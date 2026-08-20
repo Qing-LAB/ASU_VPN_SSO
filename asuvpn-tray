@@ -1,0 +1,1506 @@
+#!/usr/bin/python3
+"""ASU VPN tray applet.
+
+Connecting happens in two phases. First openconnect-sso runs as you and opens a
+browser window for the ASU SSO login; it prints back a host, a certificate
+fingerprint and a short-lived session cookie. Then asuvpn-helper runs under
+pkexec and feeds that cookie to openconnect, which needs root to set up the tun
+device. Only the cookie crosses the privilege boundary, and the browser never
+runs as root.
+
+The helper stays attached to a pipe, so closing that pipe disconnects: no
+second password prompt, and no orphaned root process if this applet dies.
+"""
+
+import argparse
+import os
+import re
+import shlex
+import shutil
+import signal
+import socket
+import struct
+import subprocess
+import sys
+import threading
+import time
+from pathlib import Path
+
+# The GUI stack is optional at import time: `asuvpn status`, `log`, `disconnect`
+# and `quit` are pure socket operations, and a missing typelib should not turn
+# them into a traceback while a tunnel is up.
+GUI_ERROR = None
+try:
+    import gi
+
+    gi.require_version("Gtk", "3.0")
+    gi.require_version("AyatanaAppIndicator3", "0.1")
+    gi.require_version("Notify", "0.7")
+
+    from gi.repository import AyatanaAppIndicator3 as AppIndicator
+    from gi.repository import Gdk, GLib, Gtk, Notify
+except (ImportError, ValueError) as exc:  # pragma: no cover - depends on the host
+    GUI_ERROR = str(exc)
+
+
+def _xdg_dir(variable, fallback):
+    """XDG base directory, matching GLib: a relative value is ignored."""
+    value = os.environ.get(variable)
+    if value and os.path.isabs(value):
+        return Path(value)
+    return Path.home() / fallback
+
+APP_ID = "asuvpn-tray"
+APP_NAME = "ASU VPN"
+DEFAULT_SERVER = "sslvpn.asu.edu"
+AC_VERSION = "4.7.00136"
+HERE = Path(__file__).resolve().parent
+HELPER = HERE / "asuvpn-helper"
+LOG_FILE = _xdg_dir("XDG_CACHE_HOME", ".cache") / "asuvpn" / "session.log"
+# Written by install.sh, so `asuvpn connect` targets the same endpoint the
+# launcher does rather than falling back to the compiled-in default.
+SERVER_FILE = _xdg_dir("XDG_CONFIG_HOME", ".config") / "asuvpn" / "server"
+AUTOSTART_FILE = (
+    _xdg_dir("XDG_CONFIG_HOME", ".config") / "autostart" / "asuvpn-tray.desktop"
+)
+MAX_LOG_LINES = 4000
+MAX_LOG_BYTES = 4 * 1024 * 1024
+# Must outlast the helper's worst case: 15s + 10s + 5s of signal escalation,
+# then draining output and checking the routing table afterwards.
+TEARDOWN_TIMEOUT = 75
+
+# Not 2: argparse already exits 2 for any bad command line, so a script could
+# not tell "wrong server" from "you typo'd a flag".
+EXIT_WRONG_SERVER = 4
+EXIT_NOT_RUNNING = 3
+
+DISCONNECTED = "disconnected"
+AUTHENTICATING = "authenticating"
+CONNECTING = "connecting"
+CONNECTED = "connected"
+DISCONNECTING = "disconnecting"
+FAILED = "failed"
+
+ICONS = {
+    DISCONNECTED: "network-vpn-disconnected-symbolic",
+    AUTHENTICATING: "network-vpn-acquiring-symbolic",
+    CONNECTING: "network-vpn-acquiring-symbolic",
+    CONNECTED: "network-vpn-symbolic",
+    DISCONNECTING: "network-vpn-acquiring-symbolic",
+    FAILED: "network-error-symbolic",
+}
+
+BUSY_STATES = (AUTHENTICATING, CONNECTING, DISCONNECTING)
+
+STATE_LABELS = {
+    DISCONNECTED: "Disconnected",
+    AUTHENTICATING: "Signing in…",
+    CONNECTING: "Connecting…",
+    CONNECTED: "Connected",
+    DISCONNECTING: "Disconnecting…",
+    FAILED: "Not connected",
+}
+
+# Taken from the message catalogue of the installed openconnect, not from
+# memory. openconnect renamed the success line to "Configured as …" in v8, and
+# v9.12 contains no "Connected as" string at all — matching on that meant the
+# applet could only reach CONNECTED when DTLS happened to negotiate. On a
+# network that blocks UDP/443 or forces a proxy the tunnel works while the tray
+# sits in "Connecting…" forever.
+#
+# "Configured as" is the authoritative line. "CSTP connected" covers the
+# TLS-only case, and the DTLS line is kept because it arrives first when UDP is
+# available. The "Connected as" forms are retained only for openconnect 7.x.
+CONNECTED_PATTERNS = (
+    re.compile(r"Configured as (?P<addr>[0-9a-fA-F.:]+)"),
+    re.compile(r"CSTP connected"),
+    re.compile(r"Established DTLS connection"),
+    re.compile(r"Connected (?P<dev>[\w.-]+) as (?P<addr>[0-9a-fA-F.:]+)"),
+    re.compile(r"Connected as (?P<addr>[0-9a-fA-F.:]+)"),
+)
+ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+
+# Deliberately narrow. A bare /Reconnect/ matched thirty message templates in
+# v9.12, two of which openconnect prints while the tunnel is perfectly healthy
+# ("DTLS Rehandshake failed; reconnecting.", and the reconnect-after-drop
+# banner on every CSTP connect) — so the badge flapped and fired a spurious
+# "connected" notification each time. These three mean the link is actually
+# down; a later "Configured as"/"CSTP connected" promotes it back.
+RECONNECTING_PATTERNS = (
+    re.compile(r"Failed to reconnect to host"),
+    re.compile(r"Failed to reconnect to proxy"),
+    re.compile(r"Detected dead peer"),
+)
+
+# Each verified present in the installed openconnect. "Failed to obtain WebVPN
+# cookie" and "Login failed" were dead patterns carried over from an older
+# release and have been dropped.
+FAILURE_PATTERNS = (
+    re.compile(r"Cookie was rejected", re.IGNORECASE),
+    re.compile(r"Failed to connect to", re.IGNORECASE),
+    re.compile(r"certificate verify failed", re.IGNORECASE),
+    re.compile(r"Failed to open HTTPS connection", re.IGNORECASE),
+)
+
+
+def configured_server():
+    try:
+        return SERVER_FILE.read_text().strip() or None
+    except OSError:
+        return None
+
+
+def find_openconnect_sso():
+    found = shutil.which("openconnect-sso")
+    if found:
+        return found
+    fallback = Path.home() / ".local" / "bin" / "openconnect-sso"
+    return str(fallback) if os.access(fallback, os.X_OK) else None
+
+
+# openconnect-sso asks for a TOTP secret on the terminal whenever the keyring
+# entry is empty, which is every run for a Duo-push setup like ASU's. Launched
+# from a desktop icon there is no terminal, so getpass hits EOF and the whole
+# sign-in dies. Answering with one blank line means "not required" and lets the
+# browser handle the second factor.
+#
+# The same code path asks for the password first when the keyring has none. A
+# blank answer there would be saved as the password and quietly break auto-fill,
+# so probe the keyring first and refuse to guess instead.
+CREDENTIALS_READY = "ready"
+CREDENTIALS_NO_PASSWORD = "no-password"
+CREDENTIALS_NONE = "no-credentials"
+CREDENTIALS_UNKNOWN = "unknown"
+CREDENTIALS_LOCKED = "locked"
+
+_PROBE = """
+import keyring
+from openconnect_sso.config import APP_NAME, load
+
+config = load()
+username = getattr(config.credentials, "username", None) if config.credentials else None
+if not username:
+    print("no-credentials")
+else:
+    print("ready" if keyring.get_password(APP_NAME, username) else "no-password")
+"""
+
+
+def sso_interpreter(sso_path):
+    """openconnect-sso is a console script; its shebang names its own venv python."""
+    try:
+        with open(sso_path, "rb") as fh:
+            first_line = fh.readline().decode("utf-8", "replace").strip()
+    except OSError:
+        return None
+    if not first_line.startswith("#!"):
+        return None
+    parts = first_line[2:].strip().split()
+    return parts[0] if parts else None
+
+
+def probe_credentials(sso_path):
+    python = sso_interpreter(sso_path)
+    if not python:
+        return CREDENTIALS_UNKNOWN
+    try:
+        result = subprocess.run(
+            [python, "-c", _PROBE],
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+    except subprocess.TimeoutExpired:
+        # Almost always a locked login keyring blocking on its unlock dialog.
+        # Must fail closed: carrying on would feed our blank line to the
+        # *password* prompt, and that blank would be saved as the password —
+        # the exact outcome this probe exists to prevent.
+        return CREDENTIALS_LOCKED
+    except (OSError, subprocess.SubprocessError):
+        return CREDENTIALS_UNKNOWN
+    answer = result.stdout.strip().splitlines()
+    if not answer:
+        return CREDENTIALS_UNKNOWN
+    return {
+        "ready": CREDENTIALS_READY,
+        "no-password": CREDENTIALS_NO_PASSWORD,
+        "no-credentials": CREDENTIALS_NONE,
+    }.get(answer[-1].strip(), CREDENTIALS_UNKNOWN)
+
+
+class VpnTray:
+    def __init__(self, server, extra_openconnect_args):
+        self.server = server
+        self.extra_args = extra_openconnect_args
+        self.state = DISCONNECTED
+        self.detail = ""
+        self._status = (DISCONNECTED, "")
+        self.auth_proc = None
+        self.helper_proc = None
+        # Set by the thread that reaps the helper. Teardown waits on this rather
+        # than calling Popen.wait() a second time, which would contend for
+        # CPython's waitpid lock and time out however fast the helper exits.
+        self.helper_exited = None
+        # Each tunnel gets a generation number. A helper that is still dying
+        # must not be able to report exit over the top of its replacement, which
+        # would drop the tray's only handle on a live root openconnect.
+        self.helper_generation = 0
+        # Sign-ins get one too. `cancelled` alone is not enough: a new connect
+        # clears it, which would un-cancel a sign-in thread still in flight and
+        # let it start a tunnel on top of the new one.
+        self.auth_generation = 0
+        self.helper_spoke = False
+        self.last_failure = None
+        self.reconnect_pending = False
+        self.quitting = False
+        self._log_bytes = 0
+        self._log_lock = threading.Lock()
+        self._stdin_lock = threading.Lock()
+        self._auth_lock = threading.Lock()
+        self.log_lines = []
+        self.log_window = None
+        self.log_buffer = None
+        self.log_view = None
+        self.cancelled = False
+
+        try:
+            LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass  # an unwritable cache dir costs the log, not the applet
+
+        Notify.init(APP_NAME)
+        self.indicator = AppIndicator.Indicator.new(
+            APP_ID, ICONS[DISCONNECTED], AppIndicator.IndicatorCategory.SYSTEM_SERVICES
+        )
+        self.indicator.set_status(AppIndicator.IndicatorStatus.ACTIVE)
+        self.indicator.set_title(APP_NAME)
+        self._build_menu()
+        self._refresh()
+
+    # ---------------------------------------------------------------- menu
+
+    def _build_menu(self):
+        self.menu = Gtk.Menu()
+
+        self.status_item = Gtk.MenuItem(label="")
+        self.status_item.set_sensitive(False)
+        self.menu.append(self.status_item)
+        self.menu.append(Gtk.SeparatorMenuItem())
+
+        self.connect_item = Gtk.MenuItem(label="Connect")
+        self.connect_item.connect("activate", lambda _w: self.connect())
+        self.menu.append(self.connect_item)
+
+        self.disconnect_item = Gtk.MenuItem(label="Disconnect")
+        self.disconnect_item.connect("activate", lambda _w: self.disconnect())
+        self.menu.append(self.disconnect_item)
+
+        self.reconnect_item = Gtk.MenuItem(label="Reconnect")
+        self.reconnect_item.connect("activate", lambda _w: self.reconnect())
+        self.menu.append(self.reconnect_item)
+
+        self.cancel_item = Gtk.MenuItem(label="Cancel")
+        self.cancel_item.connect("activate", lambda _w: self.cancel())
+        self.menu.append(self.cancel_item)
+
+        # These four swap according to state, so keep show_all() from reviving them.
+        for item in (
+            self.connect_item,
+            self.disconnect_item,
+            self.reconnect_item,
+            self.cancel_item,
+        ):
+            item.set_no_show_all(True)
+
+        self.menu.append(Gtk.SeparatorMenuItem())
+
+        log_item = Gtk.MenuItem(label="Show log…")
+        log_item.connect("activate", lambda _w: self.show_log_window())
+        self.menu.append(log_item)
+
+        # Named for what it does: puts the applet in the tray at login without
+        # firing off a Duo push before anyone has asked for one.
+        self.autostart_item = Gtk.CheckMenuItem(label="Start on login (applet only)")
+        self.autostart_item.set_active(AUTOSTART_FILE.exists())
+        self.autostart_item.connect("toggled", self._on_autostart_toggled)
+        self.menu.append(self.autostart_item)
+
+        self.menu.append(Gtk.SeparatorMenuItem())
+
+        quit_item = Gtk.MenuItem(label="Quit")
+        quit_item.connect("activate", lambda _w: self.quit())
+        self.menu.append(quit_item)
+
+        self.menu.show_all()
+        self.indicator.set_menu(self.menu)
+
+    def status_line(self):
+        """One tab-separated line, for the command line client.
+
+        Read from a single tuple so a caller on the IPC thread cannot catch a
+        new state paired with the previous detail.
+        """
+        state, detail = self._status
+        return f"{state}\t{self.server}\t{detail}"
+
+    def _refresh(self):
+        text = STATE_LABELS[self.state]
+        if self.detail:
+            text = f"{text} — {self.detail}"
+        self.status_item.set_label(f"{self.server}: {text}")
+        self.indicator.set_icon_full(ICONS[self.state], text)
+        # Hosts switch to the attention icon in ATTENTION status; without this the
+        # panel would show a blank slot exactly when something went wrong.
+        self.indicator.set_attention_icon_full(ICONS[self.state], text)
+        self.indicator.set_status(
+            AppIndicator.IndicatorStatus.ATTENTION
+            if self.state == FAILED
+            else AppIndicator.IndicatorStatus.ACTIVE
+        )
+
+        self.connect_item.set_visible(self.state in (DISCONNECTED, FAILED))
+        self.disconnect_item.set_visible(self.state == CONNECTED)
+        self.reconnect_item.set_visible(self.state == CONNECTED)
+        # Not while disconnecting: teardown must not be interrupted, and there
+        # would be nothing left to cancel anyway.
+        self.cancel_item.set_visible(self.state in (AUTHENTICATING, CONNECTING))
+
+    def _set_state(self, state, detail=""):
+        self.state = state
+        self.detail = detail
+        self._status = (state, detail)  # published as one object, see status_line
+        self._refresh()
+
+    # ----------------------------------------------------------------- log
+
+    def log(self, line):
+        """Safe to call from any thread."""
+        # openconnect-sso renders its structured logs with colour codes.
+        line = f"{time.strftime('%H:%M:%S')}  {ANSI_ESCAPE.sub('', line).rstrip()}"
+        with self._log_lock:
+            self.log_lines.append(line)
+            del self.log_lines[:-MAX_LOG_LINES]
+            try:
+                if self._log_bytes > MAX_LOG_BYTES:
+                    # A session can stay up for weeks; rewrite from the capped
+                    # in-memory tail rather than growing the file forever.
+                    LOG_FILE.write_text("\n".join(self.log_lines) + "\n")
+                    self._log_bytes = LOG_FILE.stat().st_size
+                else:
+                    with LOG_FILE.open("a") as fh:
+                        fh.write(line + "\n")
+                    self._log_bytes += len(line) + 1
+            except OSError:
+                pass
+        # The window is GTK, so it may only be touched from the main loop.
+        GLib.idle_add(self._append_to_log_window, line)
+
+    def _append_to_log_window(self, line):
+        if self.log_buffer is not None:
+            self.log_buffer.insert(self.log_buffer.get_end_iter(), line + "\n")
+            self._scroll_log_to_end()
+        return False
+
+    def _scroll_log_to_end(self):
+        if self.log_view is None or self.log_buffer is None:
+            return
+        end = self.log_buffer.get_end_iter()
+        self.log_view.scroll_to_iter(end, 0.0, False, 0.0, 0.0)
+
+    def show_log_window(self):
+        if self.log_window is not None:
+            self.log_window.present()
+            return
+
+        window = Gtk.Window(title=f"{APP_NAME} log")
+        window.set_default_size(760, 460)
+        window.set_icon_name(ICONS[CONNECTED])
+
+        with self._log_lock:
+            backlog = list(self.log_lines)
+        self.log_buffer = Gtk.TextBuffer()
+        self.log_buffer.set_text("\n".join(backlog) + ("\n" if backlog else ""))
+        self.log_view = Gtk.TextView(buffer=self.log_buffer)
+        self.log_view.set_editable(False)
+        self.log_view.set_monospace(True)
+        self.log_view.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
+
+        scroller = Gtk.ScrolledWindow()
+        scroller.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        scroller.add(self.log_view)
+
+        copy_button = Gtk.Button(label="Copy")
+        copy_button.connect("clicked", self._on_copy_log)
+        close_button = Gtk.Button(label="Close")
+        close_button.connect("clicked", lambda _w: window.destroy())
+
+        buttons = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        buttons.set_halign(Gtk.Align.END)
+        buttons.set_margin_top(6)
+        buttons.add(copy_button)
+        buttons.add(close_button)
+
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        box.set_margin_top(10)
+        box.set_margin_bottom(10)
+        box.set_margin_start(10)
+        box.set_margin_end(10)
+        box.pack_start(scroller, True, True, 0)
+        box.pack_start(buttons, False, False, 0)
+        window.add(box)
+
+        def on_destroy(_w):
+            self.log_window = None
+            self.log_buffer = None
+            self.log_view = None
+
+        window.connect("destroy", on_destroy)
+        self.log_window = window
+        window.show_all()
+        self._scroll_log_to_end()
+
+    def _on_copy_log(self, _widget):
+        with self._log_lock:
+            text = "\n".join(self.log_lines)
+        clipboard = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD)
+        clipboard.set_text(text, -1)
+
+    def notify(self, summary, body="", icon=None):
+        try:
+            note = Notify.Notification.new(summary, body, icon or ICONS[self.state])
+            note.show()
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------- actions
+
+    def connect(self):
+        if self.state in BUSY_STATES or self.state == CONNECTED:
+            return
+        sso = find_openconnect_sso()
+        if not sso:
+            self._set_state(FAILED, "openconnect-sso not found")
+            self.log("[tray] cannot find openconnect-sso on PATH or in ~/.local/bin")
+            self.notify("Cannot start", "openconnect-sso is not installed.")
+            return
+        if not os.access(HELPER, os.X_OK):
+            self._set_state(FAILED, "helper not executable")
+            self.log(f"[tray] helper is missing or not executable: {HELPER}")
+            return
+
+        self.cancelled = False
+        with self._log_lock:
+            try:
+                LOG_FILE.write_text("")
+            except OSError:
+                pass
+            self.log_lines.clear()
+            self._log_bytes = 0
+        if self.log_buffer is not None:
+            self.log_buffer.set_text("")
+
+        self.auth_generation += 1
+        self._set_state(AUTHENTICATING, "waiting for ASU sign-in")
+        self.log(f"[tray] authenticating to {self.server} via {sso}")
+        threading.Thread(
+            target=self._auth_thread, args=(sso, self.auth_generation), daemon=True
+        ).start()
+
+    def disconnect(self):
+        # A disconnect arriving mid sign-in means "stop", and the browser window
+        # needs closing even though there is no tunnel yet.
+        if self.state == DISCONNECTING:
+            return  # already tearing down; a second pass races the first
+        # Any interrupted connect goes to cancel(), including one where pkexec is
+        # already up. cancel() terminates it, which dismisses the polkit dialog;
+        # merely closing its stdin does not, because pkexec never reads it — and
+        # that left the applet stuck in "Disconnecting…" with no way back.
+        if self.state in (AUTHENTICATING, CONNECTING):
+            self.cancel()
+            return
+        if self.helper_proc is None or self.helper_proc.poll() is not None:
+            self._set_state(DISCONNECTED)
+            return
+        self._set_state(DISCONNECTING)
+        self.log("[tray] disconnecting")
+        threading.Thread(target=self._disconnect_thread, daemon=True).start()
+
+    def reconnect(self):
+        if self.state in BUSY_STATES:
+            return
+        if self.helper_proc is None or self.helper_proc.poll() is not None:
+            self.connect()
+            return
+        # Stay busy for the whole tear-down-then-connect sequence. Surfacing a
+        # momentary "disconnected" would make `asuvpn reconnect --wait` believe
+        # it had finished, and would flicker the panel icon.
+        self.reconnect_pending = True
+        self._set_state(DISCONNECTING, "reconnecting")
+        self.log("[tray] reconnecting")
+        threading.Thread(target=self._reconnect_thread, daemon=True).start()
+
+    def _reconnect_thread(self):
+        if not self._teardown_helper():
+            # Carrying on would null out our only handle on a live root tunnel
+            # and then start a second one beside it.
+            GLib.idle_add(self._reconnect_abandoned)
+            return
+        GLib.idle_add(self._reconnect_now)
+
+    def _reconnect_abandoned(self):
+        self.reconnect_pending = False
+        self._set_state(FAILED, "old tunnel would not close; not reconnecting")
+        self.log("[tray] reconnect abandoned: the previous tunnel is still up")
+        return False
+
+    def _reconnect_now(self):
+        self.reconnect_pending = False
+        self.helper_proc = None
+        self._set_state(DISCONNECTED)
+        self.connect()
+        return False
+
+    def cancel(self):
+        if self.state == DISCONNECTING:
+            return
+        self.cancelled = True
+        self.auth_generation += 1  # invalidate any sign-in still in flight
+        self.log("[tray] cancelled by user")
+        self._kill_auth()
+        if self.helper_proc is not None and self.helper_proc.poll() is None:
+            # A tunnel may already be coming up, so report it as still closing
+            # rather than claiming to be disconnected while openconnect lives.
+            self._set_state(DISCONNECTING)
+            threading.Thread(target=self._cancel_tunnel_thread, daemon=True).start()
+            return
+        self._set_state(DISCONNECTED)
+
+    def _cancel_tunnel_thread(self):
+        proc = self.helper_proc
+        if proc is None:
+            return
+        # While the polkit dialog is still up, pkexec is an ordinary process of
+        # ours and terminating it dismisses the dialog. Once it has become root
+        # this fails with EPERM, and closing the control pipe is what stops it.
+        try:
+            proc.terminate()
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+        if not self._teardown_helper():
+            GLib.idle_add(self._teardown_failed)
+
+    def quit(self):
+        if self.quitting:
+            return  # a second Quit must not start a second teardown
+        self.quitting = True
+        # Whichever branch we take, an in-flight sign-in has to die with us or
+        # it outlives the tray as an orphan with a browser window.
+        self.auth_generation += 1
+        self._kill_auth()
+        if self.helper_proc is not None and self.helper_proc.poll() is None:
+            self._set_state(DISCONNECTING)
+            self.log("[tray] quitting, closing the tunnel first")
+            threading.Thread(target=self._quit_thread, daemon=True).start()
+        else:
+            Gtk.main_quit()
+
+    def _kill_auth(self):
+        """Stop the sign-in subprocess, reading the handle exactly once."""
+        with self._auth_lock:
+            proc = self.auth_proc
+            self.auth_proc = None
+        if proc is not None and proc.poll() is None:
+            self._kill_group(proc)
+
+    def _quit_thread(self):
+        # Same first move as cancel(): while the polkit dialog is still up,
+        # pkexec is an ordinary process of ours and terminating it dismisses the
+        # prompt. Without this, quitting mid-dialog left it orphaned on screen
+        # and stalled the whole teardown budget waiting on a pipe nobody reads.
+        # Unconditional, like cancel(). Testing self.state here was dead code:
+        # quit() sets DISCONNECTING before starting this thread, so the test
+        # never fired and a polkit dialog was left orphaned on screen while
+        # teardown burned the full timeout on a pipe pkexec never reads.
+        # Once pkexec has become root this fails with EPERM, which is fine.
+        proc = self.helper_proc
+        if proc is not None:
+            try:
+                proc.terminate()
+            except (ProcessLookupError, PermissionError, OSError):
+                pass
+        # Quit regardless: refusing to exit because teardown stalled would leave
+        # the user with an applet they cannot close either.
+        if not self._teardown_helper():
+            self.log("[tray] quitting anyway; the tunnel may still be up")
+        GLib.idle_add(Gtk.main_quit)
+
+    # ------------------------------------------------------- phase 1: auth
+
+    def _auth_thread(self, sso, attempt):
+        def superseded():
+            return self.cancelled or attempt != self.auth_generation
+
+        credentials = probe_credentials(sso)
+
+        # The probe can take seconds, and until Popen below there is no process
+        # for cancel() to kill. Checked before reporting anything, so a
+        # superseded sign-in cannot overwrite a newer state with its verdict.
+        if superseded():
+            return
+
+        blocked = {
+            CREDENTIALS_NO_PASSWORD: (
+                "no saved password — run: openconnect-sso --server "
+                f"{self.server} --authenticate=shell"
+            ),
+            CREDENTIALS_LOCKED: "keyring did not answer — unlock it and try again",
+        }.get(credentials)
+        if blocked:
+            GLib.idle_add(self._auth_failed, blocked)
+            return
+        if credentials == CREDENTIALS_NONE:
+            self.log("[tray] no saved username; the browser will ask for everything")
+
+        command = [
+            sso,
+            "--server",
+            self.server,
+            "--authenticate=shell",
+        ]
+        try:
+            # Bound to a local and used only through it. Reading self.auth_proc
+            # back on each line would let a second sign-in alias this one: two
+            # threads waiting on one child, one closing the other's pipes, and a
+            # live browser process nothing can kill.
+            proc = subprocess.Popen(
+                command,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                errors="replace",
+                start_new_session=True,
+            )
+        except OSError as exc:
+            GLib.idle_add(self._auth_failed, f"could not start openconnect-sso: {exc}")
+            return
+
+        # Publish it only after a re-check, so a cancel that landed during the
+        # spawn cannot leave an unkillable sign-in behind.
+        with self._auth_lock:
+            if superseded():
+                self._kill_group(proc)
+                return
+            self.auth_proc = proc
+
+        stderr_thread = threading.Thread(
+            target=self._pump, args=(proc.stderr, "[sso] "), daemon=True
+        )
+        stderr_thread.start()
+
+        # Blank answer to the "TOTP secret (leave blank if not required)" prompt.
+        try:
+            proc.stdin.write("\n")
+            proc.stdin.flush()
+            proc.stdin.close()
+        except (OSError, ValueError):
+            pass
+
+        # Read stdout here rather than via communicate(), which would fight the
+        # stderr pump thread for the same pipes.
+        try:
+            stdout = proc.stdout.read()
+        except (OSError, ValueError):
+            stdout = ""
+        returncode = proc.wait()
+        stderr_thread.join(timeout=2)
+        for stream in (proc.stdout, proc.stderr):
+            try:
+                stream.close()
+            except (OSError, ValueError):
+                pass
+        with self._auth_lock:
+            if self.auth_proc is proc:
+                self.auth_proc = None
+
+        if superseded():
+            return
+        if returncode != 0:
+            GLib.idle_add(self._auth_failed, f"sign-in failed (exit {returncode})")
+            return
+
+        details = {}
+        for line in stdout.splitlines():
+            if "=" not in line:
+                continue
+            try:
+                unquoted = shlex.split(line)
+            except ValueError:
+                continue
+            if not unquoted:
+                continue
+            key, _, value = unquoted[0].partition("=")
+            details[key.strip().upper()] = value
+
+        if not {"HOST", "COOKIE", "FINGERPRINT"} <= details.keys():
+            GLib.idle_add(self._auth_failed, "sign-in returned no session")
+            return
+
+        GLib.idle_add(
+            self._start_tunnel,
+            details["HOST"],
+            details["COOKIE"],
+            details["FINGERPRINT"],
+            attempt,
+        )
+
+    def _auth_failed(self, message):
+        self.log(f"[tray] {message}")
+        self._set_state(FAILED, message)
+        self.notify("Sign-in failed", message)
+        return False
+
+    # ----------------------------------------------------- phase 2: tunnel
+
+    def _start_tunnel(self, host, cookie, fingerprint, attempt):
+        if self.cancelled or attempt != self.auth_generation:
+            # Cancelled or superseded while the sign-in was finishing. Going
+            # ahead would raise a root password prompt for a connection nobody
+            # is waiting for any more.
+            self.log("[tray] sign-in finished too late to be used; not connecting")
+            return False
+        if self.helper_proc is not None and self.helper_proc.poll() is None:
+            # Overwriting helper_proc here would lose the only handle on a live
+            # root openconnect, leaving it running with nothing able to stop it.
+            # Say so in the UI: returning quietly strands us in "Signing in…".
+            self._set_state(FAILED, "a tunnel is already running")
+            self.log("[tray] a tunnel is already running; not starting a second")
+            return False
+        self._set_state(CONNECTING, "authorizing")
+        self.log(f"[tray] signed in, starting openconnect for {host}")
+        command = [
+            "pkexec",
+            str(HELPER),
+            "--host",
+            host,
+            "--fingerprint",
+            fingerprint,
+            "--ac-version",
+            AC_VERSION,
+        ]
+        if self.extra_args:
+            command += ["--", *self.extra_args]
+
+        self.helper_generation += 1
+        generation = self.helper_generation
+        exited = threading.Event()
+        self.helper_exited = exited
+        self.helper_spoke = False
+        self.last_failure = None
+        try:
+            self.helper_proc = subprocess.Popen(
+                command,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                # Never strict: one invalid byte from a VPN banner would raise
+                # out of the reader thread and strand the state machine.
+                errors="replace",
+                bufsize=1,
+                # Its own session, so a Ctrl+C in the terminal reaches only us.
+                # Teardown then has exactly one path: closing the control pipe.
+                start_new_session=True,
+            )
+        except OSError as exc:
+            # Nothing was started, so release anyone who might later wait on
+            # this generation's exit rather than leaving them to time out.
+            self.helper_proc = None
+            exited.set()
+            self._set_state(FAILED, f"could not run pkexec: {exc}")
+            self.log(f"[tray] {exc}")
+            return False
+
+        try:
+            self.helper_proc.stdin.write(cookie + "\n")
+            self.helper_proc.stdin.flush()
+        except OSError as exc:
+            self.log(f"[tray] could not hand the session cookie to the helper: {exc}")
+
+        threading.Thread(
+            target=self._tunnel_thread,
+            args=(self.helper_proc, generation, exited),
+            daemon=True,
+        ).start()
+        return False
+
+    def _tunnel_thread(self, proc, generation, exited):
+        # try/finally around the whole body: if this thread dies without setting
+        # `exited`, every teardown burns the full timeout and the tray loses
+        # track of a live root tunnel for good.
+        returncode = None
+        try:
+            for raw in iter(proc.stdout.readline, ""):
+                GLib.idle_add(self._on_tunnel_output, raw.rstrip("\n"), generation)
+            returncode = proc.wait()
+        except (OSError, ValueError) as exc:
+            GLib.idle_add(self.log, f"[tray] lost the helper's output: {exc}")
+            try:
+                returncode = proc.wait()
+            except OSError:
+                returncode = -1
+        finally:
+            exited.set()
+            GLib.idle_add(self._on_tunnel_exit, returncode, generation)
+
+    def _on_tunnel_output(self, line, generation):
+        if generation != self.helper_generation:
+            # Still log it. A superseded helper's last words are its teardown
+            # diagnostics — exactly the "no default route" warning worth keeping.
+            self.log(f"[old tunnel] {line}")
+            return False
+        if line.startswith("[helper]"):
+            self.helper_spoke = True
+        self.log(line)
+        # The helper flags anything that suggests the network did not come back.
+        if line.startswith("[helper] WARNING:"):
+            self.notify(
+                "VPN teardown warning",
+                line.split("WARNING:", 1)[1].strip(),
+                icon="dialog-warning-symbolic",
+            )
+        if self.state == CONNECTED:
+            # openconnect retries internally without exiting. Left unhandled,
+            # the badge stays solid and `asuvpn status` keeps exiting 0 while
+            # traffic goes nowhere.
+            for pattern in RECONNECTING_PATTERNS:
+                if pattern.search(line):
+                    self._set_state(CONNECTING, "link lost, retrying")
+                    return False
+        if self.state in (CONNECTING, CONNECTED):
+            for pattern in CONNECTED_PATTERNS:
+                match = pattern.search(line)
+                if match:
+                    address = (match.groupdict().get("addr") or "").strip()
+                    if self.state != CONNECTED:
+                        # Reaching CONNECTED clears any earlier failure line;
+                        # otherwise a blip that openconnect recovered from
+                        # would be reported as the cause when the tunnel
+                        # eventually drops, hours later.
+                        self.last_failure = None
+                        self._set_state(CONNECTED, address)
+                        where = f"{self.server} — {address}".strip(" —")
+                        self.notify("VPN connected", where)
+                    return False
+            for pattern in FAILURE_PATTERNS:
+                if pattern.search(line):
+                    # Keep it: this is the actionable sentence. Without it the
+                    # user is told "exited with status 2" for what openconnect
+                    # already explained as "Cookie was rejected".
+                    self.last_failure = line.strip()
+                    self.log(f"[tray] openconnect reported a problem: {line}")
+                    return False
+        return False
+
+    def _on_tunnel_exit(self, returncode, generation):
+        if generation != self.helper_generation:
+            # An older tunnel finished dying after a new one took over. Saying
+            # anything here would drop the tray's handle on the live one.
+            self.log(f"[tray] a previous tunnel closed (status {returncode})")
+            return False
+        self.helper_proc = None
+        if self.reconnect_pending:
+            # _reconnect_now takes it from here; stay busy until it does.
+            self.log("[tray] tunnel closed, signing in again")
+            return False
+        if self.cancelled:
+            self._set_state(DISCONNECTED)
+            return False
+        # DISCONNECTED too, not just DISCONNECTING: disconnect() moves straight
+        # there when it finds the helper already gone, and this callback can
+        # still be queued behind it. Treating that as a failure would report an
+        # error for a perfectly clean disconnect.
+        if self.state in (DISCONNECTING, DISCONNECTED):
+            self._set_state(DISCONNECTED)
+            self.log("[tray] disconnected")
+            self.notify("VPN disconnected", self.server)
+            return False
+
+        if returncode is None:
+            returncode = -1  # the reader thread died before it could reap
+        was_connected = self.state == CONNECTED
+        # 126/127 are pkexec's own codes for "dismissed" and "not permitted", but
+        # openconnect can return them too. Only read them that way if the helper
+        # never got far enough to say anything.
+        if returncode == 126 and not self.helper_spoke:
+            message = "authorization cancelled"
+        elif returncode == 127 and not self.helper_spoke:
+            message = "not authorized to run the helper"
+        elif self.last_failure:
+            message = self.last_failure
+        elif was_connected:
+            message = "connection dropped"
+        else:
+            message = f"openconnect exited with status {returncode}"
+        self._set_state(FAILED, message)
+        self.log(f"[tray] {message}")
+        self.notify("VPN disconnected", message)
+        return False
+
+    # ------------------------------------------------------------ teardown
+
+    def _close_helper_stdin(self, proc=None):
+        proc = proc if proc is not None else self.helper_proc
+        if proc is None:
+            return
+        # Two teardown paths can arrive together (Disconnect then Quit), and a
+        # write to a pipe the other one just closed raises ValueError, not
+        # OSError — which would escape and strand the applet mid-teardown.
+        with self._stdin_lock:
+            try:
+                if proc.stdin and not proc.stdin.closed:
+                    proc.stdin.write("quit\n")
+                    proc.stdin.flush()
+                    proc.stdin.close()
+            except (OSError, ValueError):
+                pass
+
+    def _teardown_helper(self):
+        """Close the control pipe and wait. False means it is still alive."""
+        # Both handles read once, together: a tunnel starting between the two
+        # reads would have us close one generation's pipe and wait on another's.
+        with self._stdin_lock:
+            proc = self.helper_proc
+            exited = self.helper_exited
+        if proc is None:
+            return True
+        self._close_helper_stdin(proc)
+        if exited is not None and not exited.wait(timeout=TEARDOWN_TIMEOUT):
+            self.log("[tray] helper did not exit in time")
+            return False
+        return True
+
+    def _teardown_failed(self):
+        """Leave DISCONNECTING when the helper never reported back."""
+        if self.state == DISCONNECTING:
+            self._set_state(FAILED, "helper did not exit — the tunnel may still be up")
+            self.notify(
+                "VPN teardown warning",
+                "The helper did not exit. Check 'asuvpn log'.",
+                icon="dialog-warning-symbolic",
+            )
+        return False
+
+    def _disconnect_thread(self):
+        if not self._teardown_helper():
+            GLib.idle_add(self._teardown_failed)
+
+    @staticmethod
+    def _kill_group(proc):
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+        except (ProcessLookupError, PermissionError):
+            try:
+                proc.terminate()
+            except ProcessLookupError:
+                pass
+
+    def _pump(self, stream, prefix):
+        # ValueError, not OSError, is what a read from a stream closed under us
+        # raises — and _auth_thread closes these once it stops waiting for the
+        # pump to finish. Unhandled, it would kill this thread with a traceback.
+        try:
+            for raw in iter(stream.readline, ""):
+                self.log(prefix + raw.rstrip("\n"))
+        except (OSError, ValueError):
+            pass
+
+    # ----------------------------------------------------------- autostart
+
+    def _on_autostart_toggled(self, item):
+        try:
+            self._write_autostart(item.get_active())
+        except OSError as exc:
+            self.log(f"[tray] could not update autostart: {exc}")
+            item.handler_block_by_func(self._on_autostart_toggled)
+            item.set_active(not item.get_active())
+            item.handler_unblock_by_func(self._on_autostart_toggled)
+
+    def _write_autostart(self, enabled):
+        if enabled:
+            AUTOSTART_FILE.parent.mkdir(parents=True, exist_ok=True)
+            AUTOSTART_FILE.write_text(
+                "[Desktop Entry]\n"
+                "Type=Application\n"
+                f"Name={APP_NAME}\n"
+                f'Exec="{Path(__file__).resolve()}" --server "{self.server}" tray\n'
+                "Icon=asuvpn\n"
+                "Terminal=false\n"
+                "X-GNOME-Autostart-enabled=true\n"
+            )
+            self.log(f"[tray] autostart enabled ({AUTOSTART_FILE})")
+        else:
+            AUTOSTART_FILE.unlink(missing_ok=True)
+            self.log("[tray] autostart disabled")
+
+
+# ------------------------------------------------------- single instance IPC
+
+
+def ipc_address():
+    return "\0" + f"{APP_ID}-{os.getuid()}"
+
+
+def peer_uid(conn):
+    """The uid on the other end of a connected AF_UNIX socket, or None."""
+    try:
+        creds = conn.getsockopt(
+            socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3I")
+        )
+        # uid_t is unsigned, and a short read raises struct.error, not OSError
+        # — uncaught it would kill the whole IPC thread.
+        _pid, uid, _gid = struct.unpack("3I", creds)
+    except (OSError, struct.error):
+        return None
+    return uid
+
+
+def send_to_running_instance(command, timeout=5.0):
+    """Return the applet's reply, or None when no applet is running."""
+    client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    client.settimeout(timeout)
+    try:
+        client.connect(ipc_address())
+    except OSError:
+        return None
+    try:
+        client.sendall(command.encode())
+        client.shutdown(socket.SHUT_WR)
+        # An empty read means the applet closed without answering — on its way
+        # out, typically. Report that as "gone", not as an empty state.
+        return client.recv(4096).decode("utf-8", "replace").strip() or None
+    except OSError:
+        return None
+    finally:
+        client.close()
+
+
+def bind_ipc():
+    """Claim this session's control socket, or None if another applet has it.
+
+    Binding before building any UI is what makes the applet single-instance:
+    two launches racing at login would otherwise both put an icon in the panel
+    and both start a sign-in, and the loser would have no control channel.
+    """
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        server.bind(ipc_address())
+        server.listen(4)
+    except OSError:
+        server.close()
+        return None
+    return server
+
+
+def serve_ipc(tray, server):
+    actions = {
+        "connect": tray.connect,
+        "disconnect": tray.disconnect,
+        "reconnect": tray.reconnect,
+        "quit": tray.quit,
+    }
+
+    def loop():
+        while True:
+            try:
+                conn, _ = server.accept()
+            except OSError:
+                return
+            with conn:
+                # An abstract AF_UNIX socket has no filesystem node and so no
+                # permission bits: any local process can connect, and the uid in
+                # the name enforces nothing. Without this check another user
+                # could drop the tunnel, read the assigned VPN address, or —
+                # worst — call `connect` to raise an admin password prompt on
+                # this desktop whenever they liked.
+                uid = peer_uid(conn)
+                # Fail closed. Accepting when the credential cannot be read
+                # would make an unreadable peer indistinguishable from us.
+                if uid != os.getuid():
+                    tray.log(f"[tray] refused a control connection from uid {uid}")
+                    continue
+                # A client that connects and never speaks would otherwise wedge
+                # this single-threaded loop, and every later command with it.
+                conn.settimeout(10)
+                try:
+                    command = conn.recv(256).decode("utf-8", "replace").strip()
+                except OSError:
+                    continue
+                if command == "status":
+                    reply = tray.status_line()
+                elif command == "ping":
+                    reply = "ok"
+                elif command in actions:
+                    # Run it on the main loop and wait for it to return, so the
+                    # reply means "state has moved". Without this, a client that
+                    # asks for status immediately afterwards still sees the old
+                    # state and concludes nothing happened. Every action starts a
+                    # worker and returns promptly, so this cannot stall.
+                    finished = threading.Event()
+
+                    # Both are bound as defaults, not captured: this closure
+                    # outlives the loop iteration whenever the wait below times
+                    # out, and a late-running invoke would otherwise signal a
+                    # later command's event instead of its own.
+                    def invoke(action=actions[command], done=finished):
+                        try:
+                            action()
+                        finally:
+                            done.set()
+                        return False
+
+                    GLib.idle_add(invoke)
+                    # Shorter than the client's own 5s timeout, so a busy main
+                    # loop produces an honest answer rather than the client
+                    # timing out first and reporting "not running".
+                    reply = "ok" if finished.wait(timeout=3) else "busy"
+                else:
+                    reply = f"unknown command: {command}"
+                try:
+                    conn.sendall((reply + "\n").encode())
+                except OSError:
+                    pass
+
+    threading.Thread(target=loop, daemon=True).start()
+    return server
+
+
+# ------------------------------------------------------------- command line
+
+COMMANDS = ("connect", "disconnect", "reconnect", "status", "log", "tray", "quit")
+
+COMMAND_HELP = """
+commands:
+  connect       sign in and bring the tunnel up (the default)
+  disconnect    close the tunnel, leaving the applet running
+  reconnect     sign in again and replace the current tunnel
+  status        print the current state
+  log           print this session's log, -f to follow it
+  tray          run the applet in the foreground without connecting
+  quit          close the tunnel and stop the applet
+
+exit codes:
+  0  the request was carried out; for status and --wait, connected
+  1  status/--wait: not connected. disconnect: the tunnel did not close
+  2  a bad command line (argparse's own code)
+  3  status: the applet is not running
+  4  a different server was asked for than the running applet is using
+"""
+
+
+def show_log(follow):
+    if not LOG_FILE.exists():
+        print("no log yet — nothing has been connected in this session")
+        return 1
+    if send_to_running_instance("ping") is None:
+        print(f"# {APP_NAME} is not running; this is the last session's log\n")
+    try:
+        with LOG_FILE.open() as fh:
+            sys.stdout.write(fh.read())
+            sys.stdout.flush()
+            while follow:
+                line = fh.readline()
+                if line:
+                    sys.stdout.write(line)
+                    sys.stdout.flush()
+                    continue
+                # Connecting truncates the log, so follow it back to the top.
+                if fh.tell() > LOG_FILE.stat().st_size:
+                    fh.seek(0)
+                time.sleep(0.3)
+    except KeyboardInterrupt:
+        pass
+    except OSError as exc:
+        print(f"cannot read {LOG_FILE}: {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
+def wait_until_settled(timeout=300.0):
+    """Poll the applet until it stops being busy. Signing in waits on a human."""
+    deadline = time.monotonic() + timeout
+    last = None
+    misses = 0
+    while time.monotonic() < deadline:
+        reply = send_to_running_instance("status")
+        if reply is None:
+            # One unanswered poll is not proof the applet has gone; a busy main
+            # loop can miss the socket timeout. Only give up after a few.
+            misses += 1
+            if misses >= 3:
+                return None
+        else:
+            misses = 0
+            last = reply
+            if reply.split("\t", 1)[0] not in BUSY_STATES:
+                return reply
+        time.sleep(0.4)
+    return last
+
+
+def wait_until_gone(timeout=TEARDOWN_TIMEOUT + 15):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if send_to_running_instance("ping") is None:
+            return True
+        time.sleep(0.3)
+    return False
+
+
+def query_status(attempts=3):
+    """Ask for the state, tolerating a momentarily busy main loop.
+
+    One unanswered probe is not proof the applet has gone: a wedged idle queue
+    can outlast the socket timeout, and reporting "not running" for a live
+    tunnel is the worst answer this command can give.
+    """
+    for attempt in range(attempts):
+        reply = send_to_running_instance("status")
+        if reply is not None:
+            return reply
+        if attempt + 1 < attempts:
+            time.sleep(0.5)
+    return None
+
+
+def print_status(reply):
+    if reply is None:
+        print(f"{APP_NAME}: not running")
+        return EXIT_NOT_RUNNING
+    state, _, rest = reply.partition("\t")
+    server, _, detail = rest.partition("\t")
+    line = f"{APP_NAME}: {STATE_LABELS.get(state, state)}"
+    if server:
+        line += f" ({server})"
+    if detail:
+        line += f" — {detail}"
+    print(line)
+    return 0 if state == CONNECTED else 1
+
+
+def start_detached(child_args):
+    """Relaunch ourselves in the background, then wait until the socket answers.
+
+    A re-exec rather than a fork: GLib has already started worker threads by the
+    time we get here, and forking away from them deadlocks the child.
+    """
+    command = [sys.executable, os.path.abspath(__file__), "--foreground", *child_args]
+    try:
+        subprocess.Popen(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except OSError as exc:
+        print(f"could not start the applet: {exc}", file=sys.stderr)
+        return 1
+
+    for _ in range(150):
+        if send_to_running_instance("ping") is not None:
+            return 0
+        time.sleep(0.1)
+    print("the applet did not come up; try: asuvpn --foreground tray", file=sys.stderr)
+    return 1
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="asuvpn",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description=f"{APP_NAME}: tray applet for openconnect-sso,"
+        " with command line control.",
+        epilog=COMMAND_HELP,
+    )
+    parser.add_argument(
+        "command",
+        nargs="?",
+        default="connect",
+        choices=COMMANDS,
+        metavar="COMMAND",
+        help="one of: " + ", ".join(COMMANDS),
+    )
+    # Left as None so we can tell "not given" from "same as the default", which
+    # decides whether a mismatch with a running applet is worth complaining about.
+    parser.add_argument(
+        "--server",
+        default=None,
+        metavar="HOST",
+        help="VPN server to connect to (default: whatever install.sh was given)",
+    )
+    parser.add_argument(
+        "-w",
+        "--wait",
+        action="store_true",
+        help="with 'connect' or 'reconnect', wait for it to finish before returning",
+    )
+    parser.add_argument(
+        "-f",
+        "--follow",
+        action="store_true",
+        help="with 'log', keep following new lines",
+    )
+    parser.add_argument(
+        "--foreground",
+        action="store_true",
+        help="do not fork into the background when starting the applet",
+    )
+    # Older launchers and autostart files used flags rather than commands.
+    parser.add_argument("--no-connect", action="store_true", help=argparse.SUPPRESS)
+    for legacy, dest in (
+        ("--connect", "flag_connect"),
+        ("--disconnect", "flag_disconnect"),
+        ("--reconnect", "flag_reconnect"),
+    ):
+        parser.add_argument(
+            legacy, dest=dest, action="store_true", help=argparse.SUPPRESS
+        )
+    # Split at the first bare "--" by hand. argparse.REMAINDER would swallow
+    # every later flag, so "asuvpn connect --wait" would silently pass --wait to
+    # openconnect instead of to us.
+    argv = sys.argv[1:]
+    if "--" in argv:
+        separator = argv.index("--")
+        argv, passthrough = argv[:separator], argv[separator + 1 :]
+    else:
+        passthrough = []
+    args = parser.parse_args(argv)
+
+    command = args.command
+    if args.no_connect:
+        command = "tray"
+    elif args.flag_disconnect:
+        command = "disconnect"
+    elif args.flag_reconnect:
+        command = "reconnect"
+    elif args.flag_connect:
+        command = "connect"
+
+    server = args.server or configured_server() or DEFAULT_SERVER
+
+    if command == "log":
+        return show_log(args.follow)
+    if command == "status":
+        return print_status(query_status())
+
+    running = query_status()
+
+    if command == "quit":
+        if running is None:
+            print(f"{APP_NAME} is not running")
+            return 0
+        send_to_running_instance("quit")
+        if wait_until_gone():
+            print(f"{APP_NAME} stopped")
+            return 0
+        print(f"{APP_NAME} is still shutting down", file=sys.stderr)
+        return 1
+
+    if command == "disconnect":
+        if running is None:
+            print(f"{APP_NAME} is not running")
+            return 0
+        send_to_running_instance("disconnect")
+        reply = wait_until_settled(timeout=TEARDOWN_TIMEOUT + 15)
+        print_status(reply)
+        # An action reports whether the action worked. Only `status` reports
+        # connectedness, or `disconnect` would return 1 on success.
+        return 0 if (reply or "").split("\t", 1)[0] == DISCONNECTED else 1
+
+    if running is not None:
+        running_state, _, rest = running.partition("\t")
+        running_server = rest.partition("\t")[0]
+        # Compare the *resolved* server, not just an explicit --server. Checking
+        # only the flag meant that re-running install.sh with a new endpoint and
+        # then typing a bare `asuvpn connect` silently drove the old applet at
+        # the old server — the exact thing this guard claims to prevent.
+        if running_server and server != running_server:
+            print(
+                f"{APP_NAME} is already running for {running_server}, "
+                f"so it cannot connect to {server}.",
+                file=sys.stderr,
+            )
+            print("Stop it first:  asuvpn quit", file=sys.stderr)
+            return EXIT_WRONG_SERVER
+        if command == "tray":
+            print(f"{APP_NAME} is already running")
+            return 0
+        if passthrough:
+            print(
+                f"note: {APP_NAME} is already running, so these openconnect "
+                "arguments are ignored. Use 'asuvpn quit' first.",
+                file=sys.stderr,
+            )
+        if command == "connect" and running_state == CONNECTED:
+            return print_status(running)
+        send_to_running_instance(command)
+        if args.wait:
+            return print_status(wait_until_settled())
+        print_status(send_to_running_instance("status"))
+        return 0  # started; the outcome is not known yet without --wait
+
+    # No applet yet, so become one. 'tray' stays in the foreground; the others
+    # were asked to do something, so hand the terminal back once we are up.
+    if command != "tray" and not args.foreground:
+        child = ["--server", server, command]
+        if passthrough:
+            child += ["--", *passthrough]
+        started = start_detached(child)
+        if started != 0:
+            return started
+        if args.wait:
+            return print_status(wait_until_settled())
+        print_status(send_to_running_instance("status"))
+        return 0  # started; the outcome is not known yet without --wait
+
+    if GUI_ERROR is not None:
+        print(f"cannot start the applet: {GUI_ERROR}", file=sys.stderr)
+        print(
+            "Install the GTK bindings (python3-gi, gir1.2-gtk-3.0, "
+            "gir1.2-ayatanaappindicator3-0.1, gir1.2-notify-0.7) or re-run "
+            "./bootstrap.sh.",
+            file=sys.stderr,
+        )
+        return 1
+
+    listener = bind_ipc()
+    if listener is None:
+        # Another applet claimed the socket between our probe above and now.
+        print(f"{APP_NAME} is already running")
+        return 0
+
+    tray = VpnTray(server, passthrough)
+
+    # Handlers first: a signal arriving after the sign-in has started but before
+    # they were installed would kill the tray outright and orphan the browser.
+    # SIGHUP matters too — closing the terminal would otherwise skip the
+    # orderly quit and fall back to the helper's EOF path.
+    for stop_signal in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        GLib.unix_signal_add(
+            GLib.PRIORITY_DEFAULT, stop_signal, lambda: (tray.quit(), True)[1]
+        )
+
+    # Begin connecting before the socket starts answering. Otherwise a client
+    # that has just been told we are up can sample the state before the queued
+    # connect has run, see "disconnected", and conclude it already finished.
+    if command != "tray":
+        tray.connect()
+
+    serve_ipc(tray, listener)
+    Gtk.main()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,478 @@
+#!/usr/bin/python3 -I
+"""Root side of the ASU VPN tray app, launched through pkexec.
+
+Run isolated (-I) deliberately. As root, sys.path[0] would otherwise be this
+script's own directory under ~/.local, which the unprivileged user owns —
+dropping a signal.py or subprocess.py beside this file would get it imported
+and executed as root. Isolated mode removes that directory from sys.path and
+ignores PYTHON* environment variables. This file imports only the standard
+library, so it costs nothing.
+
+Reads the SSO session cookie from the first line of stdin, then runs
+openconnect. Afterwards it keeps reading stdin: "quit" or EOF tears the tunnel
+down. Tying teardown to the pipe means disconnecting needs no second polkit
+prompt, and a crashed tray applet cannot leave a stray root process behind.
+
+openconnect's output is relayed through this process rather than wired straight
+to the tray's pipe. That costs a thread but means a dead tray can never hit
+openconnect with SIGPIPE, which would kill it before it restored the routing
+table and DNS. Writes to a broken pipe are dropped, never raised: teardown has
+to survive the tray disappearing, since that is exactly when it matters most.
+
+The cookie is never printed.
+"""
+
+import argparse
+import ctypes
+import os
+import re
+import shlex
+import shutil
+import signal
+import subprocess
+import sys
+import syslog
+import threading
+import time
+
+OPENCONNECT_CANDIDATES = ("/usr/sbin/openconnect", "/usr/bin/openconnect")
+PR_SET_PDEATHSIG = 1
+IP_CANDIDATES = ("/usr/sbin/ip", "/sbin/ip", "/usr/bin/ip")
+TUNNEL_PREFIXES = ("tun", "tap", "vpn")
+INTERFACE_PREFIX = "asuvpn"
+# IFNAMSIZ is 16 including the NUL. Anything outside this cannot name a device,
+# and unchecked it would reach an `ip link delete` running as root.
+INTERFACE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,14}$")
+
+# Options that break supervision rather than extend it. --background makes
+# openconnect fork, and fork clears PR_SET_PDEATHSIG — so the daemon outlives
+# both the helper and the control pipe, with nothing holding a handle on it,
+# while teardown deletes its device out from under it. --syslog diverts the
+# progress output the tray reads, so it never sees the tunnel come up.
+# Contrast --script, which is a deliberate extension point.
+UNSUPPORTED_OPTIONS = (
+    "-b", "--background",
+    "-l", "--syslog",
+    "--pid-file",
+    "--cookieonly", "--authenticate",
+)
+
+syslog.openlog("asuvpn-helper", syslog.LOG_PID, syslog.LOG_DAEMON)
+
+
+def emit(text):
+    """Write to the tray's log pipe, tolerating a tray that has gone away."""
+    try:
+        sys.stdout.write(text)
+        sys.stdout.flush()
+    except (BrokenPipeError, ValueError, OSError):
+        pass
+
+
+def log(message):
+    emit(f"[helper] {message}\n")
+    # Also to syslog, because the tray's pipe is broken in exactly the case the
+    # teardown warnings exist for — a crashed or killed applet. Without this,
+    # "no default route after teardown" is written to a pipe nobody is reading
+    # and the user is never told their network is broken.
+    try:
+        level = syslog.LOG_WARNING if message.startswith("WARNING") else syslog.LOG_INFO
+        syslog.syslog(level, message)
+    except (OSError, ValueError):
+        pass
+
+
+def die_with_parent(parent_pid=None):
+    """Ask the kernel to signal openconnect if this helper dies.
+
+    The control pipe protects against the *tray* dying. This is the other
+    direction: if the helper is killed — OOM, an unhandled error — openconnect
+    would keep running as root with nothing able to reach it, while the tray
+    reports the connection as dropped. SIGINT makes it tear down through
+    vpnc-script, so the routing table is still restored.
+
+    Runs in the child between fork and exec. That is only safe because the
+    helper has not started any threads yet at this point.
+    """
+    try:
+        ctypes.CDLL("libc.so.6", use_errno=True).prctl(PR_SET_PDEATHSIG, signal.SIGINT)
+    except (OSError, AttributeError):
+        return
+    # The flag is only armed now, so a parent that died during the fork would
+    # never be noticed. Comparing against the recorded pid rather than testing
+    # for init: under systemd an orphan reparents to the nearest subreaper
+    # (systemd --user), never to pid 1, so that test silently never fired.
+    if parent_pid is not None and os.getppid() != parent_pid:
+        os._exit(1)
+
+
+def find_openconnect():
+    """Locate openconnect. There is deliberately no way to override this.
+
+    An earlier version took the path as an argument, which meant anyone who
+    could satisfy the polkit prompt had a one-line root exec of any file. The
+    PATH fallback is safe because pkexec resets PATH to a sanitised value.
+    """
+    for path in OPENCONNECT_CANDIDATES:
+        if os.access(path, os.X_OK):
+            return path
+    return shutil.which("openconnect")
+
+
+def find_ip():
+    for path in IP_CANDIDATES:
+        if os.access(path, os.X_OK):
+            return path
+    return None
+
+
+def requested_interface(extra):
+    """The device name the caller chose for openconnect, if any.
+
+    Takes the *last* occurrence, because that is the one getopt gives
+    openconnect. Taking the first would let `--interface docker0 --interface x`
+    point teardown at a device openconnect never touched.
+    """
+    chosen = None
+    for index, arg in enumerate(extra):
+        if arg in ("--interface", "-i") and index + 1 < len(extra):
+            chosen = extra[index + 1]
+        elif arg.startswith("--interface="):
+            chosen = arg.split("=", 1)[1]
+    return chosen
+
+
+def free_interface_name():
+    """First unused asuvpnN.
+
+    Deliberately not a fixed name. With a constant, a second user on the same
+    machine would find the first user's live device, read it as a leftover, and
+    delete it as root — taking down a tunnel that was never theirs. Picking a
+    free name means no device ever has to be removed to make room.
+    """
+    for index in range(100):
+        name = f"{INTERFACE_PREFIX}{index}"
+        if not interface_exists(name):
+            return name
+    return None
+
+
+def watch_for_interface(ifname, holder, deadline=60):
+    """Record the ifindex of our device once openconnect creates it."""
+    end = time.monotonic() + deadline
+    while time.monotonic() < end:
+        index = interface_index(ifname)
+        if index is not None:
+            holder["ifindex"] = index
+            return
+        time.sleep(0.25)
+
+
+def run(command, timeout=5):
+    try:
+        return subprocess.run(command, capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def tunnel_interfaces():
+    try:
+        names = os.listdir("/sys/class/net")
+        return {n for n in names if n.startswith(TUNNEL_PREFIXES)}
+    except OSError:
+        return set()
+
+
+def interface_index(name):
+    """The kernel's ifindex for a device, or None.
+
+    ifindex is monotonic, so it identifies one *incarnation* of a name. Two
+    helpers racing can both pick the free name asuvpn0; the loser's openconnect
+    fails, but at teardown it would find asuvpn0 present and delete the winner's
+    live tunnel. Comparing the index taken once the tunnel was up proves the
+    device still is the one we created.
+    """
+    try:
+        with open(f"/sys/class/net/{name}/ifindex") as fh:
+            return int(fh.read().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def interface_exists(name):
+    """Ask about one device by name.
+
+    Not via tunnel_interfaces(): our own device is called asuvpn0, and a
+    caller-supplied --interface can be called anything, so neither is guaranteed
+    to match the tun/tap/vpn prefixes used for spotting strays.
+    """
+    return bool(name) and os.path.exists(f"/sys/class/net/{name}")
+
+
+def verify_teardown(ifname, before, was_killed, owned):
+    """Confirm the network came back, and clear up if openconnect did not.
+
+    openconnect restores routes and DNS by running vpnc-script on the way out,
+    but only when it exits gracefully. If it had to be killed the script never
+    ran, which is what leaves a machine with no working network until it is
+    rebooted. Deleting the leftover tunnel interface takes its routes with it.
+
+    Only *our* device is ever deleted. `owned` is the ifindex captured once
+    openconnect created it, so a name that has since been reused by somebody
+    else's tunnel is left alone. Anything else that appeared meanwhile belongs
+    to something else — a VM's tap, a second VPN — and deleting that as root
+    because it matched a name prefix would be its own outage.
+    """
+    ip = find_ip()
+    present = tunnel_interfaces()
+
+    if interface_exists(ifname):
+        if owned is None or interface_index(ifname) != owned:
+            log(f"{ifname} is not the device this session created; leaving it alone")
+        elif not ip:
+            log(f"WARNING: {ifname} outlived openconnect but 'ip' is missing;"
+                " it was not removed")
+        else:
+            log(f"WARNING: {ifname} outlived openconnect; deleting it")
+            result = run([ip, "link", "delete", ifname])
+            if result is None or result.returncode != 0:
+                log(f"WARNING: could not delete {ifname}; routes may still point at it")
+
+    strays = sorted(present - before - {ifname})
+    if strays:
+        log(f"other tunnel interfaces present, left alone: {', '.join(strays)}")
+
+    if not ip:
+        # Say so rather than returning quietly: silence here reads exactly like
+        # a clean teardown, and the routing table may be in pieces.
+        log("WARNING: cannot find 'ip'; the default route could not be checked")
+        return
+    routes = run([ip, "route", "show", "default"])
+    if routes is None:
+        log("WARNING: 'ip route show' did not answer; the default route is unverified")
+        return
+    if routes.stdout.strip():
+        for line in routes.stdout.strip().splitlines():
+            log(f"default route restored: {line.strip()}")
+    else:
+        log("WARNING: no default route after teardown — network is likely broken")
+        log("WARNING: try 'nmcli networking off && nmcli networking on'")
+    if was_killed:
+        log("WARNING: openconnect was killed, so DNS may still need attention")
+
+
+class Tunnel:
+    """Owns openconnect's lifetime.
+
+    Exactly one thread may call Popen.wait() on a child. CPython's timed wait
+    acquires the internal waitpid lock non-blockingly, so if another thread is
+    already parked in a blocking wait, every timed wait times out no matter what
+    the child does. That is not academic: it made a clean teardown look like a
+    hang and escalated all the way to SIGKILL, which is precisely what stops
+    vpnc-script from restoring the routing table. So reap() is the only caller
+    of wait(), and everyone else waits on the `exited` event instead.
+    """
+
+    def __init__(self, proc):
+        self.proc = proc
+        self.killed = False
+        self.returncode = None
+        self.exited = threading.Event()
+        self._lock = threading.Lock()
+        self._closing = False
+
+    def reap(self):
+        """The single owner of Popen.wait()."""
+        self.returncode = self.proc.wait()
+        self.exited.set()
+        return self.returncode
+
+    def shutdown(self):
+        """Ask openconnect to close the tunnel cleanly, escalating if it refuses.
+
+        SIGINT and SIGTERM both make openconnect run vpnc-script with
+        reason=disconnect, which is what puts your routes and DNS back. SIGKILL
+        does not, so the graces here are deliberately generous: escalating early
+        is exactly what leaves a machine with no network.
+        """
+        with self._lock:
+            if self._closing:
+                return
+            self._closing = True
+
+        escalation = ((signal.SIGINT, 15), (signal.SIGTERM, 10), (signal.SIGKILL, 5))
+        for sig, grace in escalation:
+            if self.exited.is_set():
+                return
+            name = signal.Signals(sig).name
+            log(f"sending {name} to openconnect (pid {self.proc.pid})")
+            if sig is signal.SIGKILL:
+                self.killed = True
+                log("WARNING: openconnect ignored two polite signals; killing it")
+            try:
+                # Safe from PID reuse: the child stays a zombie until reap().
+                self.proc.send_signal(sig)
+            except (ProcessLookupError, OSError):
+                return
+            if self.exited.wait(timeout=grace):
+                return
+
+
+def relay_output(proc):
+    """Forward openconnect's output, and keep draining it if the tray is gone."""
+    for line in proc.stdout:
+        emit(line)
+
+
+def watch_control_channel(tunnel):
+    try:
+        for line in sys.stdin:
+            if line.strip().lower() in ("quit", "disconnect"):
+                log("disconnect requested")
+                return
+        log("tray applet closed the control pipe")
+    except (BrokenPipeError, ValueError, OSError) as exc:
+        log(f"control pipe error: {exc}")
+    finally:
+        tunnel.shutdown()
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--host", required=True, help="VPN URL from openconnect-sso")
+    parser.add_argument("--fingerprint", required=True, help="server certificate hash")
+    parser.add_argument("--ac-version", default="4.7.00136")
+    parser.add_argument("extra", nargs=argparse.REMAINDER)
+    args = parser.parse_args()
+
+    openconnect = find_openconnect()
+    if not openconnect:
+        log("cannot find the openconnect binary")
+        return 20
+
+    cookie = sys.stdin.readline().rstrip("\n")
+    if not cookie:
+        log("no session cookie arrived on stdin, aborting")
+        return 21
+
+    extra = [a for a in args.extra if a != "--"]
+    for option in extra:
+        name = option.split("=", 1)[0]
+        if name in UNSUPPORTED_OPTIONS:
+            log(f"refusing {name}: it would detach openconnect from this helper")
+            return 25
+    # Name the device so teardown can prove which interface is ours before
+    # deleting anything as root. A caller-supplied name is honoured instead.
+    ifname = requested_interface(extra)
+    caller_named = ifname is not None
+    if caller_named:
+        if not INTERFACE_RE.match(ifname):
+            log(f"refusing an unusable interface name: {ifname!r}")
+            return 22
+    else:
+        ifname = free_interface_name()
+        if ifname is None:
+            log("no free asuvpnN interface name available")
+            return 24
+        extra = [*extra, "--interface", ifname]
+
+    command = [
+        openconnect,
+        "--useragent",
+        f"AnyConnect Linux_64 {args.ac_version}",
+        "--version-string",
+        args.ac_version,
+        "--cookie-on-stdin",
+        "--servercert",
+        args.fingerprint,
+        *extra,
+        args.host,
+    ]
+
+    interfaces_before = tunnel_interfaces()
+    if interface_exists(ifname):
+        # Only reachable for a caller-supplied name now, since our own is chosen
+        # free. Never delete a device we were merely *told* to name: `--interface
+        # docker0` would otherwise have root destroy the caller's bridge before
+        # openconnect had even started.
+        log(f"{ifname} already exists; refusing to take over"
+            " a device we did not create")
+        return 23
+
+    # Logged only once every check has passed, immediately before the spawn.
+    # Logging it earlier meant syslog recorded root command lines that were then
+    # refused and never executed — reading, during an incident, exactly like
+    # commands that had run.
+    log(f"running as uid {os.geteuid()}: {shlex.join(command)!r}")
+
+    # Filled in once the device actually appears. Until then there is nothing
+    # this session can claim to own, and teardown deletes nothing.
+    owned = {}
+
+    # Handlers go up *before* the spawn. A signal landing between Popen and
+    # signal.signal() would take the default action and kill this process,
+    # leaving a root openconnect with no control channel — so the handler is
+    # installed first and reads the tunnel out of a holder once it exists.
+    # Handlers run on the main thread, which is about to park in reap(), so
+    # teardown is handed to a worker.
+    holder = {}
+
+    def on_signal(_signum, _frame):
+        tunnel = holder.get("tunnel")
+        if tunnel is None:
+            os._exit(1)  # nothing spawned yet; nothing to tear down
+        threading.Thread(target=tunnel.shutdown, daemon=True).start()
+
+    for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        signal.signal(sig, on_signal)
+
+    parent_pid = os.getpid()
+    # Spawned before any thread is started, which is what makes preexec_fn safe.
+    proc = subprocess.Popen(
+        command,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        errors="replace",
+        bufsize=1,
+        # parent_pid captured *before* the fork: preexec_fn runs in the child, so
+        # calling os.getpid() in there yields the child's own pid, the guard
+        # below always fires, and openconnect is killed before it ever starts.
+        preexec_fn=lambda: die_with_parent(parent_pid),  # noqa: PLW1509
+    )
+    tunnel = Tunnel(proc)
+    holder["tunnel"] = tunnel
+    threading.Thread(
+        target=watch_for_interface, args=(ifname, owned), daemon=True
+    ).start()
+
+    try:
+        proc.stdin.write(cookie + "\n")
+        proc.stdin.flush()
+        proc.stdin.close()
+    except (OSError, ValueError) as exc:
+        # openconnect can be gone already — an --interface name in use, a
+        # missing vpnc-script. Writing to its closed stdin raises, and an
+        # unhandled traceback here would replace its real exit status with a
+        # crash the tray cannot explain.
+        log(f"openconnect closed its input before the cookie arrived: {exc}")
+
+    relay = threading.Thread(target=relay_output, args=(proc,), daemon=True)
+    relay.start()
+    threading.Thread(target=watch_control_channel, args=(tunnel,), daemon=True).start()
+
+    returncode = tunnel.reap()
+    relay.join(timeout=5)
+    if returncode < 0:
+        signalled = signal.Signals(-returncode).name
+        log(f"openconnect was terminated by {signalled}")
+        returncode = 128 - returncode
+    else:
+        log(f"openconnect exited with status {returncode}")
+    verify_teardown(ifname, interfaces_before, tunnel.killed, owned.get("ifindex"))
+    return returncode
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,18 @@
+# Static analysis config. `ruff check` should be clean on a fresh checkout.
+line-length = 88
+
+[lint]
+select = ["F", "E", "W", "B", "C4", "PIE", "PLE", "RUF", "SIM", "S", "BLE", "PLW"]
+
+ignore = [
+    # E402 stays enabled; the gi imports sit inside a try block, not at module
+    # top level, so it does not fire on them.
+    # subprocess is inherent to this program; every call passes a list, never a
+    # shell string, and the results are inspected rather than trusted.
+    "S404", "S603", "S607", "PLW1510",
+    # Constants naming a credential *state*, not a credential.
+    "S105",
+    # Deliberate: notifications, log writes and teardown must never raise into
+    # the caller. Each site says why in a comment.
+    "S110", "BLE001", "SIM105",
+]

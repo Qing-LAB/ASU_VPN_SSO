@@ -1,0 +1,640 @@
+# ASU VPN SSO
+
+**Click-to-connect for the ASU VPN on Linux.** A GNOME panel applet and an
+`asuvpn` command line client for Arizona State University's SSL VPN
+(`sslvpn.asu.edu`), wrapping [`openconnect`](https://www.infradead.org/openconnect/)
+and [`openconnect-sso`](https://github.com/vlaci/openconnect-sso).
+
+## Why
+
+ASU's VPN uses Cisco AnyConnect with SAML single sign-on and Duo. There is no
+official Linux client, so the practical route is `openconnect-sso` — which works
+well, but is a foreground terminal program. It wants a terminal for its prompts
+and for `sudo`, it dies with the shell you started it in, and if it is stopped
+the wrong way it can leave your routing table and DNS in pieces, with no network
+until you reboot or bounce the interface.
+
+This turns that into something you click. Launch it, finish the ASU sign-in in
+the browser window that appears, and the tunnel stays up in the background with
+an icon in the notification area for disconnect, reconnect and the log.
+Everything the icon does is also available from the command line, so it scripts
+as well as it clicks.
+
+Most of the engineering here is in the part nobody enjoys: making sure that
+however the tunnel ends — you disconnect, you log out, the applet crashes, the
+helper is killed — `openconnect` still gets to put your routes and DNS back.
+
+## Who it is for
+
+Built and tested for **ASU on Ubuntu/Debian with GNOME**. If that is you, the
+[Quick start](#quick-start) should be the whole story.
+
+Outside that, treat it as a starting point rather than a supported
+configuration:
+
+- **Another university or company VPN.** Anything that `openconnect-sso` can
+  sign in to should work — pass `--server your.vpn.edu`. Untested beyond ASU.
+- **Another desktop.** The tray icon needs a StatusNotifier host. KDE has one
+  built in; GNOME needs the AppIndicator extension, which `bootstrap.sh`
+  installs. Untested outside GNOME.
+- **Another distribution.** `bootstrap.sh` is apt-only and will stop with the
+  dependency list rather than guess. The applet itself is plain Python and GTK 3.
+
+> [!NOTE]
+> `bootstrap.sh` installs around thirty apt packages including a build
+> toolchain, compiles `lxml` from source, may add the deadsnakes PPA for
+> Python 3.12, and enables a GNOME extension. Read
+> [Requirements](#requirements) first if that matters to you.
+
+---
+
+**Contents**
+
+- [Quick start](#quick-start)
+- [Using it](#using-it)
+- [What gets installed, and where](#what-gets-installed-and-where)
+- [Removing it](#removing-it)
+- [Security](#security)
+- [How it works](#how-it-works)
+- [Requirements](#requirements)
+- [Troubleshooting](#troubleshooting)
+- [Repository layout](#repository-layout)
+- [Status](#status)
+- [License](#license)
+
+---
+
+## Quick start
+
+```bash
+git clone https://github.com/Qing-LAB/ASU_VPN_SSO.git
+cd ASU_VPN_SSO
+./bootstrap.sh
+```
+
+`bootstrap.sh` installs whatever is missing, installs the app into `~/.local`,
+and registers the launcher. It is safe to re-run: nothing already satisfied is
+reinstalled. It runs `sudo apt-get update` on every run that has dependencies
+enabled (stale package lists otherwise cause packages to be silently skipped),
+so it asks for `sudo` each time; `--no-deps` skips that entirely. It asks
+before adding the deadsnakes PPA (see [Requirements](#requirements) for why
+Python 3.12 is needed).
+
+| Flag | Effect |
+| --- | --- |
+| `--server HOST` | The endpoint for both the launcher and the `asuvpn` command (default `sslvpn.asu.edu`) |
+| `--yes` | Never prompt, including for the PPA |
+| `--no-deps` | Skip system packages, just install and register the app |
+| `--link` | Run from the checkout instead of copying into `~/.local` |
+
+One-time step if you have never signed in with `openconnect-sso` on this machine
+— it needs to save your password to the login keyring, and the applet will not
+guess a blank one:
+
+```bash
+openconnect-sso --server sslvpn.asu.edu --authenticate=shell
+```
+
+`--authenticate=shell` matters: without it, `openconnect-sso` goes on to run
+`sudo openconnect` itself and leaves a foreground tunnel you have to Ctrl-C.
+
+## Using it
+
+Launching the app connects straight away:
+
+1. `openconnect-sso` opens a browser window for the ASU sign-in, including Duo.
+2. A polkit dialog asks for **your own** password, because `openconnect` needs
+   root to create the tun device. This replaces the terminal `sudo` prompt you
+   get from `openconnect-sso` on its own — a desktop launcher has no terminal to
+   type into. You are asked once per connect, and never to disconnect.
+3. The tunnel stays up in the background.
+
+### The panel icon
+
+| Icon | State |
+| --- | --- |
+| Filled VPN badge | Connected |
+| Dashed VPN badge | Disconnected |
+| Acquiring badge | Signing in, connecting, or disconnecting |
+| Error badge | Something failed |
+
+The menu shows only what applies to the current state: **Connect** when down,
+**Disconnect** and **Reconnect** when up, and **Cancel** while signing in or
+connecting. It is not offered during teardown, which must not be interrupted.
+**Show log…** opens a live log window, and **Quit** closes the tunnel first.
+
+**Start on login (applet only)** puts the icon in your tray at login without
+connecting — so you are not met with a Duo push before you have asked for one.
+
+Right-clicking the app icon in the dash also offers Disconnect and Reconnect.
+
+### The command line
+
+`asuvpn` does the same things as the menu. If an applet is already running it
+drives that one rather than starting a second.
+
+```bash
+asuvpn                  # same as: asuvpn connect
+asuvpn connect          # sign in and bring the tunnel up
+asuvpn status           # what state is it in
+asuvpn disconnect       # close the tunnel, leave the applet running
+asuvpn reconnect        # sign in again and replace the tunnel
+asuvpn log -f           # follow this session's log
+asuvpn quit             # close the tunnel and stop the applet
+asuvpn tray             # run the applet in the foreground, do not connect
+```
+
+Every command prints the resulting state, so nothing happens silently.
+
+By default `connect` returns as soon as the applet is running, while the sign-in
+is still in progress — it does not tie up your terminal waiting for a Duo push.
+Add `--wait` when the next thing you do depends on the tunnel actually being up:
+
+```bash
+asuvpn connect --wait && rsync -a ./data internal-host:/srv/
+```
+
+Exit codes are meant for scripting:
+
+| Exit code | Meaning |
+| --- | --- |
+| `0` | The request was carried out — and for `status` or `--wait`, connected |
+| `1` | `status` or `--wait`: not connected. `disconnect`: the tunnel did not close |
+| `2` | A bad command line (argparse's own code) |
+| `3` | `status`: the applet is not running |
+| `4` | A different server was asked for than the running applet is using |
+
+Actions report whether the action worked, so a successful `disconnect` exits 0.
+Only `status` and `--wait` report connectedness. `asuvpn log` exits 1 when there
+is no log yet.
+
+```bash
+asuvpn status >/dev/null || asuvpn connect --wait
+```
+
+Other options: `--server HOST` for a different endpoint, `--foreground` to keep
+the applet attached to the terminal, and a bare `--` to pass extra arguments
+through to `openconnect`. Flags may go before or after the command.
+
+```bash
+asuvpn --server vpn.other.edu connect
+asuvpn connect -- --script /path/to/vpnc-script
+```
+
+An applet only ever serves one server. Asking a running one for a different
+endpoint is refused with exit code 4 rather than quietly connecting to the
+wrong place; `asuvpn quit` first. This compares the endpoint actually in
+use, so it also catches the case where `install.sh` was re-run with a new
+`--server` while an applet was still up.
+
+## What gets installed, and where
+
+Everything lands under `~/.local`. Nothing is written outside `$HOME`, no system
+files are touched, and no part of the installation needs root. The program is
+**copied**, so the checkout can be moved or deleted afterwards.
+
+| Path | What it is |
+| --- | --- |
+| `~/.local/share/asuvpn/` | `asuvpn-tray`, `asuvpn-helper` and the icon: the installed program |
+| `~/.local/share/applications/asuvpn.desktop` | Launcher, with Disconnect/Reconnect actions |
+| `~/.local/share/icons/hicolor/scalable/apps/asuvpn.svg` | The app-grid icon |
+| `~/.local/bin/asuvpn` | Symlink to the installed `asuvpn-tray` |
+| `~/.config/asuvpn/server` | The endpoint, so the launcher and the `asuvpn` command agree |
+
+The `.desktop` file is what puts **ASU VPN** in the Activities overview and app
+grid. `install.sh` refreshes the desktop and icon caches, so it appears without
+a logout.
+
+Runtime state lives elsewhere, and is created on demand:
+
+| Path | What it is |
+| --- | --- |
+| `~/.cache/asuvpn/session.log` | Session log, truncated on each connect |
+| `~/.config/autostart/asuvpn-tray.desktop` | Written only when you tick "Start on login (applet only)" |
+| abstract socket `asuvpn-tray-$UID` | Single-instance guard and CLI channel; peer uid is checked, and it vanishes with the process |
+
+Separately, `bootstrap.sh` installs system packages with `apt`, and installs
+`openconnect-sso` into its own pipx venv under `~/.local/share/pipx/`.
+
+### Running from the checkout instead
+
+`--link` skips the copy and points the launcher at the checkout, so your edits
+take effect immediately. The checkout then has to stay where it is.
+
+```bash
+./bootstrap.sh --link
+```
+
+## Removing it
+
+```bash
+asuvpn quit
+rm -rf ~/.local/share/asuvpn ~/.cache/asuvpn ~/.config/asuvpn
+rm -f  ~/.local/share/applications/asuvpn.desktop \
+       ~/.local/share/icons/hicolor/scalable/apps/asuvpn.svg \
+       ~/.local/bin/asuvpn \
+       ~/.config/autostart/asuvpn-tray.desktop
+update-desktop-database ~/.local/share/applications
+```
+
+That removes the app completely. It deliberately leaves the things it did not
+own: `openconnect-sso` (`pipx uninstall openconnect-sso`), the apt packages, the
+deadsnakes PPA, the AppIndicator GNOME extension, your keyring entries, and any
+polkit rule you added by hand.
+
+## Security
+
+The design assumes you would rather understand the privilege boundary than trust
+it, so here it is in full.
+
+### What runs as you
+
+Nearly everything. The applet, the CLI, and the sign-in browser all run as your
+normal user, with no elevation:
+
+- reads `~/.config/openconnect-sso/config.toml`
+- runs `openconnect-sso`, which opens the Qt browser window for ASU SSO and Duo
+- reads your password **from the login keyring** — see below
+- writes `~/.cache/asuvpn/session.log`
+- writes `~/.config/autostart/…` only when you tick "Start on login (applet only)"
+- binds an abstract Unix socket for the single-instance guard and the CLI.
+  Abstract sockets carry no filesystem permissions, so every connection's peer
+  uid is checked with `SO_PEERCRED` and anything else is refused — otherwise
+  another local user could drop your tunnel, read your assigned VPN address,
+  or call `connect` to raise an admin password prompt on your desktop at will
+
+### What runs as root
+
+Only `asuvpn-helper`, only via `pkexec`, and only after you approve the polkit
+dialog. Once elevated it does exactly three things:
+
+1. runs `openconnect` with the session cookie fed on stdin, and stays alive as
+   its supervisor for the life of the tunnel — it does not exec and step aside,
+2. signals `openconnect` to shut down when the control pipe closes,
+3. after exit, deletes a tunnel interface that outlived `openconnect` and reads
+   the default route back, to confirm your network was restored.
+
+### What it never does
+
+- **Never sees your password.** `openconnect-sso` reads it from the login
+  keyring, and the polkit password goes to GNOME's authentication agent. Neither
+  passes through this app. The pre-flight check asks the keyring only whether a
+  password exists and receives back one of four literal strings — `ready`,
+  `no-password`, `no-credentials` or `unknown` — never the password itself.
+- **Never writes to the keyring.**
+- **Never logs the session cookie**, and never puts it on a command line where
+  `ps` could show it. It is written to the helper's stdin and nowhere else.
+  Note this is a property of the default arguments: `asuvpn connect --
+  --dump-http-traffic` would make *openconnect* print the cookie header, and
+  that lands in the log like any other output.
+- **Never modifies system files or settings — at run time.** Installing the app
+  is confined to `$HOME` and needs no root at all. `bootstrap.sh` is the sole
+  exception, and only on the dependency pass: it runs `apt` under `sudo`, asks
+  before adding the deadsnakes PPA, and enables the AppIndicator GNOME extension
+  (a dconf setting in your own profile). `--no-deps` skips all of it.
+- **Never leaves a privileged process behind.** See
+  [the control pipe](#the-control-pipe).
+
+### The password prompt, and why it is not cached
+
+`pkexec` is polkit's equivalent of `sudo`. Ubuntu's default for
+`org.freedesktop.policykit.exec` is `auth_admin`:
+
+```xml
+<allow_any>auth_admin</allow_any>
+<allow_inactive>auth_admin</allow_inactive>
+<allow_active>auth_admin</allow_active>
+```
+
+`auth_admin` does **not** cache, so you are asked once for every connect and
+reconnect. You are never asked to disconnect, because closing the control pipe
+requires no privileges at all.
+
+### Making it prompt less — don't
+
+An earlier version of this file suggested a polkit rule returning
+`AUTH_ADMIN_KEEP` for this helper, to cache the password for a few minutes. That
+advice was wrong, and it is removed rather than corrected.
+
+`pkexec` runs **every** program under the one action id
+`org.freedesktop.policykit.exec` — which is exactly why such a rule has to
+disambiguate on `action.lookup("program")`. But polkit's temporary authorization
+is keyed on the *action* and the session, not on the program. Authorising a
+single VPN connect under `AUTH_ADMIN_KEEP` therefore leaves `pkexec <anything>`
+passwordless for the rest of the retention window. It converts "malware has to
+phish your password" into "malware waits until you click Connect".
+
+`polkit.Result.YES` is worse again: permanent passwordless root for whatever sits
+at that path, and that path is inside your home directory.
+
+If the per-connect prompt bothers you, the safe lever is connecting less often,
+not widening the authorisation.
+
+### Things worth knowing before you trust it
+
+- **The helper lives in your home directory.** Anything able to write
+  `~/.local/share/asuvpn/asuvpn-helper` runs as root at your next connect, when
+  you approve the dialog. That is inherent to `pkexec`-ing a user-owned script.
+  The helper runs under `python3 -I` so that its *directory* is not on
+  `sys.path` — otherwise dropping a `signal.py` beside it would be enough, with
+  no need to touch the helper itself.
+- **`--` passes arguments straight to `openconnect`, as root.** `asuvpn connect
+  -- --script /path/to/script` will run that script with root privileges. This
+  is deliberate — it is how you supply a custom `vpnc-script` — but it is a real
+  capability, not a cosmetic passthrough.
+- **The applet trusts the fingerprint from `openconnect-sso`.** Certificate
+  pinning is `openconnect`'s job, via the `--servercert` value produced during
+  sign-in; this app passes it through unmodified.
+
+## How it works
+
+Connecting is split across a privilege boundary, which is the whole point of the
+design:
+
+```
+  you ──▶ asuvpn-tray ──▶ openconnect-sso ──▶ browser window (ASU SSO + Duo)
+              │                  │
+              │                  └──▶ host + certificate fingerprint + cookie
+              │
+              └──▶ pkexec ──▶ asuvpn-helper (root) ──▶ openconnect ──▶ asuvpn0
+                                    ▲
+                          cookie on stdin, never on argv
+```
+
+- **`asuvpn-tray`** runs as you. It drives `openconnect-sso --authenticate=shell`,
+  which performs the SAML/Duo login in a browser and prints back a host, a
+  server certificate fingerprint, and a short-lived session cookie.
+- **`asuvpn-helper`** runs as root under `pkexec`. It receives only the cookie,
+  on stdin, and hands it to `openconnect`.
+
+The browser never runs as root, and the cookie never appears in the log or on a
+command line where `ps` would show it.
+
+### Why pkexec instead of sudo
+
+Run on its own, `openconnect-sso` finishes the browser login and then shells out
+to `sudo openconnect …` itself — that is the terminal password prompt you get
+when you run it by hand. Passing `--authenticate=shell` stops it one step
+earlier: it prints the host, fingerprint and cookie and exits, never reaching
+its sudo call.
+
+The applet then makes the privileged call itself, with `pkexec`. That is not
+cosmetic. A `.desktop` launcher has no terminal, so a `sudo` password prompt
+would have nowhere to appear and the connect would just hang; `pkexec` asks
+through the GNOME polkit dialog instead.
+
+### The control pipe
+
+The helper keeps reading the same stdin pipe for the life of the tunnel. Closing
+the pipe *is* the disconnect signal, which buys two things:
+
+- **Disconnecting never asks for your password again.** The tray already holds
+  the write end; it just closes it. No second privileged call is needed.
+- **A crashed tray cannot strand the tunnel.** The helper sees EOF and tears
+  `openconnect` down, instead of leaving a root process holding your routing
+  table. This is verified by killing the applet with `SIGKILL` and checking that
+  nothing survives.
+
+The helper also relays `openconnect`'s output rather than handing it the tray's
+pipe directly. That costs a thread, but it means a dead tray cannot hit
+`openconnect` with `SIGPIPE` and kill it *before* it restores your routes and
+DNS.
+
+### Every way of stopping it
+
+All of these end in the same graceful teardown: `openconnect` receives `SIGINT`
+and gets 15 seconds to run `vpnc-script` before anything harsher is considered.
+
+| How you stop it | What happens |
+| --- | --- |
+| Tray menu → **Disconnect** | The tray closes the control pipe, the helper signals `openconnect`, routes are restored. The applet stays running. |
+| Tray menu → **Quit** | The same teardown, then the applet exits. |
+| `asuvpn disconnect` / `asuvpn quit` | Routed to the applet over the control socket. Identical to the menu. |
+| **Ctrl+C**, in `tray` or `--foreground` mode | The applet catches `SIGINT` and runs the orderly teardown. |
+| **Closing the terminal** (`SIGHUP`) | Same as Ctrl+C. |
+| **Logging out** (`SIGTERM`) | Same as Ctrl+C. |
+| The applet **crashes** or is `kill -9`ed | The control pipe closes, the helper sees EOF and tears the tunnel down. Nothing is left holding your routes. |
+| The **helper** itself dies (OOM, `kill -9`) | The kernel signals `openconnect` via `PR_SET_PDEATHSIG`, so it still runs `vpnc-script`. |
+
+> [!NOTE]
+> `asuvpn connect` from a terminal puts the applet in its own session and
+> returns. Ctrl+C afterwards does nothing, because the applet is no longer
+> attached to your terminal — use `asuvpn disconnect`.
+
+The helper is deliberately started in its **own session**, so a Ctrl+C aimed at
+the applet does not also land on `openconnect`. That leaves exactly one teardown
+path instead of two racing ones. An earlier version got this wrong: the terminal
+signalled every process at once, two shutdowns ran concurrently, and the escalation
+timer misread a healthy teardown as a hang and escalated to `SIGKILL` — which is
+the one thing guaranteed to stop `vpnc-script` from restoring the routing table.
+
+### Putting the network back
+
+`openconnect` restores your routes and DNS by running `vpnc-script` with
+`reason=disconnect` on the way out — but only when it exits *gracefully*. If it
+is killed outright the script never runs, which is the classic way to end up
+with no working network until you reboot or toggle the interface. Three things
+guard against that:
+
+- **Gentle escalation.** Teardown sends `SIGINT`, waits 15 seconds, then
+  `SIGTERM` for another 10, and only then `SIGKILL`. Both polite signals make
+  `openconnect` run the disconnect script; killing early is precisely what
+  breaks things, so the graces are deliberately generous.
+- **No `SIGPIPE` deaths.** Relaying output keeps `openconnect` alive long enough
+  to finish that script even if the tray is gone.
+- **A dead supervisor still triggers teardown.** The control pipe covers the
+  tray dying; `PR_SET_PDEATHSIG` covers the helper dying. Without it, killing
+  the helper left `openconnect` running as root with nothing able to reach it,
+  while the tray cheerfully reported the connection as dropped. (In that path
+  the kernel may deliver the signal twice, a millisecond apart; `openconnect`
+  treats the second as a repeat of the same cancellation.)
+- **A check afterwards.** After `openconnect` exits, the helper deletes the
+  tunnel device if it outlived it — removing an interface takes its routes with
+  it — then prints the restored default route, or a warning if there is none.
+  Warnings also raise a desktop notification, so a broken teardown is visible
+  instead of silent.
+
+The tunnel device is named **`asuvpn0`** (or the first free `asuvpnN`) rather
+than the usual `tun0`. That is
+what makes the cleanup above safe: teardown can prove which interface is its own
+instead of deleting anything that merely looks like a tunnel. Guessing by name
+prefix would eventually delete a VM's `tap0` or a second VPN's `tun1` — as root,
+while trying to *fix* your networking. Anything else that appeared meanwhile is
+reported and left alone. Passing your own `--interface` through `--` overrides
+the name, and teardown then tracks that one instead.
+
+A healthy disconnect ends with a line like:
+
+```
+18:32:14  [helper] default route restored: default via 198.51.100.1 dev wlan0 proto dhcp metric 600
+```
+
+If instead you see `[helper] WARNING: no default route after teardown — network
+is likely broken`, the recovery is:
+
+```bash
+nmcli networking off && nmcli networking on
+```
+
+### Two upstream quirks worth knowing
+
+**The TOTP prompt.** `openconnect-sso` asks for a TOTP secret on the terminal
+whenever its keyring entry is empty, which is every run for a Duo-push setup.
+Launched from a desktop icon there is no terminal, so `getpass` hits `EOFError`
+and the sign-in dies before the browser even opens. The applet answers that
+prompt with a blank line, meaning "not required", and lets the browser handle
+the second factor.
+
+**The password prompt behind it.** The same code path asks for your *password*
+first when the keyring has none, and a blank answer there would be silently
+saved as your password. So the applet probes the keyring first and stops with
+`no saved password` rather than guessing.
+
+## Requirements
+
+`bootstrap.sh` handles all of this. It is written down because the Python
+version in particular is easy to get wrong.
+
+### The applet
+
+Runs on the **system** `python3` with GTK 3, Ayatana AppIndicator and libnotify
+bindings:
+
+```
+python3-gi  gir1.2-gtk-3.0  gir1.2-ayatanaappindicator3-0.1  gir1.2-notify-0.7
+```
+
+It deliberately uses `/usr/bin/python3` in its shebang rather than whatever is
+first on `PATH`, because a conda or pyenv install will shadow it and will not
+have `gi`.
+
+Also needed: `openconnect`, `pkexec`, and the GNOME AppIndicator extension
+(`gnome-shell-ubuntu-extensions`) — without the extension GNOME has nowhere to
+draw a tray icon.
+
+### openconnect-sso needs Python 3.12
+
+This is the fiddly part. `openconnect-sso` pins `lxml <5` and
+`PyQt6-WebEngine <7`, and neither publishes wheels for Python 3.13+. Ubuntu
+26.04 ships only 3.14, so 3.12 has to come from the deadsnakes PPA, and `lxml`
+compiles from source, which needs a toolchain and headers:
+
+```bash
+sudo add-apt-repository ppa:deadsnakes/ppa
+sudo apt install python3.12 python3.12-venv python3.12-dev \
+                 build-essential libxml2-dev libxslt1-dev zlib1g-dev \
+                 libffi-dev libssl-dev pkg-config
+pipx install --python /usr/bin/python3.12 'openconnect-sso[full]'
+pipx inject openconnect-sso 'setuptools<71'
+```
+
+Two details that are easy to miss:
+
+- The **`[full]` extra** pulls in keyring support.
+- The **`setuptools<71` pin** matters: `openconnect-sso` still imports
+  `pkg_resources`, which setuptools 71 dropped.
+
+Qt6 WebEngine also dlopens a set of shared libraries for the sign-in window
+(`libnss3`, `libxcomposite1`, `libxdamage1`, `libxrandr2`, `libxkbcommon-x11-0`,
+`libxcb-cursor0`, `libgl1`, `libegl1`, `libxtst6`, `libdbus-1-3`, `fontconfig`).
+`libxcb-cursor0` is the one people hit on X11 sessions.
+
+## Troubleshooting
+
+Start with the log, either from the menu's **Show log…** or:
+
+```bash
+asuvpn log -f
+```
+
+| Symptom | Cause and fix |
+| --- | --- |
+| `no saved password` | The keyring has no password and the applet will not guess a blank one. Run `openconnect-sso --server sslvpn.asu.edu --authenticate=shell` once in a terminal. |
+| `authorization cancelled` | The polkit dialog was dismissed, or the password was wrong. Run `asuvpn connect` again. |
+| No icon in the panel | `gnome-extensions enable ubuntu-appindicators@ubuntu.com` |
+| `asuvpn: command not found` | `~/.local/bin` is not on your `PATH`. Add it, or run `pipx ensurepath` and open a new terminal. |
+| The sign-in window never appears | That is `openconnect-sso`, not this applet. Run `openconnect-sso --server sslvpn.asu.edu --authenticate=shell` to see the real error. |
+| `could not load the Qt platform plugin "xcb"` | Missing `libxcb-cursor0`. Re-run `./bootstrap.sh`. |
+| Log stops at `signed in, starting openconnect` | The polkit dialog never appeared. Check that a polkit agent is running, and that you are in the `sudo` group. |
+| `WARNING: no default route after teardown` | Teardown could not restore routing. `nmcli networking off && nmcli networking on`. |
+
+## Repository layout
+
+| Path | What it is |
+| --- | --- |
+| [`asuvpn-tray`](asuvpn-tray) | The applet and the `asuvpn` CLI. Runs as you, on the system `python3`. |
+| [`asuvpn-helper`](asuvpn-helper) | The root side, run under `pkexec`. Owns `openconnect`'s lifetime. |
+| [`bootstrap.sh`](bootstrap.sh) | Installs dependencies, then calls `install.sh`. |
+| [`install.sh`](install.sh) | Copies the app into `~/.local` and registers it. No system changes. |
+| [`asuvpn.svg`](asuvpn.svg) | App icon. |
+| [`ruff.toml`](ruff.toml) | Lint config. Its `ignore` list records which rules are off and why. |
+
+### Checking it
+
+The two Python files have no `.py` extension, so copy them under one before
+running the analysers:
+
+```bash
+mkdir -p /tmp/asuvpn-lint && cp ruff.toml /tmp/asuvpn-lint/
+cp asuvpn-tray /tmp/asuvpn-lint/asuvpn_tray.py
+cp asuvpn-helper /tmp/asuvpn-lint/asuvpn_helper.py
+
+ruff check /tmp/asuvpn-lint
+pyflakes   /tmp/asuvpn-lint/*.py
+pylint --disable=all --enable=E --ignored-modules=gi,gi.repository /tmp/asuvpn-lint/*.py
+bandit -q -r /tmp/asuvpn-lint -ll
+vulture --min-confidence 70 /tmp/asuvpn-lint/*.py
+shellcheck -S style bootstrap.sh install.sh
+```
+
+All of these are expected to be clean. `mypy --check-untyped-defs` still reports
+`Popen.stdin` as `IO | None`; that is a limitation of the stubs, not a defect —
+`stdin=PIPE` guarantees it, and every such write is exception-guarded anyway.
+
+## Status
+
+Exercised with stand-in `openconnect-sso`, `pkexec` and `openconnect` binaries,
+the last of which models a teardown that takes real time to restore routes:
+connect, disconnect, reconnect while connected, quit while connected, Ctrl+C in
+foreground mode, crash safety under `SIGKILL`, a dismissed authorization dialog,
+four simultaneous launches racing for the single-instance guard, every exit code,
+the `--` passthrough, and installing from an arbitrary directory in both copy and
+`--link` modes. Each teardown path was checked for a single `SIGINT`, no spurious
+escalation, and a restored default route.
+
+Specific defences were tested by trying to defeat them, not by inspection:
+
+- **Import injection.** A `signal.py` dropped beside the helper executes when the
+  helper runs without `-I`, and is ignored with it. The shebang is load-bearing.
+- **Control socket.** With the peer check inverted so an ordinary connection
+  looks foreign, the applet refuses it and logs the uid.
+- **Interface safety.** `--interface <an existing device>` is refused rather than
+  deleted; `--interface ../../etc/passwd` is rejected; the parser takes the last
+  `--interface`, matching what getopt hands openconnect.
+- **Cookie hygiene.** The cookie string appears zero times in the session log and
+  zero times in the journal; only the `--cookie-on-stdin` flag name is there.
+- **State reporting.** A rejected cookie surfaces as "Cookie was rejected by
+  server", not a bare exit code; a mid-tunnel `Connection lost` drops the badge
+  out of Connected so `asuvpn status` stops exiting 0.
+
+Checked against the real tools: the sign-in browser reaches ASU's SAML page, the
+keyring probe reports correctly, and GNOME resolves the launcher and icon.
+
+> [!IMPORTANT]
+> Stand-ins are only as good as the strings they imitate. An earlier version
+> of the fake `openconnect` printed `Connected as …`, which openconnect has
+> not said since v7 — so the applet's connect detection passed every test
+> while being dead against the real v9.12 binary, and would have hung in
+> "Connecting…" on any network without DTLS. The patterns are now taken from
+> the installed binary's own message catalogue (`strings libopenconnect.so.5`)
+> rather than from memory, and replayed against realistic v9.12 transcripts
+> for the DTLS, TLS-only, proxied, rehandshake and drop-then-recover cases.
+
+**Not yet exercised end to end:** a real `pkexec` prompt and a live tunnel, which
+need an actual Duo approval. The first real connect is therefore the one path
+still unproven — in particular, watch for the `default route restored:` line
+after your first disconnect.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
