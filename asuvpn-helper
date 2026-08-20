@@ -26,12 +26,16 @@ import argparse
 import ctypes
 import os
 import re
+import secrets
 import shlex
 import shutil
 import signal
+import stat
 import subprocess
 import sys
+import socket
 import syslog
+import tempfile
 import threading
 import time
 
@@ -40,6 +44,22 @@ PR_SET_PDEATHSIG = 1
 IP_CANDIDATES = ("/usr/sbin/ip", "/sbin/ip", "/usr/bin/ip")
 TUNNEL_PREFIXES = ("tun", "tap", "vpn")
 INTERFACE_PREFIX = "asuvpn"
+HERE = os.path.dirname(os.path.abspath(__file__))
+NOTIFY = os.path.join(HERE, "asuvpn-notify")
+DEFAULT_VPNC_SCRIPT = "/usr/share/vpnc-scripts/vpnc-script"
+# Root-only, so that nothing else on the machine can inject state events. The
+# directory bit is the whole access control: 0700 root:root denies traversal to
+# every other uid, and only root could reach the socket inside it anyway.
+RUNTIME_ROOT = "/run/asuvpn"
+
+# openconnect's documented script contract, not log text. These five values have
+# been stable since vpnc; the log wording has not.
+REASON_STATES = {
+    "connect": "connected",
+    "reconnect": "connected",
+    "attempt-reconnect": "connecting",
+    "disconnect": "disconnected",
+}
 # IFNAMSIZ is 16 including the NUL. Anything outside this cannot name a device,
 # and unchecked it would reach an `ip link delete` running as root.
 INTERFACE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,14}$")
@@ -58,6 +78,76 @@ UNSUPPORTED_OPTIONS = (
 )
 
 syslog.openlog("asuvpn-helper", syslog.LOG_PID, syslog.LOG_DAEMON)
+
+
+def unsafe_write_access(path):
+    """Why `path` is writable by a principal other than its owner, or None.
+
+    Group-writable is not automatically a finding. Debian and Ubuntu default to
+    umask 002 with user-private groups, so a plain git checkout is 0775 with
+    gid == uid — the "group" is one person, and refusing there would break
+    --link mode for no gain. A *shared* group is a second principal, and
+    world-writable always is.
+    """
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    if st.st_mode & stat.S_IWOTH:
+        return "world-writable"
+    if st.st_mode & stat.S_IWGRP and st.st_gid != st.st_uid:
+        return f"writable by group {st.st_gid}"
+    return None
+
+
+def event_channel():
+    """A private datagram socket for script events, or (None, None, None).
+
+    /run when we are root, which is the real case; a 0700 temp directory
+    otherwise so the mechanism stays testable without privileges.
+    """
+    try:
+        if os.geteuid() == 0:
+            os.makedirs(RUNTIME_ROOT, mode=0o700, exist_ok=True)
+            os.chmod(RUNTIME_ROOT, 0o700)
+            directory = tempfile.mkdtemp(prefix=f"{os.getpid()}-", dir=RUNTIME_ROOT)
+        else:
+            directory = tempfile.mkdtemp(prefix="asuvpn-")
+        os.chmod(directory, 0o700)
+        path = os.path.join(directory, "events")
+        server = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+        server.bind(path)
+        os.chmod(path, 0o600)
+        return server, path, directory
+    except OSError as exc:
+        log(f"no event channel ({exc}); falling back to output matching")
+        return None, None, None
+
+
+def serve_events(server, token, ifname, owned):
+    """Translate openconnect's script events into state lines for the tray."""
+    while True:
+        try:
+            data, _ = server.recvfrom(4096)
+        except OSError:
+            return
+        parts = data.decode("utf-8", "replace").split("\t")
+        # Length and token both checked: a short or unrecognised datagram is
+        # discarded rather than indexed into.
+        if len(parts) < 5 or not secrets.compare_digest(parts[0], token):
+            continue
+        reason, device, ip4, ip6 = parts[1], parts[2], parts[3], parts[4]
+        state = REASON_STATES.get(reason)
+        if state is None:
+            continue  # pre-init: the tunnel is not configured yet
+        address = ip4 or ip6
+        if state == "connected":
+            # The authoritative moment to claim the device: openconnect has just
+            # created it, so this ifindex is provably ours.
+            index = interface_index(device or ifname)
+            if index is not None:
+                owned["ifindex"] = index
+        emit(f"[helper] STATE {state} dev={device or ifname} addr={address}\n")
 
 
 def emit(text):
@@ -140,6 +230,32 @@ def requested_interface(extra):
         elif arg.startswith("--interface="):
             chosen = arg.split("=", 1)[1]
     return chosen
+
+
+def requested_script(extra):
+    """The caller's --script value, so the wrapper can chain to it."""
+    chosen = None
+    for index, arg in enumerate(extra):
+        if arg in ("--script", "-s") and index + 1 < len(extra):
+            chosen = extra[index + 1]
+        elif arg.startswith("--script="):
+            chosen = arg.split("=", 1)[1]
+    return chosen
+
+
+def strip_script_option(extra):
+    """Drop the caller's --script; the wrapper takes its place and chains to it."""
+    skip = False
+    for index, arg in enumerate(extra):
+        if skip:
+            skip = False
+            continue
+        if arg in ("--script", "-s"):
+            skip = index + 1 < len(extra)
+            continue
+        if arg.startswith("--script="):
+            continue
+        yield arg
 
 
 def free_interface_name():
@@ -319,9 +435,14 @@ class Tunnel:
 
 
 def relay_output(proc):
-    """Forward openconnect's output, and keep draining it if the tray is gone."""
+    """Forward openconnect's output, and keep draining it if the tray is gone.
+
+    Prefixed, so the tray can tell our messages from openconnect's. Sharing one
+    unframed pipe meant a VPN banner containing "[helper] WARNING:" could raise
+    a desktop notification with text the server chose.
+    """
     for line in proc.stdout:
-        emit(line)
+        emit(f"[vpn] {line.rstrip(chr(10))}\n")
 
 
 def watch_control_channel(tunnel):
@@ -344,6 +465,15 @@ def main():
     parser.add_argument("--ac-version", default="4.7.00136")
     parser.add_argument("extra", nargs=argparse.REMAINDER)
     args = parser.parse_args()
+
+    # This runs as root from a directory the unprivileged user owns. That is
+    # inherent and documented, but group- or world-writable is not: it would let
+    # a *second* account take root at the next connect. Enforced, not just noted.
+    for path in (HERE, os.path.abspath(__file__), NOTIFY):
+        reason = unsafe_write_access(path)
+        if reason:
+            log(f"refusing to run: {path} is {reason}")
+            return 26
 
     openconnect = find_openconnect()
     if not openconnect:
@@ -375,6 +505,19 @@ def main():
             log("no free asuvpnN interface name available")
             return 24
         extra = [*extra, "--interface", ifname]
+
+    # State comes from openconnect's script contract rather than its log text.
+    # A caller-supplied --script is chained, not discarded.
+    events, event_path, event_dir = event_channel()
+    token = secrets.token_hex(16)
+    script_env = dict(os.environ)
+    if events is not None and os.access(NOTIFY, os.X_OK):
+        script_env["ASUVPN_EVENT_SOCKET"] = event_path
+        script_env["ASUVPN_EVENT_TOKEN"] = token
+        chained = requested_script(extra) or DEFAULT_VPNC_SCRIPT
+        script_env["ASUVPN_REAL_SCRIPT"] = chained
+        extra = list(strip_script_option(extra))
+        extra = [*extra, "--script", NOTIFY]
 
     command = [
         openconnect,
@@ -439,10 +582,17 @@ def main():
         # parent_pid captured *before* the fork: preexec_fn runs in the child, so
         # calling os.getpid() in there yields the child's own pid, the guard
         # below always fires, and openconnect is killed before it ever starts.
+        env=script_env,
         preexec_fn=lambda: die_with_parent(parent_pid),  # noqa: PLW1509
     )
     tunnel = Tunnel(proc)
     holder["tunnel"] = tunnel
+    if events is not None:
+        threading.Thread(
+            target=serve_events, args=(events, token, ifname, owned), daemon=True
+        ).start()
+    # Kept as a second, independent source: if the script never fires we still
+    # learn the device's identity from the kernel.
     threading.Thread(
         target=watch_for_interface, args=(ifname, owned), daemon=True
     ).start()
@@ -471,6 +621,10 @@ def main():
     else:
         log(f"openconnect exited with status {returncode}")
     verify_teardown(ifname, interfaces_before, tunnel.killed, owned.get("ifindex"))
+    if events is not None:
+        events.close()
+    if event_dir:
+        shutil.rmtree(event_dir, ignore_errors=True)
     return returncode
 
 

@@ -68,14 +68,22 @@ if [ "$LINK_MODE" -eq 1 ] || [ "$SRC_DIR" = "$APP_DIR" ]; then
 else
   INSTALL_DIR="$APP_DIR"
   mkdir -p "$INSTALL_DIR"
-  install -m 0755 "$SRC_DIR/asuvpn-tray" "$SRC_DIR/asuvpn-helper" "$INSTALL_DIR/"
+  install -m 0755 "$SRC_DIR/asuvpn-tray" "$SRC_DIR/asuvpn-helper" \
+                  "$SRC_DIR/asuvpn-notify" "$INSTALL_DIR/"
   install -m 0644 "$SRC_DIR/asuvpn.svg" "$INSTALL_DIR/"
 fi
 
 TRAY="$INSTALL_DIR/asuvpn-tray"
 # Already 0755 in copy mode; in --link mode the checkout may be read-only, and
 # a failure here must not be fatal now that the files are otherwise in place.
-chmod +x "$TRAY" "$INSTALL_DIR/asuvpn-helper" 2>/dev/null || true
+chmod +x "$TRAY" "$INSTALL_DIR/asuvpn-helper" "$INSTALL_DIR/asuvpn-notify" 2>/dev/null || true
+
+# The helper and the notify script are executed as root. The helper refuses to
+# run if either is group- or world-writable, so make sure they are not: a stray
+# umask or an unpacked archive can easily leave 0775 behind.
+chmod 0755 "$INSTALL_DIR" 2>/dev/null || true
+chmod go-w "$INSTALL_DIR" "$TRAY" "$INSTALL_DIR/asuvpn-helper" \
+           "$INSTALL_DIR/asuvpn-notify" 2>/dev/null || true
 install -m 0644 "$SRC_DIR/asuvpn.svg" "$ICON_DIR/asuvpn.svg"
 
 # `asuvpn` is a symlink to the same script, not a separate program.
@@ -85,7 +93,17 @@ ln -sfn "$TRAY" "$BIN_DIR/asuvpn"
 # command has no such context. Record it so both agree on the endpoint.
 CONFIG_DIR="$CONFIG_HOME/asuvpn"
 mkdir -p "$CONFIG_DIR"
+chmod 0700 "$CONFIG_DIR"
 printf '%s\n' "$SERVER" > "$CONFIG_DIR/server"
+chmod 0600 "$CONFIG_DIR/server"
+
+# The session log records the address the VPN assigned you, the routes it
+# installed and the DNS servers it used. None of that belongs to other accounts
+# on the machine, and it was previously created 0644 by default umask.
+case "${XDG_CACHE_HOME:-}" in /*) CACHE_DIR="$XDG_CACHE_HOME/asuvpn" ;; *) CACHE_DIR="$HOME/.cache/asuvpn" ;; esac
+mkdir -p "$CACHE_DIR"
+chmod 0700 "$CACHE_DIR"
+[ -f "$CACHE_DIR/session.log" ] && chmod 0600 "$CACHE_DIR/session.log"
 
 # StartupNotify is off deliberately: this app has no window, so GNOME would sit
 # on a launch spinner until it timed out.
@@ -139,11 +157,12 @@ command -v gtk-update-icon-cache >/dev/null &&
   gtk-update-icon-cache -f -t "$HOME/.local/share/icons/hicolor" 2>/dev/null || true
 
 echo "Installed:"
-echo "  program   $INSTALL_DIR"
+echo "  program   $INSTALL_DIR  (0755, not group-writable)"
 echo "  launcher  $DESKTOP_FILE"
 echo "  icon      $ICON_DIR/asuvpn.svg"
 echo "  command   $BIN_DIR/asuvpn"
-echo "  server    $SERVER  ($CONFIG_DIR/server)"
+echo "  server    $SERVER  ($CONFIG_DIR/server, 0600)"
+echo "  log       $CACHE_DIR/session.log  (0600)"
 [ "$INSTALL_DIR" = "$SRC_DIR" ] &&
   echo "  (running from this checkout; do not move or delete it)"
 

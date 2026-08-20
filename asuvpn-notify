@@ -1,0 +1,75 @@
+#!/usr/bin/python3 -I
+"""vpnc-script wrapper: reports openconnect's state, then does the real work.
+
+openconnect runs this at every transition with the state in the environment —
+`reason` is one of pre-init, connect, disconnect, attempt-reconnect, reconnect,
+alongside TUNDEV and INTERNAL_IP4_ADDRESS. That is a documented, versioned
+contract (openconnect.org/vpnc-script.html), inherited from vpnc and unchanged
+across the v7 to v8 rename that silently broke log-message matching.
+
+This forwards one datagram to asuvpn-helper and then execs the real
+vpnc-script, so routing and DNS are configured exactly as they would have been.
+
+Reporting is best effort and never fatal: a failure here must not stop the
+tunnel being configured. Isolated (-I) for the same reason as the helper — this
+runs as root, and its directory is owned by an unprivileged user.
+"""
+
+import os
+import socket
+import sys
+
+DEFAULT_SCRIPT = "/usr/share/vpnc-scripts/vpnc-script"
+# Set by the helper. Absent means "nobody is listening", which is not an error.
+SOCKET_VAR = "ASUVPN_EVENT_SOCKET"
+TOKEN_VAR = "ASUVPN_EVENT_TOKEN"
+SCRIPT_VAR = "ASUVPN_REAL_SCRIPT"
+
+
+def report():
+    path = os.environ.get(SOCKET_VAR)
+    token = os.environ.get(TOKEN_VAR)
+    if not path or not token:
+        return
+    fields = (
+        token,
+        # Lower-case deliberately: `reason` is the variable name openconnect
+        # sets, fixed by the vpnc-script contract. Capitalising it reads nothing.
+        os.environ.get("reason", ""),  # noqa: SIM112
+        os.environ.get("TUNDEV", ""),
+        os.environ.get("INTERNAL_IP4_ADDRESS", ""),
+        os.environ.get("INTERNAL_IP6_ADDRESS", ""),
+    )
+    # Tabs are the separator, so strip any the environment may contain rather
+    # than let a hostile value split into extra fields.
+    message = "\t".join(f.replace("\t", " ").replace("\n", " ") for f in fields)
+    client = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+    try:
+        client.settimeout(2)
+        client.sendto(message.encode("utf-8", "replace")[:4096], path)
+    except OSError:
+        pass
+    finally:
+        client.close()
+
+
+def main():
+    try:
+        report()
+    except Exception:  # reporting must never break routing
+        pass
+
+    # Hand over with the environment intact; the real script needs every var
+    # openconnect set. --script is a shell command line, not a path, so this
+    # goes through sh exactly as openconnect would have run it.
+    script = os.environ.get(SCRIPT_VAR) or DEFAULT_SCRIPT
+    for var in (SOCKET_VAR, TOKEN_VAR, SCRIPT_VAR):
+        os.environ.pop(var, None)
+    # A shell is the point: --script is defined as a shell command line, so this
+    # is exactly how openconnect would have invoked it.
+    os.execv("/bin/sh", ["/bin/sh", "-c", script])  # noqa: S606
+
+
+if __name__ == "__main__":
+    main()
+    sys.exit(1)  # only reached if execv failed

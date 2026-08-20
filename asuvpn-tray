@@ -250,6 +250,7 @@ class VpnTray:
         # let it start a tunnel on top of the new one.
         self.auth_generation = 0
         self.helper_spoke = False
+        self.state_events = False
         self.last_failure = None
         self.reconnect_pending = False
         self.quitting = False
@@ -264,7 +265,12 @@ class VpnTray:
         self.cancelled = False
 
         try:
-            LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+            # 0700/0600: the log holds the address the VPN assigned, the routes
+            # it installed and the DNS it used. Default umask made it 0644.
+            LOG_FILE.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            os.chmod(LOG_FILE.parent, 0o700)
+            if LOG_FILE.exists():
+                os.chmod(LOG_FILE, 0o600)
         except OSError:
             pass  # an unwritable cache dir costs the log, not the applet
 
@@ -492,6 +498,7 @@ class VpnTray:
         with self._log_lock:
             try:
                 LOG_FILE.write_text("")
+                os.chmod(LOG_FILE, 0o600)
             except OSError:
                 pass
             self.log_lines.clear()
@@ -796,6 +803,7 @@ class VpnTray:
         exited = threading.Event()
         self.helper_exited = exited
         self.helper_spoke = False
+        self.state_events = False
         self.last_failure = None
         try:
             self.helper_proc = subprocess.Popen(
@@ -853,6 +861,28 @@ class VpnTray:
             exited.set()
             GLib.idle_add(self._on_tunnel_exit, returncode, generation)
 
+    def _apply_state_event(self, payload):
+        """Authoritative state, straight from openconnect's script contract."""
+        fields = dict(
+            part.split("=", 1) for part in payload.split() if "=" in part
+        )
+        state = payload.split(None, 1)[0] if payload.split() else ""
+        if state not in (CONNECTED, CONNECTING, DISCONNECTED):
+            return
+        self.state_events = True  # the log-matching fallback is now redundant
+        if state == CONNECTED:
+            address = fields.get("addr", "")
+            self.last_failure = None
+            if self.state != CONNECTED:
+                self._set_state(CONNECTED, address)
+                self.notify("VPN connected", f"{self.server} — {address}".strip(" —"))
+            elif address and self.detail != address:
+                self._set_state(CONNECTED, address)
+        elif state == CONNECTING and self.state == CONNECTED:
+            self._set_state(CONNECTING, "link lost, retrying")
+        # A disconnect event is left to _on_tunnel_exit, which already
+        # distinguishes a requested teardown from a dropped tunnel.
+
     def _on_tunnel_output(self, line, generation):
         if generation != self.helper_generation:
             # Still log it. A superseded helper's last words are its teardown
@@ -861,6 +891,10 @@ class VpnTray:
             return False
         if line.startswith("[helper]"):
             self.helper_spoke = True
+            if line.startswith("[helper] STATE "):
+                self._apply_state_event(line[len("[helper] STATE "):])
+                self.log(line)
+                return False
         self.log(line)
         # The helper flags anything that suggests the network did not come back.
         if line.startswith("[helper] WARNING:"):
@@ -869,6 +903,8 @@ class VpnTray:
                 line.split("WARNING:", 1)[1].strip(),
                 icon="dialog-warning-symbolic",
             )
+        if self.state_events:
+            return False  # the script contract is authoritative; do not guess
         if self.state == CONNECTED:
             # openconnect retries internally without exiting. Left unhandled,
             # the badge stays solid and `asuvpn status` keeps exiting 0 while

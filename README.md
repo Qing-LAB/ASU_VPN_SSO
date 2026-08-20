@@ -195,11 +195,11 @@ files are touched, and no part of the installation needs root. The program is
 
 | Path | What it is |
 | --- | --- |
-| `~/.local/share/asuvpn/` | `asuvpn-tray`, `asuvpn-helper` and the icon: the installed program |
+| `~/.local/share/asuvpn/` | `asuvpn-tray`, `asuvpn-helper`, `asuvpn-notify` and the icon (`0755`, never group-writable) |
 | `~/.local/share/applications/asuvpn.desktop` | Launcher, with Disconnect/Reconnect actions |
 | `~/.local/share/icons/hicolor/scalable/apps/asuvpn.svg` | The app-grid icon |
 | `~/.local/bin/asuvpn` | Symlink to the installed `asuvpn-tray` |
-| `~/.config/asuvpn/server` | The endpoint, so the launcher and the `asuvpn` command agree |
+| `~/.config/asuvpn/server` | The endpoint, so the launcher and the `asuvpn` command agree (`0600` in a `0700` directory) |
 
 The `.desktop` file is what puts **ASU VPN** in the Activities overview and app
 grid. `install.sh` refreshes the desktop and icon caches, so it appears without
@@ -209,7 +209,7 @@ Runtime state lives elsewhere, and is created on demand:
 
 | Path | What it is |
 | --- | --- |
-| `~/.cache/asuvpn/session.log` | Session log, truncated on each connect |
+| `~/.cache/asuvpn/session.log` | Session log, truncated on each connect (`0600` in a `0700` directory) |
 | `~/.config/autostart/asuvpn-tray.desktop` | Written only when you tick "Start on login (applet only)" |
 | abstract socket `asuvpn-tray-$UID` | Single-instance guard and CLI channel; peer uid is checked, and it vanishes with the process |
 
@@ -273,6 +273,18 @@ dialog. Once elevated it does exactly three things:
 2. signals `openconnect` to shut down when the control pipe closes,
 3. after exit, deletes a tunnel interface that outlived `openconnect` and reads
    the default route back, to confirm your network was restored.
+
+It also opens a datagram socket for `asuvpn-notify` to report state on. That
+lives in a `0700` directory under `/run` owned by root, so no other account can
+reach it — and every message carries a per-session token, so two concurrent
+sessions cannot be confused for one another.
+
+Before doing any of that, the helper **refuses to run** if itself, its directory
+or `asuvpn-notify` is world-writable or writable by a shared group. That turns
+the caveat below from something you have to remember into something enforced. A
+user-private group is not treated as a finding: Debian and Ubuntu default to
+umask 002, so an ordinary checkout is `0775` with `gid == uid` and the "group"
+is one person.
 
 ### What it never does
 
@@ -382,6 +394,52 @@ The applet then makes the privileged call itself, with `pkexec`. That is not
 cosmetic. A `.desktop` launcher has no terminal, so a `sudo` password prompt
 would have nowhere to appear and the connect would just hang; `pkexec` asks
 through the GNOME polkit dialog instead.
+
+### Knowing whether it is connected
+
+State comes from openconnect's **script contract**, not from matching its log
+output. openconnect runs `vpnc-script` at every transition with the state in the
+environment — `reason` is one of `pre-init`, `connect`, `disconnect`,
+`attempt-reconnect`, `reconnect`, alongside `TUNDEV` and
+`INTERNAL_IP4_ADDRESS`. That interface is documented, versioned and inherited
+from vpnc; the log wording is neither.
+
+[`asuvpn-notify`](asuvpn-notify) is installed as that script. It forwards one
+datagram to the helper and then `exec`s the real `vpnc-script`, so routing and
+DNS are configured exactly as they would have been. If you pass your own
+`--script`, it is chained rather than discarded.
+
+Three sources, in order of authority:
+
+| Source | What it gives | When it is used |
+| --- | --- | --- |
+| Script contract | `reason`, device, assigned address | Always, when available |
+| `/sys/class/net/<dev>/ifindex` | Proof the device is the one we created | Teardown ownership |
+| Log patterns | Best guess | Fallback only, if no event arrives |
+
+This is not hypothetical tidying. Matching on `Connected as …` — which
+openconnect stopped saying in v8 — meant the applet could only ever reach
+"Connected" when DTLS happened to negotiate. On a network blocking UDP/443 or
+behind a proxy the tunnel worked while the tray sat in "Connecting…" forever.
+The contract has no such failure mode, and it hands over the assigned address,
+which the log patterns never reliably did.
+
+### When the link drops
+
+openconnect handles reconnection itself, and the applet follows rather than
+interferes. Dead peer detection notices the break, and it retries for
+`--reconnect-timeout` seconds (default 300) using the **same session cookie** —
+so a WiFi toggle, or moving between networks, normally recovers with no new
+sign-in and no Duo push. It copes with your address changing underneath it.
+
+Two limits, both outside our control. The server advertises its own window
+(`Server reports that reconnect-after-drop is allowed within N seconds` — you
+will see the number in `asuvpn log`), and the session cookie eventually expires.
+Past either, openconnect gives up and a fresh sign-in is needed.
+
+The tray shows this as **Connecting… — link lost, retrying**, driven by
+`attempt-reconnect` and `reconnect` events, so `asuvpn status` stops exiting 0
+while traffic is going nowhere.
 
 ### The control pipe
 
@@ -564,6 +622,7 @@ asuvpn log -f
 | --- | --- |
 | [`asuvpn-tray`](asuvpn-tray) | The applet and the `asuvpn` CLI. Runs as you, on the system `python3`. |
 | [`asuvpn-helper`](asuvpn-helper) | The root side, run under `pkexec`. Owns `openconnect`'s lifetime. |
+| [`asuvpn-notify`](asuvpn-notify) | The `vpnc-script` wrapper. Reports state, then chains to the real script. |
 | [`bootstrap.sh`](bootstrap.sh) | Installs dependencies, then calls `install.sh`. |
 | [`install.sh`](install.sh) | Copies the app into `~/.local` and registers it. No system changes. |
 | [`asuvpn.svg`](asuvpn.svg) | App icon. |
@@ -601,6 +660,13 @@ four simultaneous launches racing for the single-instance guard, every exit code
 the `--` passthrough, and installing from an arbitrary directory in both copy and
 `--link` modes. Each teardown path was checked for a single `SIGINT`, no spurious
 escalation, and a restored default route.
+
+The state framework was exercised through the real script contract: a stand-in
+openconnect that invokes `--script` with `reason=connect`, `attempt-reconnect`,
+`reconnect` and `disconnect`, confirming the tray follows each one and displays
+the assigned address. The permission refusal was tested by making the directory
+world-writable and group-shared in turn, and by confirming an ordinary
+user-private-group checkout still runs.
 
 Specific defences were tested by trying to defeat them, not by inspection:
 
