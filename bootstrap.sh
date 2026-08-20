@@ -133,7 +133,7 @@ install_openconnect_sso() {
   # set -e, before the app was ever installed.
   if pipx list --short 2>/dev/null | grep -q "^openconnect-sso "; then
     say "pinning $SETUPTOOLS_PIN inside its venv"
-    pipx inject openconnect-sso "$SETUPTOOLS_PIN" >/dev/null
+    pipx inject openconnect-sso "$SETUPTOOLS_PIN" --force >/dev/null
   else
     warn "openconnect-sso is not managed by pipx; make sure its environment has $SETUPTOOLS_PIN"
   fi
