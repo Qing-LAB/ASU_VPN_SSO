@@ -111,13 +111,20 @@ STATE_LABELS = {
 # "Configured as" is the authoritative line. "CSTP connected" covers the
 # TLS-only case, and the DTLS line is kept because it arrives first when UDP is
 # available. The "Connected as" forms are retained only for openconnect 7.x.
-CONNECTED_PATTERNS = (
-    re.compile(r"Configured as (?P<addr>[0-9a-fA-F.:]+)"),
-    re.compile(r"CSTP connected"),
-    re.compile(r"Established DTLS connection"),
-    re.compile(r"Connected (?P<dev>[\w.-]+) as (?P<addr>[0-9a-fA-F.:]+)"),
-    re.compile(r"Connected as (?P<addr>[0-9a-fA-F.:]+)"),
+# Each entry pairs the regex with the literal fragment it depends on, and says
+# whether the installed openconnect is still expected to contain it. That is
+# what lets `asuvpn selftest` check these against the binary's own message
+# catalogue instead of against our memory of it — the check that would have
+# caught matching on "Connected as", which openconnect stopped saying in v8.
+CONNECTED_MESSAGES = (
+    ("Configured as", r"Configured as (?P<addr>[0-9a-fA-F.:]+)", True),
+    ("CSTP connected", r"CSTP connected", True),
+    ("Established DTLS connection", r"Established DTLS connection", True),
+    ("Connected %s as %s",
+     r"Connected (?P<dev>[\w.-]+) as (?P<addr>[0-9a-fA-F.:]+)", False),
+    ("Connected as", r"Connected as (?P<addr>[0-9a-fA-F.:]+)", False),
 )
+CONNECTED_PATTERNS = tuple(re.compile(r) for _, r, _ in CONNECTED_MESSAGES)
 ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 
 # Deliberately narrow. A bare /Reconnect/ matched thirty message templates in
@@ -126,21 +133,37 @@ ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 # banner on every CSTP connect) — so the badge flapped and fired a spurious
 # "connected" notification each time. These three mean the link is actually
 # down; a later "Configured as"/"CSTP connected" promotes it back.
-RECONNECTING_PATTERNS = (
-    re.compile(r"Failed to reconnect to host"),
-    re.compile(r"Failed to reconnect to proxy"),
-    re.compile(r"Detected dead peer"),
+RECONNECTING_MESSAGES = (
+    ("Failed to reconnect to host", r"Failed to reconnect to host", True),
+    ("Failed to reconnect to proxy", r"Failed to reconnect to proxy", True),
+    ("Detected dead peer", r"Detected dead peer", True),
 )
+RECONNECTING_PATTERNS = tuple(re.compile(r) for _, r, _ in RECONNECTING_MESSAGES)
 
 # Each verified present in the installed openconnect. "Failed to obtain WebVPN
 # cookie" and "Login failed" were dead patterns carried over from an older
 # release and have been dropped.
-FAILURE_PATTERNS = (
-    re.compile(r"Cookie was rejected", re.IGNORECASE),
-    re.compile(r"Failed to connect to", re.IGNORECASE),
-    re.compile(r"certificate verify failed", re.IGNORECASE),
-    re.compile(r"Failed to open HTTPS connection", re.IGNORECASE),
+FAILURE_MESSAGES = (
+    ("Cookie was rejected", r"Cookie was rejected", True),
+    ("Failed to connect to", r"Failed to connect to", True),
+    ("certificate verify failed", r"certificate verify failed", True),
+    ("Failed to open HTTPS connection", r"Failed to open HTTPS connection", True),
 )
+FAILURE_PATTERNS = tuple(
+    re.compile(r, re.IGNORECASE) for _, r, _ in FAILURE_MESSAGES
+)
+
+
+def parse_state_payload(payload):
+    """Split a `[helper] STATE ...` payload into its state and its fields.
+
+    Module level so `asuvpn selftest` can exercise it without a display: it is
+    the one place a malformed or hostile event could reach the state machine.
+    """
+    words = payload.split()
+    state = words[0] if words else ""
+    fields = dict(part.split("=", 1) for part in words if "=" in part)
+    return state, fields
 
 
 def configured_server():
@@ -801,12 +824,11 @@ class VpnTray:
         self.helper_generation += 1
         generation = self.helper_generation
         exited = threading.Event()
-        self.helper_exited = exited
         self.helper_spoke = False
         self.state_events = False
         self.last_failure = None
         try:
-            self.helper_proc = subprocess.Popen(
+            proc = subprocess.Popen(
                 command,
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
@@ -823,21 +845,32 @@ class VpnTray:
         except OSError as exc:
             # Nothing was started, so release anyone who might later wait on
             # this generation's exit rather than leaving them to time out.
-            self.helper_proc = None
+            with self._stdin_lock:
+                self.helper_proc = None
+                self.helper_exited = exited
             exited.set()
             self._set_state(FAILED, f"could not run pkexec: {exc}")
             self.log(f"[tray] {exc}")
             return False
 
+        # Published as a pair, under the same lock _teardown_helper reads them
+        # with. Assigning the event before the process meant a teardown running
+        # between the two saw this generation's event beside the *previous*
+        # generation's process — closing one pipe and then waiting out the full
+        # timeout on an event the other would never set.
+        with self._stdin_lock:
+            self.helper_proc = proc
+            self.helper_exited = exited
+
         try:
-            self.helper_proc.stdin.write(cookie + "\n")
-            self.helper_proc.stdin.flush()
+            proc.stdin.write(cookie + "\n")
+            proc.stdin.flush()
         except OSError as exc:
             self.log(f"[tray] could not hand the session cookie to the helper: {exc}")
 
         threading.Thread(
             target=self._tunnel_thread,
-            args=(self.helper_proc, generation, exited),
+            args=(proc, generation, exited),
             daemon=True,
         ).start()
         return False
@@ -863,13 +896,19 @@ class VpnTray:
 
     def _apply_state_event(self, payload):
         """Authoritative state, straight from openconnect's script contract."""
-        fields = dict(
-            part.split("=", 1) for part in payload.split() if "=" in part
-        )
-        state = payload.split(None, 1)[0] if payload.split() else ""
+        state, fields = parse_state_payload(payload)
         if state not in (CONNECTED, CONNECTING, DISCONNECTED):
             return
         self.state_events = True  # the log-matching fallback is now redundant
+        # Teardown has already decided how this ends. openconnect can be midway
+        # through a recovery when the disconnect lands, and the `reconnect`
+        # event that follows would otherwise flip the badge back to Connected,
+        # fire a "VPN connected" notification, and leave _on_tunnel_exit seeing
+        # CONNECTED rather than DISCONNECTING -- reporting a clean, requested
+        # disconnect as "connection dropped". The fallback path never had this
+        # hole: it is guarded on `self.state in (CONNECTING, CONNECTED)`.
+        if self.quitting or self.cancelled or self.state == DISCONNECTING:
+            return
         if state == CONNECTED:
             address = fields.get("addr", "")
             self.last_failure = None
@@ -891,6 +930,11 @@ class VpnTray:
             return False
         if line.startswith("[helper]"):
             self.helper_spoke = True
+            if line.startswith("[helper] refusing"):
+                # The helper stopped before openconnect was started at all.
+                # Without this the user is shown "openconnect exited with
+                # status 26" for a refusal openconnect was never part of.
+                self.last_failure = line[len("[helper] "):].strip()
             if line.startswith("[helper] STATE "):
                 self._apply_state_event(line[len("[helper] STATE "):])
                 self.log(line)
@@ -903,39 +947,45 @@ class VpnTray:
                 line.split("WARNING:", 1)[1].strip(),
                 icon="dialog-warning-symbolic",
             )
-        if self.state_events:
-            return False  # the script contract is authoritative; do not guess
-        if self.state == CONNECTED:
-            # openconnect retries internally without exiting. Left unhandled,
-            # the badge stays solid and `asuvpn status` keeps exiting 0 while
-            # traffic goes nowhere.
-            for pattern in RECONNECTING_PATTERNS:
-                if pattern.search(line):
-                    self._set_state(CONNECTING, "link lost, retrying")
-                    return False
-        if self.state in (CONNECTING, CONNECTED):
-            for pattern in CONNECTED_PATTERNS:
-                match = pattern.search(line)
-                if match:
-                    address = (match.groupdict().get("addr") or "").strip()
-                    if self.state != CONNECTED:
-                        # Reaching CONNECTED clears any earlier failure line;
-                        # otherwise a blip that openconnect recovered from
-                        # would be reported as the cause when the tunnel
-                        # eventually drops, hours later.
-                        self.last_failure = None
-                        self._set_state(CONNECTED, address)
-                        where = f"{self.server} — {address}".strip(" —")
-                        self.notify("VPN connected", where)
-                    return False
-            for pattern in FAILURE_PATTERNS:
-                if pattern.search(line):
-                    # Keep it: this is the actionable sentence. Without it the
-                    # user is told "exited with status 2" for what openconnect
-                    # already explained as "Cookie was rejected".
-                    self.last_failure = line.strip()
-                    self.log(f"[tray] openconnect reported a problem: {line}")
-                    return False
+        # The script contract says which state we are in; it never says why a
+        # connection failed. Only the state machine below is redundant once
+        # events arrive -- the failure scan further down is not.
+        if not self.state_events:
+            if self.state == CONNECTED:
+                # openconnect retries internally without exiting. Left
+                # unhandled, the badge stays solid and `asuvpn status` keeps
+                # exiting 0 while traffic goes nowhere.
+                for pattern in RECONNECTING_PATTERNS:
+                    if pattern.search(line):
+                        self._set_state(CONNECTING, "link lost, retrying")
+                        return False
+            if self.state in (CONNECTING, CONNECTED):
+                for pattern in CONNECTED_PATTERNS:
+                    match = pattern.search(line)
+                    if match:
+                        address = (match.groupdict().get("addr") or "").strip()
+                        if self.state != CONNECTED:
+                            # Reaching CONNECTED clears any earlier failure
+                            # line; otherwise a blip that openconnect recovered
+                            # from would be reported as the cause when the
+                            # tunnel eventually drops, hours later.
+                            self.last_failure = None
+                            self._set_state(CONNECTED, address)
+                            where = f"{self.server} — {address}".strip(" —")
+                            self.notify("VPN connected", where)
+                        return False
+        # Deliberately outside that guard. Scanning only in the fallback meant
+        # that after any successful connect -- i.e. as soon as one state event
+        # had arrived -- a later failure was reported as a bare "exited with
+        # status 1" while openconnect's own explanation sat in the log directly
+        # above it. That is the whole reason this scan exists.
+        for pattern in FAILURE_PATTERNS:
+            if pattern.search(line):
+                # "[vpn] " is how the helper stops openconnect's output forging
+                # helper messages; it is framing, not something to show anyone.
+                self.last_failure = line.removeprefix("[vpn] ").strip()
+                self.log(f"[tray] openconnect reported a problem: {line}")
+                return False
         return False
 
     def _on_tunnel_exit(self, returncode, generation):
@@ -1213,7 +1263,8 @@ def serve_ipc(tray, server):
 
 # ------------------------------------------------------------- command line
 
-COMMANDS = ("connect", "disconnect", "reconnect", "status", "log", "tray", "quit")
+COMMANDS = ("connect", "disconnect", "reconnect", "status", "log", "tray", "quit",
+            "selftest")
 
 COMMAND_HELP = """
 commands:
@@ -1224,6 +1275,7 @@ commands:
   log           print this session's log, -f to follow it
   tray          run the applet in the foreground without connecting
   quit          close the tunnel and stop the applet
+  selftest      check this installation against this machine
 
 exit codes:
   0  the request was carried out; for status and --wait, connected
@@ -1232,6 +1284,24 @@ exit codes:
   3  status: the applet is not running
   4  a different server was asked for than the running applet is using
 """
+
+
+def run_selftest(argv):
+    """Hand the whole command line to asuvpn-selftest.
+
+    Its flags are its own; re-declaring them here would only let the two drift
+    apart. Run with the same interpreter, so it inspects the python the applet
+    actually uses rather than whatever is first on PATH.
+    """
+    selftest = HERE / "asuvpn-selftest"
+    if not os.access(selftest, os.X_OK):
+        print(f"{selftest} is missing or not executable", file=sys.stderr)
+        return 1
+    try:
+        return subprocess.run([sys.executable, str(selftest), *argv]).returncode
+    except OSError as exc:
+        print(f"could not run {selftest}: {exc}", file=sys.stderr)
+        return 1
 
 
 def show_log(follow):
@@ -1406,6 +1476,10 @@ def main():
     # every later flag, so "asuvpn connect --wait" would silently pass --wait to
     # openconnect instead of to us.
     argv = sys.argv[1:]
+    # Intercepted before parsing so that --tier and --quiet reach the self-test
+    # rather than being rejected here as unknown flags.
+    if argv and argv[0] == "selftest":
+        return run_selftest(argv[1:])
     if "--" in argv:
         separator = argv.index("--")
         argv, passthrough = argv[:separator], argv[separator + 1 :]
@@ -1425,6 +1499,8 @@ def main():
 
     server = args.server or configured_server() or DEFAULT_SERVER
 
+    if command == "selftest":  # reached via `asuvpn --server x selftest`
+        return run_selftest([])
     if command == "log":
         return show_log(args.follow)
     if command == "status":

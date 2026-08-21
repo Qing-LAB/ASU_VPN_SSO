@@ -46,7 +46,9 @@ TUNNEL_PREFIXES = ("tun", "tap", "vpn")
 INTERFACE_PREFIX = "asuvpn"
 HERE = os.path.dirname(os.path.abspath(__file__))
 NOTIFY = os.path.join(HERE, "asuvpn-notify")
-DEFAULT_VPNC_SCRIPT = "/usr/share/vpnc-scripts/vpnc-script"
+# Only a last resort. openconnect knows its own compiled-in default and prints
+# it, so it is asked rather than guessed -- see default_vpnc_script().
+FALLBACK_VPNC_SCRIPT = "/usr/share/vpnc-scripts/vpnc-script"
 # Root-only, so that nothing else on the machine can inject state events. The
 # directory bit is the whole access control: 0700 root:root denies traversal to
 # every other uid, and only root could reach the socket inside it anyway.
@@ -76,8 +78,31 @@ UNSUPPORTED_OPTIONS = (
     "--pid-file",
     "--cookieonly", "--authenticate",
 )
+# getopt_long bundles short options, so -bv is -b -v and slips straight past a
+# comparison against whole argv elements -- which is how --background got in
+# after all, taking openconnect out of this helper's supervision. Working out
+# which letter in a bundle is an option and which is somebody's argument means
+# reimplementing getopt against a table that changes between releases, so
+# bundles are refused instead and the message says how to rewrite them.
+BUNDLED_SHORT_RE = re.compile(r"^-[A-Za-z]{2,}$")
 
 syslog.openlog("asuvpn-helper", syslog.LOG_PID, syslog.LOG_DAEMON)
+
+
+def unsupported_option(option):
+    """Why this openconnect option cannot be supervised, or None.
+
+    A function rather than an inline loop so `asuvpn selftest` can put the
+    whole blocklist through its paces without spawning anything.
+    """
+    if option.split("=", 1)[0] in UNSUPPORTED_OPTIONS:
+        name = option.split("=", 1)[0]
+        return f"refusing {name}: it would detach openconnect from this helper"
+    if BUNDLED_SHORT_RE.match(option):
+        return (f"refusing {option}: bundled short options cannot be checked"
+                " here, because getopt reads -bv as -b -v. Pass them one at a"
+                " time (-i lo, not -ilo) so each can be seen.")
+    return None
 
 
 def unsafe_write_access(path):
@@ -100,6 +125,64 @@ def unsafe_write_access(path):
     return None
 
 
+def vpnc_script_from_binary(openconnect):
+    """What openconnect reports as its default script, or None if it did not.
+
+    Separate from default_vpnc_script() so callers can tell "the binary told us"
+    from "we fell back" — on Debian the two answers are the same string, which
+    makes an equality test useless for the distinction.
+    """
+    result = run([openconnect, "--version"], timeout=10)
+    if result is None:
+        return None
+    for stream in (result.stdout, result.stderr):
+        for line in (stream or "").splitlines():
+            head, sep, tail = line.partition(":")
+            if sep and head.strip().startswith("Default vpnc-script"):
+                path = tail.strip()
+                if path:
+                    return path
+    return None
+
+
+def default_vpnc_script(openconnect):
+    """openconnect's own compiled-in default, asked of the binary.
+
+    `openconnect --version` ends with
+
+        Default vpnc-script (override with --script): /path/to/vpnc-script
+
+    Hardcoding that path is the same mistake as hardcoding log text. Debian and
+    Ubuntu use /usr/share/vpnc-scripts/vpnc-script, Fedora and Arch use
+    /etc/vpnc/vpnc-script, and a source build can use anything at all. It
+    matters because passing --script *replaces* the default: guess it wrong and
+    the wrapper execs a path that is not there, sh returns 127, openconnect logs
+    "Script ... returned error 127" and carries on -- so the tunnel comes up
+    with no routes and no DNS, restores nothing on the way out, and the tray
+    reports "Connected" throughout.
+    """
+    return vpnc_script_from_binary(openconnect) or FALLBACK_VPNC_SCRIPT
+
+
+def prune_stale_channels():
+    """Remove channel directories left behind by a helper that was killed.
+
+    The directory name carries the pid that created it, and teardown removes it
+    -- but SIGKILL skips teardown, so one is left holding a dead socket every
+    time. /run is a tmpfs and these are tiny, but they accumulate until reboot.
+    Only entries whose pid is gone are touched: pid reuse means a live one may
+    belong to something else entirely.
+    """
+    try:
+        entries = os.listdir(RUNTIME_ROOT)
+    except OSError:
+        return
+    for name in entries:
+        pid = name.partition("-")[0]
+        if pid.isdigit() and not os.path.exists(f"/proc/{pid}"):
+            shutil.rmtree(os.path.join(RUNTIME_ROOT, name), ignore_errors=True)
+
+
 def event_channel():
     """A private datagram socket for script events, or (None, None, None).
 
@@ -110,6 +193,7 @@ def event_channel():
         if os.geteuid() == 0:
             os.makedirs(RUNTIME_ROOT, mode=0o700, exist_ok=True)
             os.chmod(RUNTIME_ROOT, 0o700)
+            prune_stale_channels()
             directory = tempfile.mkdtemp(prefix=f"{os.getpid()}-", dir=RUNTIME_ROOT)
         else:
             directory = tempfile.mkdtemp(prefix="asuvpn-")
@@ -141,13 +225,33 @@ def serve_events(server, token, ifname, owned):
         if state is None:
             continue  # pre-init: the tunnel is not configured yet
         address = ip4 or ip6
+        # The device name is about to be used as a path component under
+        # /sys/class/net, so it is validated with the same rule that guards
+        # `ip link delete`. Nothing but root can reach this socket and
+        # asuvpn-notify sends what openconnect set, so this is depth rather
+        # than a hole being closed — but a name that cannot be a device has no
+        # business being turned into a filesystem path either way.
+        if device and not INTERFACE_RE.match(device):
+            log(f"ignoring an event for an impossible device name: {device!r}")
+            device = ""
         if state == "connected":
             # The authoritative moment to claim the device: openconnect has just
             # created it, so this ifindex is provably ours.
             index = interface_index(device or ifname)
             if index is not None:
                 owned["ifindex"] = index
-        emit(f"[helper] STATE {state} dev={device or ifname} addr={address}\n")
+        # Sanitised here rather than trusted from the sender. asuvpn-notify
+        # already strips separators, but the rule has to hold where the line is
+        # built: a newline in either field ends the line early and the rest
+        # arrives as a second, unprefixed message, while a space silently
+        # becomes an extra field. Caught by `asuvpn selftest`.
+        emit(f"[helper] STATE {state} dev={one_token(device or ifname)}"
+             f" addr={one_token(address)}\n")
+
+
+def one_token(value):
+    """Collapse a value to a single whitespace-free token for a STATE line."""
+    return re.sub(r"\s+", "_", value.strip())[:64]
 
 
 def emit(text):
@@ -285,8 +389,18 @@ def watch_for_interface(ifname, holder, deadline=60):
 
 
 def run(command, timeout=5):
+    # stdin is /dev/null, never inherited. This process's stdin is the control
+    # pipe: a child that reads it steals the "quit" line teardown depends on,
+    # and one that merely blocks on it hangs the helper. Nothing here has any
+    # business reading input.
     try:
-        return subprocess.run(command, capture_output=True, text=True, timeout=timeout)
+        return subprocess.run(
+            command,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
     except (OSError, subprocess.SubprocessError):
         return None
 
@@ -487,9 +601,9 @@ def main():
 
     extra = [a for a in args.extra if a != "--"]
     for option in extra:
-        name = option.split("=", 1)[0]
-        if name in UNSUPPORTED_OPTIONS:
-            log(f"refusing {name}: it would detach openconnect from this helper")
+        refusal = unsupported_option(option)
+        if refusal:
+            log(refusal)
             return 25
     # Name the device so teardown can prove which interface is ours before
     # deleting anything as root. A caller-supplied name is honoured instead.
@@ -508,13 +622,38 @@ def main():
 
     # State comes from openconnect's script contract rather than its log text.
     # A caller-supplied --script is chained, not discarded.
+    #
+    # Interposing is the optional half of this. Whatever we chain to has to be
+    # at least as good as the default we are displacing, because --script
+    # replaces it outright -- so if we cannot establish what openconnect would
+    # have run, we step aside entirely and let it run that instead. Losing the
+    # event channel costs state precision and falls back to log matching;
+    # chaining to a path that is not there costs the user their routing table.
     events, event_path, event_dir = event_channel()
     token = secrets.token_hex(16)
     script_env = dict(os.environ)
-    if events is not None and os.access(NOTIFY, os.X_OK):
+    caller_script = requested_script(extra)
+    if caller_script:
+        # Their command line, their responsibility: --script is documented as a
+        # shell command line, so it need not be a path we can stat.
+        chained, chain_ok = caller_script, True
+    else:
+        chained = default_vpnc_script(openconnect)
+        chain_ok = os.access(chained, os.X_OK)
+        if not chain_ok:
+            log(f"WARNING: {chained} is not executable, so openconnect's own"
+                " default script is left in place; state will come from its"
+                " output instead of the script contract")
+    if events is not None and (not chain_ok or not os.access(NOTIFY, os.X_OK)):
+        # Nothing will ever arrive on it; do not leave a socket and a thread
+        # waiting on one for the life of the tunnel.
+        events.close()
+        events = None
+        shutil.rmtree(event_dir, ignore_errors=True)
+        event_dir = None
+    if events is not None:
         script_env["ASUVPN_EVENT_SOCKET"] = event_path
         script_env["ASUVPN_EVENT_TOKEN"] = token
-        chained = requested_script(extra) or DEFAULT_VPNC_SCRIPT
         script_env["ASUVPN_REAL_SCRIPT"] = chained
         extra = list(strip_script_option(extra))
         extra = [*extra, "--script", NOTIFY]

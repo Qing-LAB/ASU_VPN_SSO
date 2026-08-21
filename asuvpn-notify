@@ -19,6 +19,10 @@ import os
 import socket
 import sys
 
+# Only reached if this script is run as a vpnc-script by hand. In normal use
+# asuvpn-helper always sets ASUVPN_REAL_SCRIPT, and it derives that from
+# `openconnect --version` rather than assuming -- the path differs between
+# distributions. Kept as a last resort, not as the expected route.
 DEFAULT_SCRIPT = "/usr/share/vpnc-scripts/vpnc-script"
 # Set by the helper. Absent means "nobody is listening", which is not an error.
 SOCKET_VAR = "ASUVPN_EVENT_SOCKET"
