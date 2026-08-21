@@ -122,22 +122,63 @@ install_openconnect_sso() {
   else
     say "installing $SSO_SPEC on python$PY (compiles lxml, so give it a few minutes)"
     pipx install --python "$PYBIN" "$SSO_SPEC"
+    # Re-resolve: $sso was empty precisely because it was not installed yet, and
+    # the verification below needs the console script to read its shebang from.
+    # Without this the check is skipped on a *fresh* install — the one case it
+    # matters most for.
+    sso="$(command -v openconnect-sso || true)"
+    [ -n "$sso" ] || { [ -x "$HOME/.local/bin/openconnect-sso" ] && sso="$HOME/.local/bin/openconnect-sso"; }
   fi
 
   # Always, never only on a fresh install: an earlier run that died between the
-  # install and this pin leaves openconnect-sso importing a pkg_resources that
-  # setuptools 71 removed. pipx inject is idempotent, so re-running is free —
-  # but only for a venv pipx actually owns. An openconnect-sso installed with
-  # `pip install --user` lands in the same ~/.local/bin and satisfies the check
-  # above, and `pipx inject` then exits 1 and killed the whole bootstrap under
-  # set -e, before the app was ever installed.
+  # install and this pin leaves openconnect-sso needing a pkg_resources that a
+  # current setuptools no longer ships. (Measured on this machine: setuptools
+  # 78.1.1 still has pkg_resources, 83.0.0 does not. <71 is a known-good pin
+  # rather than the exact boundary -- it is the bound that has been made to
+  # work, so it is left alone.)
+  #
+  # --force is load-bearing, and this comment used to claim the opposite ("pipx
+  # inject is idempotent, so re-running is free"). It is not idempotent, it is
+  # inert: pipx's skip test is `venv.has_package("setuptools")`, which only asks
+  # whether *a* setuptools is present — and one always is. So without --force
+  # pipx prints "already seems to be injected", installs nothing, and still
+  # returns 0. The pin silently never applied, set -e saw success, and the
+  # >/dev/null below hid even that notice.
+  #
+  # The `pipx list` guard is a separate matter: an openconnect-sso installed
+  # with `pip install --user` lands in the same ~/.local/bin and satisfies the
+  # check above, and `pipx inject` then exits 1 and killed the whole bootstrap
+  # under set -e, before the app was ever installed.
   if pipx list --short 2>/dev/null | grep -q "^openconnect-sso "; then
     say "pinning $SETUPTOOLS_PIN inside its venv"
     pipx inject openconnect-sso "$SETUPTOOLS_PIN" --force >/dev/null
+    verify_sso_venv "$sso"
   else
     warn "openconnect-sso is not managed by pipx; make sure its environment has $SETUPTOOLS_PIN"
   fi
   pipx ensurepath >/dev/null 2>&1 || true
+}
+
+# Check the outcome, not the exit status. The whole reason the pin needs --force
+# is that pipx reported success while doing nothing, so taking a second
+# command's word for it would repeat the mistake exactly. What actually matters
+# is whether openconnect-sso can still import pkg_resources, so ask that.
+#
+# The interpreter is read from the console script's shebang rather than guessed
+# from PIPX_HOME — the same way the applet finds it.
+verify_sso_venv() {
+  local sso="${1:-}" py version
+  [ -n "$sso" ] && [ -r "$sso" ] || return 0
+  py="$(head -1 "$sso" | sed 's|^#!||' | awk '{print $1}')"
+  [ -n "$py" ] && [ -x "$py" ] || return 0
+  version="$("$py" -c 'import importlib.metadata as m; print(m.version("setuptools"))' \
+             2>/dev/null || echo unknown)"
+  if "$py" -c 'import pkg_resources' >/dev/null 2>&1; then
+    say "openconnect-sso venv OK (setuptools $version, pkg_resources imports)"
+  else
+    warn "openconnect-sso cannot import pkg_resources (setuptools $version)."
+    warn "Sign-in will fail. Try: pipx inject openconnect-sso '$SETUPTOOLS_PIN' --force"
+  fi
 }
 
 # ------------------------------------------------------------------- checking
@@ -225,6 +266,8 @@ $(say "done")
       asuvpn connect        # sign in and connect
       asuvpn status         # what state is it in
       asuvpn disconnect
+
+      asuvpn selftest       # check this install against this machine
 
   One-time step, if you have never signed in with openconnect-sso on this
   machine: run it once in a terminal so it can save your password to the
