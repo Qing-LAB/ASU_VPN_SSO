@@ -59,6 +59,7 @@ configuration:
 - [Requirements](#requirements)
 - [Troubleshooting](#troubleshooting)
 - [Repository layout](#repository-layout)
+- [Design notes](#design-notes)
 - [Status](#status)
 - [License](#license)
 
@@ -142,6 +143,7 @@ asuvpn reconnect        # sign in again and replace the tunnel
 asuvpn log -f           # follow this session's log
 asuvpn quit             # close the tunnel and stop the applet
 asuvpn tray             # run the applet in the foreground, do not connect
+asuvpn selftest         # check this installation against this machine
 ```
 
 Every command prints the resulting state, so nothing happens silently.
@@ -168,6 +170,21 @@ Actions report whether the action worked, so a successful `disconnect` exits 0.
 Only `status` and `--wait` report connectedness. `asuvpn log` exits 1 when there
 is no log yet.
 
+A tunnel that fails reports `openconnect`'s own exit status, or `128 + n` if it
+was killed by signal *n*. Codes in the twenties come from the helper refusing to
+start, and it always logs a sentence saying which — the tray shows that sentence
+rather than the bare number:
+
+| Code | The helper refused because |
+| --- | --- |
+| `20` | `openconnect` is not installed |
+| `21` | no session cookie arrived on stdin |
+| `22` | the interface name you passed could not name a device |
+| `23` | that interface already exists, and it was not created by this session |
+| `24` | no free `asuvpnN` name (a hundred tunnels is not a real scenario) |
+| `25` | an option was passed that would detach `openconnect` from the helper |
+| `26` | the helper, its directory, or `asuvpn-notify` is writable by someone else |
+
 ```bash
 asuvpn status >/dev/null || asuvpn connect --wait
 ```
@@ -175,6 +192,13 @@ asuvpn status >/dev/null || asuvpn connect --wait
 Other options: `--server HOST` for a different endpoint, `--foreground` to keep
 the applet attached to the terminal, and a bare `--` to pass extra arguments
 through to `openconnect`. Flags may go before or after the command.
+
+Arguments after `--` are checked for options that would take `openconnect` out
+of the helper's supervision — `--background`, `--syslog`, `--pid-file` and
+friends are refused. Bundled short options are refused too, because `getopt`
+reads `-bv` as `-b -v` and working out which letter is an option and which is
+somebody's argument would mean reimplementing `getopt` against a table that
+changes between releases. Write them separately: `-i lo`, not `-ilo`.
 
 ```bash
 asuvpn --server vpn.other.edu connect
@@ -195,7 +219,7 @@ files are touched, and no part of the installation needs root. The program is
 
 | Path | What it is |
 | --- | --- |
-| `~/.local/share/asuvpn/` | `asuvpn-tray`, `asuvpn-helper`, `asuvpn-notify` and the icon (`0755`, never group-writable) |
+| `~/.local/share/asuvpn/` | `asuvpn-tray`, `asuvpn-helper`, `asuvpn-notify`, `asuvpn-selftest` and the icon (`0755`, never group-writable) |
 | `~/.local/share/applications/asuvpn.desktop` | Launcher, with Disconnect/Reconnect actions |
 | `~/.local/share/icons/hicolor/scalable/apps/asuvpn.svg` | The app-grid icon |
 | `~/.local/bin/asuvpn` | Symlink to the installed `asuvpn-tray` |
@@ -409,6 +433,27 @@ datagram to the helper and then `exec`s the real `vpnc-script`, so routing and
 DNS are configured exactly as they would have been. If you pass your own
 `--script`, it is chained rather than discarded.
 
+Which script it chains to is **asked of `openconnect`**, not assumed:
+`openconnect --version` reports its own compiled-in default, which is
+`/usr/share/vpnc-scripts/vpnc-script` on Debian and Ubuntu but `/etc/vpnc/vpnc-script`
+on Fedora and Arch, and anything at all in a source build. This matters because
+passing `--script` *replaces* that default — chain to a path that is not there
+and the tunnel comes up with no routes and no DNS, restores nothing on the way
+out, and the tray reports "Connected" throughout. If the script cannot be found
+or is not executable, the helper does not interpose at all: `openconnect` keeps
+its own default and state falls back to reading its output. Losing state
+precision is a fair trade; losing your routing table is not.
+
+What `openconnect` reports, and what you see:
+
+| `reason` | Badge |
+| --- | --- |
+| `pre-init` | nothing yet — the tunnel is not configured |
+| `connect` | **Connected**, with the address it assigned you |
+| `attempt-reconnect` | **Connecting… — link lost, retrying** |
+| `reconnect` | **Connected**, with the new address if it changed |
+| `disconnect` | left to the exit path, which knows whether you asked for it |
+
 Three sources, in order of authority:
 
 | Source | What it gives | When it is used |
@@ -583,14 +628,25 @@ sudo apt install python3.12 python3.12-venv python3.12-dev \
                  build-essential libxml2-dev libxslt1-dev zlib1g-dev \
                  libffi-dev libssl-dev pkg-config
 pipx install --python /usr/bin/python3.12 'openconnect-sso[full]'
-pipx inject openconnect-sso 'setuptools<71'
+pipx inject openconnect-sso 'setuptools<71' --force
 ```
 
-Two details that are easy to miss:
+Three details that are easy to miss:
 
 - The **`[full]` extra** pulls in keyring support.
-- The **`setuptools<71` pin** matters: `openconnect-sso` still imports
-  `pkg_resources`, which setuptools 71 dropped.
+- The **`setuptools<71` pin** matters. `openconnect-sso` imports
+  `pkg_resources` — in its sign-in browser process, to load the `user.js` it
+  injects — and current setuptools no longer ships that module. Measured on
+  this machine: setuptools `78.1.1` still has `pkg_resources`, `83.0.0` does
+  not. So `<71` is a **known-good pin, not the exact boundary**; it is the
+  bound that has been made to work end to end, which is why it is not relaxed.
+- **`--force` on that inject is not optional.** `pipx` decides whether a
+  package is already injected with a version-blind test — it asks only whether
+  *some* `setuptools` is present, and one always is. Without `--force` it prints
+  "already seems to be injected", installs nothing, and **still exits 0**, so
+  the pin silently never applies and the venv keeps a `setuptools` that breaks
+  sign-in at import. `asuvpn selftest` checks the pin by its effect, not by
+  that exit status.
 
 Qt6 WebEngine also dlopens a set of shared libraries for the sign-in window
 (`libnss3`, `libxcomposite1`, `libxdamage1`, `libxrandr2`, `libxkbcommon-x11-0`,
@@ -615,6 +671,12 @@ asuvpn log -f
 | `could not load the Qt platform plugin "xcb"` | Missing `libxcb-cursor0`. Re-run `./bootstrap.sh`. |
 | Log stops at `signed in, starting openconnect` | The polkit dialog never appeared. Check that a polkit agent is running, and that you are in the `sudo` group. |
 | `WARNING: no default route after teardown` | Teardown could not restore routing. `nmcli networking off && nmcli networking on`. |
+| `refusing to run: … is world-writable` | Anything writable by another account runs as root at your next connect, so the helper stops. `chmod go-w ~/.local/share/asuvpn` and re-run. |
+| `refusing --background` / `refusing -bv` | That option would detach `openconnect` from the helper, leaving a root process nothing can stop. Drop it; write bundled short options separately (`-i lo`, not `-ilo`). |
+| `WARNING: … is not executable, so openconnect's own default script is left in place` | The `vpnc-script` this system uses could not be found, so state falls back to reading `openconnect`'s output. Routing is unaffected. Install `vpnc-scripts`. |
+| `Script … returned error 127` | The `vpnc-script` failed, so routes and DNS were never configured. Install `vpnc-scripts`, then `asuvpn selftest`. |
+| `ModuleNotFoundError: No module named 'pkg_resources'` | The `setuptools<71` pin did not take. `pipx inject openconnect-sso 'setuptools<71' --force` — the `--force` is what makes it apply. |
+| Self-check reports a failure | `asuvpn selftest` prints a detail line under each failure saying what will break and how to fix it. |
 
 ## Repository layout
 
@@ -623,20 +685,61 @@ asuvpn log -f
 | [`asuvpn-tray`](asuvpn-tray) | The applet and the `asuvpn` CLI. Runs as you, on the system `python3`. |
 | [`asuvpn-helper`](asuvpn-helper) | The root side, run under `pkexec`. Owns `openconnect`'s lifetime. |
 | [`asuvpn-notify`](asuvpn-notify) | The `vpnc-script` wrapper. Reports state, then chains to the real script. |
+| [`asuvpn-selftest`](asuvpn-selftest) | Checks the install against the machine. Run by `install.sh`, and by `asuvpn selftest`. |
 | [`bootstrap.sh`](bootstrap.sh) | Installs dependencies, then calls `install.sh`. |
 | [`install.sh`](install.sh) | Copies the app into `~/.local` and registers it. No system changes. |
 | [`asuvpn.svg`](asuvpn.svg) | App icon. |
+| [`DESIGN.md`](DESIGN.md) | Internals: state machine, concurrency, invariants, how it is tested. |
 | [`ruff.toml`](ruff.toml) | Lint config. Its `ignore` list records which rules are off and why. |
 
 ### Checking it
 
-The two Python files have no `.py` extension, so copy them under one before
-running the analysers:
+`install.sh` runs the self-check at the end of every install, and you can run it
+yourself whenever something behaves oddly:
+
+```bash
+asuvpn selftest
+asuvpn selftest --tier environment
+asuvpn selftest --quiet          # only failures and warnings
+```
+
+It exits 0 if nothing failed, 1 otherwise. Nothing in it connects to a network,
+asks for privileges, or touches the real `openconnect`.
+
+The reason it is shaped the way it is: **ordinary unit tests would not have
+caught a single one of the bugs that hurt this project.** Matching on
+`Connected as`, which `openconnect` stopped saying in v8; hardcoding the
+`vpnc-script` path, which differs between distributions; comparing whole `argv`
+elements when `getopt` bundles short options — every one was a wrong assumption
+about the *environment*, and a test that only checked the code against itself
+would have passed happily while the code was dead. So there are three tiers, and
+the middle one is the point:
+
+| Tier | What it checks |
+| --- | --- |
+| `logic` | Pure functions: the option blocklist, interface-name validation, `--interface`/`--script` parsing, the permission rules, state-payload parsing, and that `openconnect`'s output cannot forge a helper message |
+| `environment` | Our assumptions put to the installed binaries — that `openconnect` exists, that the `vpnc-script` it names is executable and handles every `reason` we send, that our fallback log patterns still appear in its message catalogue, and that nothing the helper runs as root is writable by anyone else |
+| `wiring` | `asuvpn-notify` actually executed: the event arrives with the right token and fields, the real `vpnc-script` still runs with its environment intact, the token is scrubbed before it sees it, and no event can emit more than one line |
+
+The environment tier reads the installed `libopenconnect`'s own strings, so
+`asuvpn selftest` is what tells you the fallback patterns have gone stale on
+some future release, instead of finding out during an outage.
+
+The suite is checked by breaking the code on purpose and confirming it notices:
+reverting the bundled-option fix, making the field sanitiser a no-op, pointing
+the default script somewhere that does not exist, matching on a message the
+binary no longer contains, and making the installed directory world-writable.
+All five are caught.
+
+The linters run separately. The three Python programs have no `.py` extension,
+so copy them under one first:
 
 ```bash
 mkdir -p /tmp/asuvpn-lint && cp ruff.toml /tmp/asuvpn-lint/
-cp asuvpn-tray /tmp/asuvpn-lint/asuvpn_tray.py
-cp asuvpn-helper /tmp/asuvpn-lint/asuvpn_helper.py
+cp asuvpn-tray     /tmp/asuvpn-lint/asuvpn_tray.py
+cp asuvpn-helper   /tmp/asuvpn-lint/asuvpn_helper.py
+cp asuvpn-selftest /tmp/asuvpn-lint/asuvpn_selftest.py
+cp asuvpn-notify   /tmp/asuvpn-lint/asuvpn_notify.py
 
 ruff check /tmp/asuvpn-lint
 pyflakes   /tmp/asuvpn-lint/*.py
@@ -649,6 +752,14 @@ shellcheck -S style bootstrap.sh install.sh
 All of these are expected to be clean. `mypy --check-untyped-defs` still reports
 `Popen.stdin` as `IO | None`; that is a limitation of the stubs, not a defect —
 `stdin=PIPE` guarantees it, and every such write is exception-guarded anyway.
+
+## Design notes
+
+[`DESIGN.md`](DESIGN.md) covers the internals for anyone reading or changing the
+code: the process and privilege model, the state machine and where state comes
+from, the threading model and the locks, the teardown guarantees, the full exit
+code list, the invariants the code exists to maintain, how it is tested, and
+what to update in lockstep when you change something.
 
 ## Status
 
@@ -667,6 +778,27 @@ openconnect that invokes `--script` with `reason=connect`, `attempt-reconnect`,
 the assigned address. The permission refusal was tested by making the directory
 world-writable and group-shared in turn, and by confirming an ordinary
 user-private-group checkout still runs.
+
+The stand-ins run inside an unprivileged **mount namespace**, bind-mounted over
+`/usr/sbin/openconnect`, `/usr/bin/pkexec`, `openconnect-sso` and the
+`vpnc-script`, with a guard that refuses to start unless every one of them
+resolves to a fake. Earlier rounds used symlinks, and twice a gap in that
+arrangement let a test reach a real binary. A namespace cannot leak: the real
+filesystem is not modified at all, and is byte-identical afterwards.
+
+The `reason` values the framework depends on were confirmed present in the
+installed `libopenconnect.so.5` rather than assumed. `connect` and `reconnect`
+do not appear in `strings` output because the linker tail-merges them into
+`attempt-reconnect` — they are at `attempt-reconnect`+8 and +10 — and the
+installed `vpnc-script` enumerates exactly those five in its own `case`
+statement.
+
+Behaviours confirmed by first reproducing the bug and then the fix: a failure
+after a successful connect now reports `Failed to connect to host …` rather than
+a bare exit status; a `reconnect` event racing a user-requested disconnect ends
+`Disconnected` rather than in the error state; a bundled `-bv` is refused; a
+missing `vpnc-script` leaves `openconnect`'s own default in place instead of
+silently disabling all routing.
 
 Specific defences were tested by trying to defeat them, not by inspection:
 
@@ -699,7 +831,8 @@ keyring probe reports correctly, and GNOME resolves the launcher and icon.
 **Not yet exercised end to end:** a real `pkexec` prompt and a live tunnel, which
 need an actual Duo approval. The first real connect is therefore the one path
 still unproven — in particular, watch for the `default route restored:` line
-after your first disconnect.
+after your first disconnect. Run `asuvpn selftest` first: everything it checks
+is everything that can be checked without one.
 
 ## License
 

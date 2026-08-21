@@ -7,3 +7,4 @@ __pycache__/
 
 # editor/session metadata
 .reasonix/
+.ruff_cache/
