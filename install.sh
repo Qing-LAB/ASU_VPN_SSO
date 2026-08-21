@@ -69,21 +69,22 @@ else
   INSTALL_DIR="$APP_DIR"
   mkdir -p "$INSTALL_DIR"
   install -m 0755 "$SRC_DIR/asuvpn-tray" "$SRC_DIR/asuvpn-helper" \
-                  "$SRC_DIR/asuvpn-notify" "$INSTALL_DIR/"
+                  "$SRC_DIR/asuvpn-notify" "$SRC_DIR/asuvpn-selftest" "$INSTALL_DIR/"
   install -m 0644 "$SRC_DIR/asuvpn.svg" "$INSTALL_DIR/"
 fi
 
 TRAY="$INSTALL_DIR/asuvpn-tray"
 # Already 0755 in copy mode; in --link mode the checkout may be read-only, and
 # a failure here must not be fatal now that the files are otherwise in place.
-chmod +x "$TRAY" "$INSTALL_DIR/asuvpn-helper" "$INSTALL_DIR/asuvpn-notify" 2>/dev/null || true
+chmod +x "$TRAY" "$INSTALL_DIR/asuvpn-helper" "$INSTALL_DIR/asuvpn-notify" \
+         "$INSTALL_DIR/asuvpn-selftest" 2>/dev/null || true
 
 # The helper and the notify script are executed as root. The helper refuses to
 # run if either is group- or world-writable, so make sure they are not: a stray
 # umask or an unpacked archive can easily leave 0775 behind.
 chmod 0755 "$INSTALL_DIR" 2>/dev/null || true
 chmod go-w "$INSTALL_DIR" "$TRAY" "$INSTALL_DIR/asuvpn-helper" \
-           "$INSTALL_DIR/asuvpn-notify" 2>/dev/null || true
+           "$INSTALL_DIR/asuvpn-notify" "$INSTALL_DIR/asuvpn-selftest" 2>/dev/null || true
 install -m 0644 "$SRC_DIR/asuvpn.svg" "$ICON_DIR/asuvpn.svg"
 
 # `asuvpn` is a symlink to the same script, not a separate program.
@@ -170,3 +171,18 @@ case ":$PATH:" in
   *":$BIN_DIR:"*) ;;
   *) echo; echo "note: $BIN_DIR is not on your PATH; add it to use the asuvpn command." ;;
 esac
+
+# Check what was just installed against this machine, now rather than at the
+# first connect. The logic and wiring tiers need nothing but the files; the
+# environment tier is what catches a missing openconnect, absent GTK bindings,
+# or a vpnc-script this distribution keeps somewhere else. Advisory on purpose:
+# installing before ./bootstrap.sh has run is a legitimate order to do this in,
+# and the report says what is still missing.
+if [ -x "$INSTALL_DIR/asuvpn-selftest" ]; then
+  echo
+  if "$INSTALL_DIR/asuvpn-selftest" --quiet; then
+    echo "self-check passed"
+  else
+    echo "self-check found problems; run 'asuvpn selftest' for the full report." >&2
+  fi
+fi
