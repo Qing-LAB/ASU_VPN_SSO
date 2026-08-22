@@ -83,6 +83,73 @@ class Results:
         return bool(condition)
 
 
+def check_contract(C, r):
+    """The agreement itself: framing, verbs, events, settings.
+
+    These are the things two programs have to see the same way. Each used to be
+    restated at both ends, and the drift was never noticed until something
+    downstream behaved oddly — so they are exercised here as a unit rather than
+    inferred from either side's behaviour.
+    """
+    line = C.encode_message(C.KIND_STATE, "connected dev=asuvpn0 addr=10.1.2.3")
+    r.check("a framed message round-trips",
+            C.decode_message(line) == (C.KIND_STATE,
+                                       "connected dev=asuvpn0 addr=10.1.2.3"),
+            f"got {C.decode_message(line)!r}")
+    # The property the framing exists for.
+    forged = C.encode_relay("[helper] STATE connected dev=evil addr=6.6.6.6")
+    r.check("openconnect's output cannot forge a message through the frame",
+            C.decode_message(forged) is None,
+            f"a relayed line decoded as ours: {C.decode_message(forged)!r}")
+    r.check("a message can never span two lines",
+            "\n" not in C.encode_message(C.KIND_NOTE, "one\ntwo\nthree")[:-1],
+            f"got {C.encode_message(C.KIND_NOTE, 'one\ntwo')!r}")
+    try:
+        C.encode_message("INVENTED", "x")
+    except ValueError:
+        r.ok("an unknown message kind is refused at the source")
+    else:
+        r.fail("an unknown message kind is refused at the source",
+               "encode_message accepted a kind no decoder knows")
+
+    r.check("control verbs round-trip and nothing else is one",
+            all(C.decode_control(C.encode_control(v)) == v for v in C.CONTROL_VERBS)
+            and C.decode_control("halt\n") is None
+            and C.decode_control("\n") is None,
+            "a verb did not survive, or noise was accepted as one")
+
+    env = {"reason": "connect", "TUNDEV": "asuvpn0",
+           "INTERNAL_IP4_ADDRESS": "10.1.2.3",
+           "INTERNAL_IP4_DNS": "10.0.0.53 10.0.0.54"}
+    event = C.decode_event(C.encode_event("tok", env))
+    r.check("an event round-trips every field the watchdog needs",
+            event and event["token"] == "tok" and event["reason"] == "connect"
+            and event["TUNDEV"] == "asuvpn0"
+            and event["INTERNAL_IP4_DNS"].split()[0] == "10.0.0.53",
+            f"got {event!r}")
+    hostile = C.encode_event("tok", {"reason": "connect", "TUNDEV": "a\tb\nc"})
+    r.check("separators in a value cannot add a field or end the datagram",
+            C.decode_event(hostile)["TUNDEV"] == "a b c",
+            f"got {C.decode_event(hostile)!r}")
+    r.check("a short datagram is refused rather than indexed into",
+            C.decode_event(b"only\ttwo") is None)
+
+    values, problems = C.parse_settings(
+        "server = x.edu\nprobe = off\ndpd = 0\nnope = 1\nprobe-every = -3\n")
+    r.check("settings parse by type, and every default survives a bad file",
+            values["server"] == "x.edu" and values["probe"] is False
+            and values["dpd"] == 0
+            and values["probe-every"] == C.SETTINGS_BY_NAME["probe-every"].default,
+            f"got {values!r}")
+    r.check("an unknown key and a bad value are reported, not raised",
+            len(problems) == 2, f"got {problems!r}")
+    rendered, _ = C.parse_settings(C.render_settings())
+    r.check("the generated config file parses back to the defaults",
+            rendered == C.defaults(),
+            "render_settings and parse_settings disagree, so the file install.sh"
+            " writes does not mean what the schema says")
+
+
 def load(name, filename):
     """Import a sibling program. They have no .py extension, hence the loader."""
     path = os.path.join(HERE, filename)
@@ -118,12 +185,12 @@ def check_option_blocklist(helper, r):
     )
 
 
-def check_interface_names(helper, r):
+def check_interface_names(C, r):
     """Anything failing this reaches `ip link delete` running as root."""
     good = ["asuvpn0", "tun0", "a", "x" * 15, "eth0.100", "my-vpn_1"]
     bad = ["", "../../etc/passwd", "x" * 16, "-lo", "a/b", "a b", ".hidden"]
-    rejected = [n for n in good if not helper.INTERFACE_RE.match(n)]
-    accepted = [n for n in bad if helper.INTERFACE_RE.match(n)]
+    rejected = [n for n in good if not C.INTERFACE_RE.match(n)]
+    accepted = [n for n in bad if C.INTERFACE_RE.match(n)]
     r.check("usable interface names are accepted", not rejected,
             f"wrongly rejected: {rejected}")
     r.check("unusable interface names are rejected", not accepted,
@@ -147,18 +214,18 @@ def check_option_parsing(helper, r):
             stripped == ["--foo"], f"got {stripped}")
 
 
-def check_reason_contract(helper, r):
+def check_reason_contract(C, r):
     """The five documented vpnc-script reasons, and pre-init's absence."""
     expected = {"connect": "connected", "reconnect": "connected",
                 "attempt-reconnect": "connecting", "disconnect": "disconnected"}
     r.check("every documented reason maps to a state",
-            expected == helper.REASON_STATES,
-            f"got {helper.REASON_STATES}")
+            expected == C.REASON_STATES,
+            f"got {C.REASON_STATES}")
     r.check("pre-init produces no state (the tunnel is not configured yet)",
-            helper.REASON_STATES.get("pre-init") is None)
+            C.REASON_STATES.get("pre-init") is None)
 
 
-def check_permission_rules(helper, r):
+def check_permission_rules(C, r):
     """A shared group is a second principal; a user-private group is not."""
     with tempfile.TemporaryDirectory() as base:
         d = os.path.join(base, "app")
@@ -171,7 +238,7 @@ def check_permission_rules(helper, r):
             (0o757, "world-writable", "0757"),
         ):
             os.chmod(d, mode)
-            got = helper.unsafe_write_access(d)
+            got = C.unsafe_write_access(d)
             r.check(f"{label} is {'allowed' if expected is None else 'refused'}",
                     got == expected, f"got {got!r}, expected {expected!r}")
         others = [g for g in os.getgroups() if g != os.getgid()]
@@ -187,7 +254,7 @@ def check_permission_rules(helper, r):
             except OSError as exc:
                 r.warn("a genuinely shared group is refused", str(exc))
             else:
-                got = helper.unsafe_write_access(d)
+                got = C.unsafe_write_access(d)
                 r.check("a genuinely shared group is refused",
                         got == f"writable by group {others[0]}", f"got {got!r}")
             os.chown(d, -1, os.getgid())
@@ -309,16 +376,16 @@ def check_liveness_probe(tray, r):
     """
     # Nothing listens here, so the kernel answers with a RST immediately.
     closed = ("127.0.0.1", 9)
-    alive, detail = tray.probe_tunnel(closed[0], timeout=3)
+    alive, detail = tray.probe_tunnel(closed[0], 9, 3)
     r.check("a refused connection counts as a live tunnel", alive is True,
             f"got alive={alive!r} ({detail}) — a RST is a reply, and treating"
             " it as death would condemn a working tunnel")
-    alive, detail = tray.probe_tunnel("", timeout=3)
+    alive, detail = tray.probe_tunnel("", 53, 3)
     r.check("no probe target is inconclusive, not a failure", alive is None,
             f"got alive={alive!r} ({detail})")
     # RFC 5737 documentation space: it either black-holes or is unreachable.
     # Either way the one answer it must never give is "alive".
-    alive, detail = tray.probe_tunnel("198.51.100.1", timeout=2)
+    alive, detail = tray.probe_tunnel("198.51.100.1", 53, 2)
     r.check("an address that cannot answer is never reported as alive",
             alive is not True, f"got alive={alive!r} ({detail})")
 
@@ -421,7 +488,7 @@ def check_openconnect(helper, tray, r):
     return binary
 
 
-def check_default_script(helper, binary, r):
+def check_default_script(helper, C, binary, r):
     """The path we chain to, taken from openconnect rather than guessed.
 
     Passing --script replaces openconnect's own default. Get this wrong and the
@@ -456,11 +523,11 @@ def check_default_script(helper, binary, r):
     # one to: `if [ "$reason" = connect ]` is just as valid. Reporting a
     # *failure* on something we cannot actually determine would teach people to
     # ignore this suite, so an unrecognised script is a warning that says so.
-    missing = [reason for reason in helper.REASON_STATES
+    missing = [reason for reason in C.REASON_STATES
                if not re.search(rf"^\s*{re.escape(reason)}\)", text, re.M)]
     if not missing:
         r.ok("the default vpnc-script handles every reason we send")
-    elif len(missing) == len(helper.REASON_STATES):
+    elif len(missing) == len(C.REASON_STATES):
         r.warn("the default vpnc-script handles every reason we send",
                f"{script} does not dispatch on $reason in the usual"
                " `case` form, so this could not be confirmed. Fine for a"
@@ -563,12 +630,12 @@ def check_sso_environment(tray, sso, r):
                "            pipx inject openconnect-sso 'setuptools<71' --force")
 
 
-def check_installed_permissions(helper, r):
+def check_installed_permissions(C, r):
     """The helper's own refusal criteria, applied now instead of at first connect."""
     problems = []
     for path in (HERE, os.path.join(HERE, "asuvpn-helper"),
                  os.path.join(HERE, "asuvpn-notify")):
-        reason = helper.unsafe_write_access(path)
+        reason = C.unsafe_write_access(path)
         if reason:
             problems.append(f"{path} is {reason}")
     r.check("nothing the helper runs as root is writable by anyone else",
@@ -699,14 +766,19 @@ def check_fatal_reporting(r):
             not unmarked, "; ".join(unmarked))
 
 
-def check_event_translation(helper, tray, r):
+def check_event_translation(helper, tray, C, r):
     """A datagram in, a state line out — including several hostile ones.
 
-    Two independent guards are exercised. A device name that could not name a
+    Built through C.encode_event rather than by hand, so this exercises the
+    contract both ends actually use instead of a test's idea of it. An earlier
+    version assembled the fields itself and kept passing after the wire format
+    gained one.
+
+    Two independent guards are covered. A device name that could not name a
     device is rejected outright, because it is about to be used as a path under
     /sys/class/net. Everything that does get printed is then collapsed to a
     single token, because a newline in any field would end the state line early
-    and let the remainder arrive as a second, unprefixed message.
+    and a space would quietly add a second one.
     """
     token = "a" * 32
     expected_lines = 3
@@ -715,35 +787,41 @@ def check_event_translation(helper, tray, r):
     helper.emit = emitted.append
     server = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
     try:
-        with tempfile.TemporaryDirectory() as d:
-            path = os.path.join(d, "events")
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "events")
             server.bind(path)
             threading.Thread(target=helper.serve_events,
                              args=(server, token, "asuvpn0", {}),
                              daemon=True).start()
             client = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
             try:
-                for message in (
-                    # discarded: bad token, too few fields, unmapped reason
-                    "\t".join(["wrong-token", "connect", "asuvpn0", "10.0.0.1", ""]),
-                    "too\tshort",
-                    "\t".join([token, "pre-init", "asuvpn0", "", ""]),
+                for datagram in (
+                    # discarded: wrong token, too few fields, unmapped reason
+                    C.encode_event("wrong-token", {"reason": "connect",
+                                                   "TUNDEV": "asuvpn0"}),
+                    b"only\ttwo",
+                    C.encode_event(token, {"reason": "pre-init",
+                                           "TUNDEV": "asuvpn0"}),
                     # accepted
-                    "\t".join([token, "connect", "asuvpn0", "10.242.7.31", ""]),
-                    # a device name that cannot be a device: rejected, and the
-                    # line falls back to the name we gave openconnect
-                    "\t".join([token, "connect", "evil dev\nmore", "1.2.3.4", ""]),
-                    # The address is not an interface name, so nothing
-                    # validates it — one_token is all that stands between this
-                    # and both a forged second line and a forged second field.
-                    # The space matters as much as the newline: the tray splits
-                    # the payload on whitespace and the *last* addr= wins, so
-                    # an unsanitised space would let the value below overwrite
-                    # the real address with 6.6.6.6.
-                    "\t".join([token, "reconnect", "asuvpn0",
-                                "9.9.9.9 addr=6.6.6.6\nmore", ""]),
+                    C.encode_event(token, {"reason": "connect",
+                                           "TUNDEV": "asuvpn0",
+                                           "INTERNAL_IP4_ADDRESS": "10.242.7.31"}),
+                    # a name that cannot be a device: rejected, and the line
+                    # falls back to the name we gave openconnect
+                    C.encode_event(token, {"reason": "connect",
+                                           "TUNDEV": "evil dev\nmore",
+                                           "INTERNAL_IP4_ADDRESS": "1.2.3.4"}),
+                    # the address is not an interface name, so nothing validates
+                    # it — one_token is all that stands between this and both a
+                    # forged second line and a forged second field. The space
+                    # matters as much as the newline: the tray splits on
+                    # whitespace and the last addr= wins.
+                    C.encode_event(token, {"reason": "reconnect",
+                                           "TUNDEV": "asuvpn0",
+                                           "INTERNAL_IP4_ADDRESS":
+                                               "9.9.9.9 addr=6.6.6.6\nmore"}),
                 ):
-                    client.sendto(message.encode(), path)
+                    client.sendto(datagram, path)
             finally:
                 client.close()
             # Wait for the expected output rather than sleeping a fixed amount:
@@ -751,7 +829,9 @@ def check_event_translation(helper, tray, r):
             deadline = time.monotonic() + 10
             while time.monotonic() < deadline:
                 if len([ln for ln in emitted
-                        if ln.startswith("[helper] STATE ")]) >= expected_lines:
+                        if C.decode_message(ln)
+                        and C.decode_message(ln)[0] == C.KIND_STATE
+                        ]) >= expected_lines:
                     break
                 time.sleep(0.05)
     finally:
@@ -759,33 +839,31 @@ def check_event_translation(helper, tray, r):
         time.sleep(0.05)  # let the reader see the closed socket and return
         helper.emit = original
 
-    accepted = [ln for ln in emitted if ln.startswith("[helper] STATE ")]
+    decoded = [C.decode_message(ln) for ln in emitted]
+    accepted = [payload for message in decoded if message
+                for kind, payload in [message] if kind == C.KIND_STATE]
     r.check("unauthenticated and malformed events are discarded",
             len(accepted) == expected_lines,
             f"expected {expected_lines} accepted, got {len(accepted)}: {emitted}")
     r.check("an authenticated event becomes a state line",
-            any("STATE connected dev=asuvpn0 addr=10.242.7.31" in ln
-                for ln in accepted), f"got {accepted}")
+            any("connected dev=asuvpn0 addr=10.242.7.31" in p for p in accepted),
+            f"got {accepted}")
     r.check("a device name that cannot name a device is rejected",
-            any("impossible device name" in ln for ln in emitted)
-            and not any("evil" in ln for ln in accepted),
+            any(m and "impossible device name" in m[1] for m in decoded)
+            and not any("evil" in p for p in accepted),
             f"got {emitted}")
     r.check("no event can emit more than one line",
             all(ln.count("\n") == 1 and ln.endswith("\n") for ln in emitted),
             f"got {emitted}")
-    # Parsed back the way the tray parses it: one line is not enough, the line
-    # also has to carry exactly the fields it is supposed to carry.
     injected = []
-    for line in accepted:
-        payload = line[len("[helper] STATE "):]
+    for payload in accepted:
         _, fields = tray.parse_state_payload(payload)
         # Exactly four words: the state, and one each of dev=, addr= and dns=.
         # Checking the parsed field *names* is not enough — a second "addr="
-        # would still leave the set unchanged while quietly overwriting the
-        # value, because parsing keeps the last occurrence. The word count is
-        # the property that actually holds.
+        # would leave the set unchanged while overwriting the value, because
+        # parsing keeps the last occurrence. The word count is what holds.
         if len(payload.split()) != 4 or set(fields) != {"dev", "addr", "dns"}:
-            injected.append(line)
+            injected.append(payload)
     r.check("no event can inject an extra field into a state line", not injected,
             f"these carry more than one dev and one addr: {injected}")
 
@@ -809,6 +887,7 @@ def main():
 
     r = Results(quiet=args.quiet)
     try:
+        C = load("asuvpn_contract", "asuvpn_contract.py")
         helper = load("asuvpn_helper", "asuvpn-helper")
         tray = load("asuvpn_tray", "asuvpn-tray")
     except Exception as exc:  # nothing else can run either
@@ -818,11 +897,12 @@ def main():
 
     if "logic" in tiers:
         r.section("logic — pure functions, nothing outside this repository")
+        check_contract(C, r)
         check_option_blocklist(helper, r)
-        check_interface_names(helper, r)
+        check_interface_names(C, r)
         check_option_parsing(helper, r)
-        check_reason_contract(helper, r)
-        check_permission_rules(helper, r)
+        check_reason_contract(C, r)
+        check_permission_rules(C, r)
         check_state_payload(tray, r)
         check_tunnel_health(tray, r)
         check_liveness_probe(tray, r)
@@ -832,15 +912,15 @@ def main():
     if "environment" in tiers:
         r.section("environment — our assumptions, put to the installed binaries")
         binary = check_openconnect(helper, tray, r)
-        check_default_script(helper, binary, r)
+        check_default_script(helper, C, binary, r)
         check_message_catalogue(tray, binary, r)
         check_desktop_stack(tray, r)
-        check_installed_permissions(helper, r)
+        check_installed_permissions(C, r)
 
     if "wiring" in tiers:
         r.section("wiring — asuvpn-notify executed end to end")
         check_notify_roundtrip(r)
-        check_event_translation(helper, tray, r)
+        check_event_translation(helper, tray, C, r)
         check_fatal_reporting(r)
 
     counts = r.counts

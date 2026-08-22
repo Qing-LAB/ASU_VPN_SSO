@@ -24,6 +24,8 @@ The cookie is never printed.
 
 import argparse
 import ctypes
+import importlib.machinery
+import importlib.util
 import os
 import re
 import secrets
@@ -39,11 +41,40 @@ import tempfile
 import threading
 import time
 
+def _contract():
+    """Load the shared contract from beside this program, by explicit path.
+
+    Not `import`: this runs isolated (-I) so its own directory is deliberately
+    not on sys.path — that is what stops a signal.py dropped beside it being
+    executed as root. An explicit path bypasses sys.path entirely.
+
+    Verified before it is executed, because running as root out of a directory
+    an unprivileged user owns is the whole reason -I is there. The check is
+    skipped when unprivileged: loading a file you own, as yourself, crosses no
+    boundary, and refusing there would break --link mode from an ordinary
+    umask-002 checkout.
+    """
+    here = os.path.dirname(os.path.abspath(__file__))
+    path = os.path.join(here, "asuvpn_contract.py")
+    if os.geteuid() == 0:
+        for target in (here, path):
+            info = os.stat(target)
+            if info.st_mode & stat.S_IWOTH or (
+                    info.st_mode & stat.S_IWGRP and info.st_gid != info.st_uid):
+                raise SystemExit(f"refusing to load {target}: writable by others")
+    loader = importlib.machinery.SourceFileLoader("asuvpn_contract", path)
+    spec = importlib.util.spec_from_loader("asuvpn_contract", loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+C = _contract()
+
 OPENCONNECT_CANDIDATES = ("/usr/sbin/openconnect", "/usr/bin/openconnect")
 PR_SET_PDEATHSIG = 1
 IP_CANDIDATES = ("/usr/sbin/ip", "/sbin/ip", "/usr/bin/ip")
 TUNNEL_PREFIXES = ("tun", "tap", "vpn")
-INTERFACE_PREFIX = "asuvpn"
 HERE = os.path.dirname(os.path.abspath(__file__))
 NOTIFY = os.path.join(HERE, "asuvpn-notify")
 # Only a last resort. openconnect knows its own compiled-in default and prints
@@ -53,31 +84,6 @@ FALLBACK_VPNC_SCRIPT = "/usr/share/vpnc-scripts/vpnc-script"
 # directory bit is the whole access control: 0700 root:root denies traversal to
 # every other uid, and only root could reach the socket inside it anyway.
 RUNTIME_ROOT = "/run/asuvpn"
-
-# ASU's server negotiates "CSTP connected. DPD 0, Keepalive 0" -- dead peer
-# detection disabled. With no DPD, openconnect has no way to notice the far end
-# has stopped answering: it sits in a connected state indefinitely while nothing
-# flows. That is the silent breakage, and openconnect's own --force-dpd exists
-# for exactly it ("use DPD at the specified interval even if the server hasn't
-# requested it").
-#
-# Cheap to be wrong about. A DPD failure makes openconnect re-establish using
-# the *same* session cookie -- no sign-in, no Duo push, no polkit prompt -- so
-# an interval that is too eager costs a brief reconnect, not a re-authentication.
-# A caller who passes their own --force-dpd is left alone.
-DEFAULT_DPD_INTERVAL = 30
-
-# openconnect's documented script contract, not log text. These five values have
-# been stable since vpnc; the log wording has not.
-REASON_STATES = {
-    "connect": "connected",
-    "reconnect": "connected",
-    "attempt-reconnect": "connecting",
-    "disconnect": "disconnected",
-}
-# IFNAMSIZ is 16 including the NUL. Anything outside this cannot name a device,
-# and unchecked it would reach an `ip link delete` running as root.
-INTERFACE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,14}$")
 
 # Options that break supervision rather than extend it. --background makes
 # openconnect fork, and fork clears PR_SET_PDEATHSIG — so the daemon outlives
@@ -244,15 +250,19 @@ def serve_events(server, token, ifname, owned):
                 log(f"WARNING: the state event channel stopped ({exc});"
                     " the tray will fall back to reading openconnect's output")
             return
-        parts = data.decode("utf-8", "replace").split("\t")
-        # Length and token both checked: a short or unrecognised datagram is
-        # discarded rather than indexed into.
-        if len(parts) < 5 or not secrets.compare_digest(parts[0], token):
+        event = C.decode_event(data)
+        # Shape and token both checked: a short or unrecognised datagram is
+        # discarded rather than indexed into. compare_digest is applied here
+        # rather than in the contract, which has no business holding an opinion
+        # about how a secret is compared.
+        if event is None or not secrets.compare_digest(event["token"], token):
             continue
-        reason, device, ip4, ip6 = parts[1], parts[2], parts[3], parts[4]
-        # Field added after the first five; older senders simply do not have it.
-        dns = parts[5].split()[0] if len(parts) > 5 and parts[5].split() else ""
-        state = REASON_STATES.get(reason)
+        reason = event["reason"]
+        device = event["TUNDEV"]
+        ip4, ip6 = event["INTERNAL_IP4_ADDRESS"], event["INTERNAL_IP6_ADDRESS"]
+        resolvers = event["INTERNAL_IP4_DNS"].split()
+        dns = resolvers[0] if resolvers else ""
+        state = C.REASON_STATES.get(reason)
         if state is None:
             continue  # pre-init: the tunnel is not configured yet
         address = ip4 or ip6
@@ -262,7 +272,7 @@ def serve_events(server, token, ifname, owned):
         # asuvpn-notify sends what openconnect set, so this is depth rather
         # than a hole being closed — but a name that cannot be a device has no
         # business being turned into a filesystem path either way.
-        if device and not INTERFACE_RE.match(device):
+        if device and not C.INTERFACE_RE.match(device):
             log(f"ignoring an event for an impossible device name: {device!r}")
             device = ""
         if state == "connected":
@@ -276,13 +286,10 @@ def serve_events(server, token, ifname, owned):
         # built: a newline in either field ends the line early and the rest
         # arrives as a second, unprefixed message, while a space silently
         # becomes an extra field. Caught by `asuvpn selftest`.
-        emit(f"[helper] STATE {state} dev={one_token(device or ifname)}"
-             f" addr={one_token(address)} dns={one_token(dns)}\n")
-
-
-def one_token(value):
-    """Collapse a value to a single whitespace-free token for a STATE line."""
-    return re.sub(r"\s+", "_", value.strip())[:64]
+        emit(C.encode_message(C.KIND_STATE,
+                              f"{state} dev={C.one_token(device or ifname)}"
+                              f" addr={C.one_token(address)}"
+                              f" dns={C.one_token(dns)}"))
 
 
 def emit(text):
@@ -303,7 +310,7 @@ def fatal(message):
     did not, so those reached the user as a bare number with the explanation
     sitting unread in the log.
     """
-    emit(f"[helper] FATAL {message}\n")
+    emit(C.encode_message(C.KIND_FATAL, message))
     try:
         syslog.syslog(syslog.LOG_ERR, message)
     except (OSError, ValueError):
@@ -311,7 +318,8 @@ def fatal(message):
 
 
 def log(message):
-    emit(f"[helper] {message}\n")
+    kind = C.KIND_WARNING if message.startswith("WARNING") else C.KIND_NOTE
+    emit(C.encode_message(kind, message.removeprefix("WARNING: ")))
     # Also to syslog, because the tray's pipe is broken in exactly the case the
     # teardown warnings exist for — a crashed or killed applet. Without this,
     # "no default route after teardown" is written to a pipe nobody is reading
@@ -428,7 +436,7 @@ def free_interface_name():
     free name means no device ever has to be removed to make room.
     """
     for index in range(100):
-        name = f"{INTERFACE_PREFIX}{index}"
+        name = f"{C.INTERFACE_PREFIX}{index}"
         if not interface_exists(name):
             return name
     return None
@@ -633,17 +641,17 @@ def relay_output(proc):
     a desktop notification with text the server chose.
     """
     for line in proc.stdout:
-        emit(f"[vpn] {line.rstrip(chr(10))}\n")
+        emit(C.encode_relay(line))
 
 
 def watch_control_channel(tunnel):
     try:
         for line in sys.stdin:
-            verb = line.strip().lower()
-            if verb in ("quit", "disconnect"):
+            verb = C.decode_control(line)
+            if verb in C.CONTROL_STOP:
                 log("disconnect requested")
                 return
-            if verb == "reconnect":
+            if verb == C.CONTROL_RECONNECT:
                 # Deliberately does not return: this re-establishes the tunnel
                 # and keeps the control channel open, where quit tears it down.
                 tunnel.nudge()
@@ -660,6 +668,14 @@ def main():
     parser.add_argument("--host", required=True, help="VPN URL from openconnect-sso")
     parser.add_argument("--fingerprint", required=True, help="server certificate hash")
     parser.add_argument("--ac-version", default="4.7.00136")
+    # Passed in rather than read from a file. Settings belong to the user and
+    # this runs as root, where ~ is root's home -- so the side that owns the
+    # config resolves it and hands over a value, and the privileged side never
+    # reads anything an unprivileged account can write.
+    parser.add_argument("--dpd", type=int,
+                        default=C.SETTINGS_BY_NAME["dpd"].default,
+                        help="dead peer detection interval; 0 leaves the"
+                             " server's choice alone")
     parser.add_argument("extra", nargs=argparse.REMAINDER)
     args = parser.parse_args()
 
@@ -667,7 +683,7 @@ def main():
     # inherent and documented, but group- or world-writable is not: it would let
     # a *second* account take root at the next connect. Enforced, not just noted.
     for path in (HERE, os.path.abspath(__file__), NOTIFY):
-        reason = unsafe_write_access(path)
+        reason = C.unsafe_write_access(path)
         if reason:
             fatal(f"refusing to run: {path} is {reason}")
             return 26
@@ -693,7 +709,7 @@ def main():
     ifname = requested_interface(extra)
     caller_named = ifname is not None
     if caller_named:
-        if not INTERFACE_RE.match(ifname):
+        if not C.INTERFACE_RE.match(ifname):
             fatal(f"refusing an unusable interface name: {ifname!r}")
             return 22
     else:
@@ -747,18 +763,18 @@ def main():
         shutil.rmtree(event_dir, ignore_errors=True)
         event_dir = None
     if events is not None:
-        script_env["ASUVPN_EVENT_SOCKET"] = event_path
-        script_env["ASUVPN_EVENT_TOKEN"] = token
-        script_env["ASUVPN_REAL_SCRIPT"] = chained
+        script_env[C.EVENT_SOCKET_VAR] = event_path
+        script_env[C.EVENT_TOKEN_VAR] = token
+        script_env[C.REAL_SCRIPT_VAR] = chained
         extra = list(strip_script_option(extra))
         extra = [*extra, "--script", NOTIFY]
 
-    if requested_dpd(extra) is None:
-        extra = [*extra, "--force-dpd", str(DEFAULT_DPD_INTERVAL)]
-        # Says what was done, not what the server did: this runs before the
-        # server has said anything, and asserting its behaviour here would be
-        # wrong for every gateway that does negotiate DPD.
-        log(f"forcing dead peer detection every {DEFAULT_DPD_INTERVAL}s;"
+    # Says what was done, not what the server did: this runs before the server
+    # has said anything, and asserting its behaviour here would be wrong for
+    # every gateway that does negotiate DPD.
+    if args.dpd and requested_dpd(extra) is None:
+        extra = [*extra, "--force-dpd", str(args.dpd)]
+        log(f"forcing dead peer detection every {args.dpd}s;"
             " a server that negotiates it off leaves a dropped tunnel"
             " looking connected")
 
@@ -780,7 +796,7 @@ def main():
     # when the event channel could not be set up and state is coming from log
     # matching. Scraping it back out of a logged argv would be exactly the kind
     # of magic-string coupling the rest of this design removes.
-    emit(f"[helper] DEVICE {one_token(ifname)}\n")
+    emit(C.encode_message(C.KIND_DEVICE, C.one_token(ifname)))
 
     # Logged only once every check has passed, immediately before the spawn.
     # Logging it earlier meant syslog recorded root command lines that were then

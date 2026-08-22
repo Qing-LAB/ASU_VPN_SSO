@@ -23,6 +23,7 @@ is a machine with no working network until it reboots.
 
 **Contents**
 
+- [The contract](#the-contract)
 - [Processes and privilege](#processes-and-privilege)
 - [What happens on connect](#what-happens-on-connect)
 - [The state machine](#the-state-machine)
@@ -38,6 +39,52 @@ is a machine with no working network until it reboots.
 
 ---
 
+## The contract
+
+[`asuvpn_contract.py`](asuvpn_contract.py) holds everything more than one
+program has to know: the wire format the helper speaks to the tray, the verbs
+the tray speaks back, the fields `asuvpn-notify` puts on the event socket, the
+reasons `openconnect` reports, and the settings schema.
+
+It exists because each of those had been restated wherever it was needed, and
+most had drifted. Five message prefixes, each parsed by its own string test in
+the tray — and one of them keyed on the *wording* "refusing", which four of the
+seven refusals did not use, so those reached the user as a bare exit number. Two
+unrelated config mechanisms, a line of text and the presence of a file. Nine
+tunables split across two programs with no way for anyone to change them.
+
+| Section | Defines |
+| --- | --- |
+| Messages | `MESSAGE_PREFIX`, `RELAY_PREFIX`, the five kinds, `encode_message` / `decode_message` / `encode_relay` |
+| Control | the verbs the tray writes to the helper's stdin |
+| Events | the variable names, the field order, `encode_event` / `decode_event` |
+| openconnect | `REASON_STATES`, `INTERFACE_RE` |
+| Settings | the schema, the parser, and the generator that writes the file |
+
+### Loaded, not imported
+
+`asuvpn-helper` and `asuvpn-notify` run isolated (`-I`) so that their own
+directory is deliberately *not* on `sys.path` — that is what stops a `signal.py`
+dropped beside them being executed as root. And `asuvpn-tray` is reached through
+a symlink in `~/.local/bin`, so its `sys.path[0]` is that directory rather than
+the one its siblings live in. An explicit path built from the resolved location
+is the only form correct for all three.
+
+Each program therefore carries an eight-line loader, and that duplication is
+irreducible: code cannot be shared before the mechanism that shares it has been
+loaded. It is the only thing in this project stated more than once on purpose.
+The privileged programs verify the directory for write access by a second
+principal before executing anything; the unprivileged ones do not, because
+loading a file you own as yourself crosses no boundary — and refusing there
+would break `--link` mode from an ordinary umask-002 checkout.
+
+### Settings belong to the user side
+
+The helper runs as root, where `~` is root's home. It therefore never reads the
+config file: the tray resolves the settings and passes what the helper needs as
+explicit arguments (`--dpd`). A privileged process reading a file an
+unprivileged account can write is a trust boundary crossed for no reason.
+
 ## Processes and privilege
 
 Four programs, two privilege levels.
@@ -48,6 +95,7 @@ Four programs, two privilege levels.
 | `asuvpn-helper` | **root**, via `pkexec` | one tunnel | `openconnect`'s lifetime, teardown, the event socket |
 | `asuvpn-notify` | **root**, run by `openconnect` | one transition | reporting one event, then chaining to the real `vpnc-script` |
 | `asuvpn-selftest` | you | one run | checking the install against the machine |
+| `asuvpn_contract.py` | — | loaded by all four | the agreement between them; never executed as a program |
 
 `openconnect-sso` and the Qt browser it opens run **as you**. The only thing
 that crosses the privilege boundary is the session cookie, on stdin.
@@ -507,7 +555,7 @@ where it can be, checked by `asuvpn selftest`.
 
 ## How this is tested
 
-Three tiers in `asuvpn-selftest` (54 checks), plus a scenario sandbox.
+Three tiers in `asuvpn-selftest` (65 checks), plus a scenario sandbox.
 
 The shaping constraint: **conventional unit tests would not have caught any of
 the bugs that actually hurt this project.** `Connected as`, the hardcoded script

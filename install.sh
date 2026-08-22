@@ -70,6 +70,9 @@ else
   mkdir -p "$INSTALL_DIR"
   install -m 0755 "$SRC_DIR/asuvpn-tray" "$SRC_DIR/asuvpn-helper" \
                   "$SRC_DIR/asuvpn-notify" "$SRC_DIR/asuvpn-selftest" "$INSTALL_DIR/"
+  # Not executable: it is loaded, not run. Every program reads it by explicit
+  # path, so it has to sit beside them.
+  install -m 0644 "$SRC_DIR/asuvpn_contract.py" "$INSTALL_DIR/"
   install -m 0644 "$SRC_DIR/asuvpn.svg" "$INSTALL_DIR/"
 fi
 
@@ -84,19 +87,34 @@ chmod +x "$TRAY" "$INSTALL_DIR/asuvpn-helper" "$INSTALL_DIR/asuvpn-notify" \
 # umask or an unpacked archive can easily leave 0775 behind.
 chmod 0755 "$INSTALL_DIR" 2>/dev/null || true
 chmod go-w "$INSTALL_DIR" "$TRAY" "$INSTALL_DIR/asuvpn-helper" \
-           "$INSTALL_DIR/asuvpn-notify" "$INSTALL_DIR/asuvpn-selftest" 2>/dev/null || true
+           "$INSTALL_DIR/asuvpn-notify" "$INSTALL_DIR/asuvpn-selftest" \
+           "$INSTALL_DIR/asuvpn_contract.py" 2>/dev/null || true
 install -m 0644 "$SRC_DIR/asuvpn.svg" "$ICON_DIR/asuvpn.svg"
 
 # `asuvpn` is a symlink to the same script, not a separate program.
 ln -sfn "$TRAY" "$BIN_DIR/asuvpn"
 
-# The launcher carries the server on its Exec line, but the bare `asuvpn`
-# command has no such context. Record it so both agree on the endpoint.
+# One config file, generated from the contract's own schema so the file is the
+# reference for what can be changed. Created complete the first time; after
+# that only the server line is touched, because the rest belongs to the user.
 CONFIG_DIR="$CONFIG_HOME/asuvpn"
+CONFIG_FILE="$CONFIG_DIR/asuvpn.conf"
 mkdir -p "$CONFIG_DIR"
 chmod 0700 "$CONFIG_DIR"
-printf '%s\n' "$SERVER" > "$CONFIG_DIR/server"
-chmod 0600 "$CONFIG_DIR/server"
+if [ -f "$CONFIG_FILE" ]; then
+  # awk with the value passed as data, never interpolated into an expression:
+  # `--server 'x|w /etc/passwd'` was an arbitrary file write once already.
+  awk -v line="server = $SERVER" \
+    '{ split($0, f, "#"); split(f[1], kv, "="); k=kv[1]; gsub(/^[ \t]+|[ \t]+$/, "", k)
+       if (k == "server") { print line } else { print } }' \
+    "$CONFIG_FILE" > "$CONFIG_FILE.tmp" && mv "$CONFIG_FILE.tmp" "$CONFIG_FILE"
+else
+  "$INSTALL_DIR/asuvpn-tray" --write-config "$SERVER" > "$CONFIG_FILE"
+fi
+chmod 0600 "$CONFIG_FILE"
+
+# Superseded by the file above; left behind they would be two sources of truth.
+rm -f "$CONFIG_DIR/server" "$CONFIG_DIR/autoreconnect"
 
 # The session log records the address the VPN assigned you, the routes it
 # installed and the DNS servers it used. None of that belongs to other accounts
@@ -162,7 +180,7 @@ echo "  program   $INSTALL_DIR  (0755, not group-writable)"
 echo "  launcher  $DESKTOP_FILE"
 echo "  icon      $ICON_DIR/asuvpn.svg"
 echo "  command   $BIN_DIR/asuvpn"
-echo "  server    $SERVER  ($CONFIG_DIR/server, 0600)"
+echo "  settings  $CONFIG_FILE  (0600, server = $SERVER)"
 echo "  log       $CACHE_DIR/session.log  (0600)"
 [ "$INSTALL_DIR" = "$SRC_DIR" ] &&
   echo "  (running from this checkout; do not move or delete it)"

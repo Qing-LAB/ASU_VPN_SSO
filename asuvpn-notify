@@ -13,49 +13,55 @@ vpnc-script, so routing and DNS are configured exactly as they would have been.
 Reporting is best effort and never fatal: a failure here must not stop the
 tunnel being configured. Isolated (-I) for the same reason as the helper — this
 runs as root, and its directory is owned by an unprivileged user.
+
+What goes on the wire, and under which names, is asuvpn_contract's to say. This
+end used to restate the field order and the variable names, which is exactly how
+two ends of a protocol drift apart.
 """
 
+import importlib.machinery
+import importlib.util
 import os
-import socket
+import stat
 import sys
 
-# Only reached if this script is run as a vpnc-script by hand. In normal use
-# asuvpn-helper always sets ASUVPN_REAL_SCRIPT, and it derives that from
-# `openconnect --version` rather than assuming -- the path differs between
-# distributions. Kept as a last resort, not as the expected route.
+
+def _contract():
+    """Load the shared contract by explicit path; see asuvpn_contract.py."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    path = os.path.join(here, "asuvpn_contract.py")
+    if os.geteuid() == 0:
+        for target in (here, path):
+            info = os.stat(target)
+            if info.st_mode & stat.S_IWOTH or (
+                    info.st_mode & stat.S_IWGRP and info.st_gid != info.st_uid):
+                raise SystemExit(f"refusing to load {target}: writable by others")
+    loader = importlib.machinery.SourceFileLoader("asuvpn_contract", path)
+    spec = importlib.util.spec_from_loader("asuvpn_contract", loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+C = _contract()
+
+# Only reached if this is run as a vpnc-script by hand. In normal use the helper
+# always sets the real script, and it derives that from `openconnect --version`
+# rather than assuming -- the path differs between distributions.
 DEFAULT_SCRIPT = "/usr/share/vpnc-scripts/vpnc-script"
-# Set by the helper. Absent means "nobody is listening", which is not an error.
-SOCKET_VAR = "ASUVPN_EVENT_SOCKET"
-TOKEN_VAR = "ASUVPN_EVENT_TOKEN"
-SCRIPT_VAR = "ASUVPN_REAL_SCRIPT"
 
 
 def report():
-    path = os.environ.get(SOCKET_VAR)
-    token = os.environ.get(TOKEN_VAR)
+    import socket
+
+    path = os.environ.get(C.EVENT_SOCKET_VAR)
+    token = os.environ.get(C.EVENT_TOKEN_VAR)
     if not path or not token:
-        return
-    fields = (
-        token,
-        # Lower-case deliberately: `reason` is the variable name openconnect
-        # sets, fixed by the vpnc-script contract. Capitalising it reads nothing.
-        os.environ.get("reason", ""),  # noqa: SIM112
-        os.environ.get("TUNDEV", ""),
-        os.environ.get("INTERNAL_IP4_ADDRESS", ""),
-        os.environ.get("INTERNAL_IP6_ADDRESS", ""),
-        # The VPN's own resolvers, which the applet uses as a liveness target.
-        # Derived rather than configured: whatever this tunnel says to talk to
-        # is by definition something that should answer through it. May be
-        # several, space separated, or absent.
-        os.environ.get("INTERNAL_IP4_DNS", ""),
-    )
-    # Tabs are the separator, so strip any the environment may contain rather
-    # than let a hostile value split into extra fields.
-    message = "\t".join(f.replace("\t", " ").replace("\n", " ") for f in fields)
+        return  # nobody is listening, which is not an error
     client = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
     try:
         client.settimeout(2)
-        client.sendto(message.encode("utf-8", "replace")[:4096], path)
+        client.sendto(C.encode_event(token, os.environ), path)
     except OSError:
         pass
     finally:
@@ -71,11 +77,9 @@ def main():
     # Hand over with the environment intact; the real script needs every var
     # openconnect set. --script is a shell command line, not a path, so this
     # goes through sh exactly as openconnect would have run it.
-    script = os.environ.get(SCRIPT_VAR) or DEFAULT_SCRIPT
-    for var in (SOCKET_VAR, TOKEN_VAR, SCRIPT_VAR):
+    script = os.environ.get(C.REAL_SCRIPT_VAR) or DEFAULT_SCRIPT
+    for var in C.EVENT_VARS:
         os.environ.pop(var, None)
-    # A shell is the point: --script is defined as a shell command line, so this
-    # is exactly how openconnect would have invoked it.
     os.execv("/bin/sh", ["/bin/sh", "-c", script])  # noqa: S606
 
 
