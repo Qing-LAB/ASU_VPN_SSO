@@ -309,6 +309,35 @@ What survives is true of every working tunnel and false of a broken one:
 The facts behind each verdict are logged whether or not anything is wrong, so
 the next silent break arrives with evidence attached rather than as a mystery.
 
+### The probe, for the blind spot they share
+
+All of the above can pass while the tunnel carries nothing. So every
+`PROBE_EVERY` cycles the applet opens a TCP connection through the tunnel and
+closes it, on a worker thread — `PROBE_TIMEOUT` seconds on the GLib main loop
+would freeze the UI.
+
+The target is derived, not configured: `INTERNAL_IP4_DNS`, forwarded from
+`asuvpn-notify` through the same script contract as everything else. Whatever
+this tunnel says to resolve against ought to answer through it.
+
+**A refusal counts as alive.** Measured against a live ASU tunnel, one pushed
+resolver completed the handshake in 29ms and the other answered with a RST in
+20ms; both prove a packet crossed in each direction. Only a timeout means the
+tunnel is black-holed, and `ENETUNREACH`-style errors return *inconclusive*
+because the device checks already diagnose that better.
+
+| Outcome | Verdict |
+| --- | --- |
+| connected | alive |
+| `ConnectionRefusedError` | alive — a RST is a reply |
+| timeout | **not carrying traffic** |
+| other `OSError` | inconclusive; the device checks own it |
+
+The two sources keep separate strike counters, and a demotion is only undone by
+the source that caused it. Sharing one counter would let the device check —
+which still passes perfectly during a black hole — promote the badge back every
+twenty seconds and flap it indefinitely.
+
 ### Escalating, cheapest first
 
 The two recoveries differ by a Duo push and a typed password, so they are not
@@ -442,7 +471,7 @@ where it can be, checked by `asuvpn selftest`.
 
 ## How this is tested
 
-Three tiers in `asuvpn-selftest` (45 checks), plus a scenario sandbox.
+Three tiers in `asuvpn-selftest` (49 checks), plus a scenario sandbox.
 
 The shaping constraint: **conventional unit tests would not have caught any of
 the bugs that actually hurt this project.** `Connected as`, the hardcoded script

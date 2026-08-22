@@ -86,6 +86,13 @@ AUTORECONNECT_MIN_GAP = 300
 # take a SIGUSR2 every 40s forever, because each nudge produces a `reconnect`
 # event that looks like a fresh, healthy start.
 NUDGE_MIN_GAP = 120
+# The passive checks below are free, so they run every cycle. The probe puts a
+# packet on the wire, so it runs every third one. A healthy ASU tunnel answers
+# in about 30ms, so five seconds is enormous headroom -- and it runs on a worker
+# thread regardless, because five seconds on the main loop would freeze the UI.
+PROBE_EVERY = 3
+PROBE_TIMEOUT = 5
+PROBE_PORT = 53
 
 # Not 2: argparse already exits 2 for any bad command line, so a script could
 # not tell "wrong server" from "you typo'd a flag".
@@ -211,6 +218,35 @@ def route_count(device):
     except OSError:
         pass  # a kernel without IPv6; the v4 count still stands
     return total
+
+
+def probe_tunnel(address, timeout=PROBE_TIMEOUT):
+    """Does anything answer through the tunnel? True, False, or None if unclear.
+
+    This is the check that catches a black hole: a tunnel whose device is up and
+    whose routes are installed, but which carries nothing. Every passive test
+    passes in that state, and so does openconnect's own dead peer detection when
+    the server never asked for it.
+
+    A refusal counts as alive. Measured against a live ASU tunnel, one resolver
+    completed the handshake in 29ms and another answered with a RST in 20ms --
+    and the RST is just as good an answer, because it proves a packet crossed in
+    each direction. Only silence means the tunnel is not carrying traffic, which
+    is why nothing here cares whether the service is actually up.
+    """
+    if not address:
+        return None, "no target"
+    try:
+        socket.create_connection((address, PROBE_PORT), timeout=timeout).close()
+        return True, f"{address} answered"
+    except ConnectionRefusedError:
+        return True, f"{address} refused the connection, which is still a reply"
+    except (TimeoutError, socket.timeout):
+        return False, f"{address} did not answer in {timeout}s"
+    except OSError as exc:
+        # No route, network down: the passive checks own that diagnosis and
+        # give a better one, so this declines to add a second opinion.
+        return None, f"{address}: {exc.__class__.__name__}"
 
 
 def tunnel_health(device, ifindex):
@@ -400,8 +436,12 @@ class VpnTray:
         self.tunnel_device = None
         self.tunnel_ifindex = None
         self.tunnel_address = ""
-        self.health_strikes = 0
+        self.strikes = {"device": 0, "probe": 0}
         self.health_demoted = False
+        self.demoted_by = None
+        self.tunnel_dns = ""
+        self.probe_cycle = 0
+        self.probe_in_flight = False
         # -inf, not 0: time.monotonic() counts from boot, so a zero here would
         # block the first nudge for the first NUDGE_MIN_GAP seconds of uptime —
         # exactly when a tunnel brought up at login is most likely to need one.
@@ -1012,8 +1052,9 @@ class VpnTray:
         self.tunnel_device = None
         self.tunnel_ifindex = None
         self.tunnel_address = ""
-        self.health_strikes = 0
+        self.strikes = {"device": 0, "probe": 0}
         self.health_demoted = False
+        self.demoted_by = None
         # last_nudge and last_autoreconnect are deliberately NOT reset here.
         # Every automatic recovery arrives back through this function, so
         # clearing the timestamps would clear the limits that make recovery
@@ -1104,7 +1145,8 @@ class VpnTray:
         if state == CONNECTED:
             address = fields.get("addr", "")
             self.last_failure = None
-            self._adopt_tunnel(fields.get("dev") or self.tunnel_device, address)
+            self._adopt_tunnel(fields.get("dev") or self.tunnel_device, address,
+                               fields.get("dns", ""))
             if self.state != CONNECTED:
                 self._set_state(CONNECTED, address)
                 self.notify("VPN connected", f"{self.server} — {address}".strip(" —"))
@@ -1117,11 +1159,17 @@ class VpnTray:
 
     # ------------------------------------------------------------- watchdog
 
-    def _adopt_tunnel(self, device, address):
+    def _adopt_tunnel(self, device, address, dns=""):
         """Record what the watchdog should be watching, once it is up."""
         self.tunnel_address = address
-        self.health_strikes = 0
+        # The probe target, taken from what this tunnel says to resolve
+        # against. Nothing is hardcoded: a VPN that pushes no resolver simply
+        # gets the device checks, which need no target at all.
+        if dns:
+            self.tunnel_dns = dns
+        self.strikes = {"device": 0, "probe": 0}
         self.health_demoted = False
+        self.demoted_by = None
         if not device or not DEVICE_RE.match(device):
             return
         self.tunnel_device = device
@@ -1138,52 +1186,92 @@ class VpnTray:
         self.tunnel_device = None
         self.tunnel_ifindex = None
         self.tunnel_address = ""
-        self.health_strikes = 0
+        self.tunnel_dns = ""
+        self.strikes = {"device": 0, "probe": 0}
         self.health_demoted = False
+        self.demoted_by = None
 
     def autoreconnect_enabled(self):
         return AUTORECONNECT_FILE.exists()
 
     def _health_check(self):
-        """Ask the kernel whether the tunnel could still be carrying traffic.
+        """Ask the kernel, and occasionally the network, whether this still works.
 
-        openconnect's dead-peer detection covers the case where the far end
-        stops answering. It cannot see the case where the tunnel is fine but
-        something local — a resume, a WiFi change, another daemon rewriting the
-        table — has taken the routes away. That is the breakage that looks
-        silent, because every layer involved still believes it is connected.
+        openconnect's dead peer detection covers the far end going away. It
+        cannot see a break that is local — a resume, a WiFi change, another
+        daemon rewriting the table — and when the server never asked for DPD it
+        cannot see anything at all. Two independent sources cover that: what the
+        kernel says about the device and its routes, which is free, and whether
+        anything actually answers through the tunnel, which is not.
         """
         if self.quitting:
             return True
         if self.state not in (CONNECTED, CONNECTING) or self.helper_proc is None:
             return True
+
         reason, facts = tunnel_health(self.tunnel_device, self.tunnel_ifindex)
-
         if reason is None:
-            if self.health_strikes:
-                self.log(f"[tray] tunnel healthy again ({self._facts(facts)})")
-            self.health_strikes = 0
-            # Only ever undo our own demotion: a CONNECTING we did not cause is
-            # openconnect reconnecting, and that is its story to finish.
-            if self.health_demoted and self.state == CONNECTING:
-                self.health_demoted = False
-                self._set_state(CONNECTED, self.tunnel_address)
-                self.notify("VPN carrying traffic again", self.server)
-            return True
+            self._healthy("device", self._facts(facts))
+        elif self.state == CONNECTED or self.health_demoted:
+            # A CONNECTING we did not cause is openconnect's own reconnect and
+            # it owns that; one we caused still has to be counted, or nothing
+            # would ever escalate past the first demotion.
+            self._unhealthy("device", reason, self._facts(facts))
+            return True  # no point probing a device that is already broken
 
-        # A CONNECTING we did not cause is openconnect's own reconnect, and it
-        # owns that. A CONNECTING we *did* cause still has to be counted:
-        # stopping here meant that once the badge was demoted nothing escalated
-        # ever again, so a nudge that failed to help was the end of the line and
-        # automatic sign-in could never fire — precisely when it was wanted.
-        if self.state != CONNECTED and not self.health_demoted:
-            return True
-        self.health_strikes += 1
-        self.log(f"[tray] tunnel check {self.health_strikes}/{HEALTH_STRIKES}:"
-                 f" {reason} ({self._facts(facts)})")
-        if self.health_strikes >= HEALTH_STRIKES:
-            self._tunnel_unhealthy(reason)
+        self.probe_cycle += 1
+        if (self.tunnel_dns and not self.probe_in_flight
+                and self.probe_cycle % PROBE_EVERY == 0):
+            self._start_probe()
         return True
+
+    def _start_probe(self):
+        """Run the probe off the main loop; five seconds on it would freeze the UI."""
+        self.probe_in_flight = True
+        target, generation = self.tunnel_dns, self.helper_generation
+
+        def work():
+            alive, detail = probe_tunnel(target)
+            GLib.idle_add(self._probe_result, alive, detail, generation)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _probe_result(self, alive, detail, generation):
+        self.probe_in_flight = False
+        if self.quitting or generation != self.helper_generation:
+            return False  # a reply for a tunnel that is no longer the live one
+        if alive is None:
+            return False  # unreachable or unconfigured; the device check owns it
+        if alive:
+            self._healthy("probe", detail)
+        elif self.state == CONNECTED or self.health_demoted:
+            self._unhealthy("probe", "nothing answers through the tunnel", detail)
+        return False
+
+    def _healthy(self, source, detail):
+        """One source reports clear. Only undo a demotion this source caused.
+
+        Sources are tracked separately on purpose. A probe failure leaves the
+        device and its routes perfectly intact, so letting the device check
+        promote the badge back would flap it every twenty seconds against a
+        tunnel that is genuinely carrying nothing.
+        """
+        if self.strikes[source]:
+            self.log(f"[tray] tunnel {source} check clear again ({detail})")
+        self.strikes[source] = 0
+        if self.demoted_by == source and self.state == CONNECTING:
+            self.demoted_by = None
+            self.health_demoted = False
+            self._set_state(CONNECTED, self.tunnel_address)
+            self.notify("VPN carrying traffic again", self.server)
+
+    def _unhealthy(self, source, reason, detail):
+        self.strikes[source] += 1
+        self.log(f"[tray] tunnel {source} check {self.strikes[source]}"
+                 f"/{HEALTH_STRIKES}: {reason} ({detail})")
+        if self.strikes[source] >= HEALTH_STRIKES:
+            self.demoted_by = source
+            self._tunnel_unhealthy(reason)
 
     @staticmethod
     def _facts(facts):
@@ -1207,7 +1295,7 @@ class VpnTray:
         first = not self.health_demoted
         self.log(f"[tray] the tunnel is not usable: {reason}")
         self.health_demoted = True
-        self.health_strikes = 0
+        self.strikes = {"device": 0, "probe": 0}
         self._set_state(CONNECTING, f"not carrying traffic — {reason}")
 
         now = time.monotonic()

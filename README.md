@@ -545,12 +545,34 @@ the device still exists, it is still the same device this session created (by
 make it useful are still installed. That last one is precisely what dead peer
 detection cannot see.
 
-Every check is a couple of reads from `/sys` and `/proc` — no packets are sent
-and no subprocess is spawned. The result is logged either way, so the next
-silent break leaves evidence instead of a mystery:
+Every one of those is a couple of reads from `/sys` and `/proc` — no packets and
+no subprocess. But they all share a blind spot: a tunnel can have a healthy
+device, correct routes, and still carry nothing. So every third cycle the applet
+also **asks the network**.
+
+The target is not configured and not hardcoded — it is the resolver the VPN
+itself pushed (`INTERNAL_IP4_DNS`), forwarded through the same script contract
+everything else uses. Whatever this tunnel says to resolve against is by
+definition something that ought to answer through it. A VPN that pushes no
+resolver simply gets the device checks.
+
+The probe opens a TCP connection and closes it. **A refusal counts as alive**,
+which is the part worth understanding: measured against a live ASU tunnel, one
+pushed resolver completed the handshake in 29 ms and the other answered with a
+RST in 20 ms — and the RST is just as good an answer, because it proves a packet
+crossed in each direction. Only silence means the tunnel is not carrying
+traffic. Whether the service behind the probe is up is none of our business.
+
+The two sources are tracked separately, so a probe failure is only cleared by a
+successful probe. Letting the device check promote the badge back would flap it
+every twenty seconds against a tunnel that is genuinely carrying nothing.
+
+The result is logged either way, so the next silent break leaves evidence
+instead of a mystery:
 
 ```
-[tray] tunnel check 1/2: no routes point at the tunnel any more (dev=asuvpn0, routes=0)
+[tray] tunnel device check 1/2: no routes point at the tunnel any more (dev=asuvpn0, routes=0)
+[tray] tunnel probe check 2/2: nothing answers through the tunnel (10.0.0.53 did not answer in 5s)
 [tray] asked openconnect to re-establish (same session, no sign-in needed)
 ```
 

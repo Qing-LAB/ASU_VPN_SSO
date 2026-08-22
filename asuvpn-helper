@@ -250,6 +250,8 @@ def serve_events(server, token, ifname, owned):
         if len(parts) < 5 or not secrets.compare_digest(parts[0], token):
             continue
         reason, device, ip4, ip6 = parts[1], parts[2], parts[3], parts[4]
+        # Field added after the first five; older senders simply do not have it.
+        dns = parts[5].split()[0] if len(parts) > 5 and parts[5].split() else ""
         state = REASON_STATES.get(reason)
         if state is None:
             continue  # pre-init: the tunnel is not configured yet
@@ -275,7 +277,7 @@ def serve_events(server, token, ifname, owned):
         # arrives as a second, unprefixed message, while a space silently
         # becomes an extra field. Caught by `asuvpn selftest`.
         emit(f"[helper] STATE {state} dev={one_token(device or ifname)}"
-             f" addr={one_token(address)}\n")
+             f" addr={one_token(address)} dns={one_token(dns)}\n")
 
 
 def one_token(value):

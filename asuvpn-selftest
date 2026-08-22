@@ -243,6 +243,32 @@ def check_tunnel_health(tray, r):
             f"lo={tray.route_count('lo')} fake={tray.route_count('asuvpn-nope')}")
 
 
+def check_liveness_probe(tray, r):
+    """The probe's verdicts, against endpoints every machine has.
+
+    The rule worth pinning down is that a *refusal* counts as alive. Measured
+    against a live ASU tunnel, one pushed resolver completed the handshake in
+    29ms and another answered with a RST in 20ms -- and the RST is just as good,
+    because it proves a packet crossed in each direction. Treating it as a
+    failure would declare a perfectly good tunnel dead whenever the service
+    behind the probe happened to be down.
+    """
+    # Nothing listens here, so the kernel answers with a RST immediately.
+    closed = ("127.0.0.1", 9)
+    alive, detail = tray.probe_tunnel(closed[0], timeout=3)
+    r.check("a refused connection counts as a live tunnel", alive is True,
+            f"got alive={alive!r} ({detail}) — a RST is a reply, and treating"
+            " it as death would condemn a working tunnel")
+    alive, detail = tray.probe_tunnel("", timeout=3)
+    r.check("no probe target is inconclusive, not a failure", alive is None,
+            f"got alive={alive!r} ({detail})")
+    # RFC 5737 documentation space: it either black-holes or is unreachable.
+    # Either way the one answer it must never give is "alive".
+    alive, detail = tray.probe_tunnel("198.51.100.1", timeout=2)
+    r.check("an address that cannot answer is never reported as alive",
+            alive is not True, f"got alive={alive!r} ({detail})")
+
+
 def check_state_payload(tray, r):
     """The one place a malformed or hostile event meets the state machine."""
     cases = [
@@ -541,6 +567,7 @@ def check_notify_roundtrip(r):
             "reason": "connect",
             "TUNDEV": "asuvpn0",
             "INTERNAL_IP4_ADDRESS": "10.242.7.31",
+            "INTERNAL_IP4_DNS": "10.0.0.53 10.0.0.54",
         })
         try:
             proc = subprocess.run([notify], env=env, stdin=subprocess.DEVNULL,
@@ -559,8 +586,12 @@ def check_notify_roundtrip(r):
 
         fields = data.split("\t")
         r.check("the event reaches the helper's socket",
-                len(fields) == 5 and fields[0] == "0123456789abcdef",
+                len(fields) == 6 and fields[0] == "0123456789abcdef",
                 f"received {data!r}")
+        r.check("the VPN's own resolvers come across, for the liveness probe",
+                fields[5:6] == ["10.0.0.53 10.0.0.54"],
+                f"received {fields[5:6]} — without this there is nothing to"
+                " probe, and a black-holed tunnel looks perfectly healthy")
         r.check("the event carries reason, device and address",
                 fields[1:4] == ["connect", "asuvpn0", "10.242.7.31"],
                 f"received {fields[1:4] if len(fields) > 3 else data!r}")
@@ -658,12 +689,12 @@ def check_event_translation(helper, tray, r):
     for line in accepted:
         payload = line[len("[helper] STATE "):]
         _, fields = tray.parse_state_payload(payload)
-        # Exactly three words: the state, one dev= and one addr=. Checking the
-        # parsed field *names* is not enough — a second "addr=" would still
-        # leave the set at {dev, addr} while quietly overwriting the value,
-        # because parsing keeps the last occurrence. The word count is the
-        # property that actually holds.
-        if len(payload.split()) != 3 or set(fields) != {"dev", "addr"}:
+        # Exactly four words: the state, and one each of dev=, addr= and dns=.
+        # Checking the parsed field *names* is not enough — a second "addr="
+        # would still leave the set unchanged while quietly overwriting the
+        # value, because parsing keeps the last occurrence. The word count is
+        # the property that actually holds.
+        if len(payload.split()) != 4 or set(fields) != {"dev", "addr", "dns"}:
             injected.append(line)
     r.check("no event can inject an extra field into a state line", not injected,
             f"these carry more than one dev and one addr: {injected}")
@@ -704,6 +735,7 @@ def main():
         check_permission_rules(helper, r)
         check_state_payload(tray, r)
         check_tunnel_health(tray, r)
+        check_liveness_probe(tray, r)
         check_output_framing(helper, r)
 
     if "environment" in tiers:

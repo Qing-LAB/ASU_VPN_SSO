@@ -43,6 +43,11 @@ def report():
         os.environ.get("TUNDEV", ""),
         os.environ.get("INTERNAL_IP4_ADDRESS", ""),
         os.environ.get("INTERNAL_IP6_ADDRESS", ""),
+        # The VPN's own resolvers, which the applet uses as a liveness target.
+        # Derived rather than configured: whatever this tunnel says to talk to
+        # is by definition something that should answer through it. May be
+        # several, space separated, or absent.
+        os.environ.get("INTERNAL_IP4_DNS", ""),
     )
     # Tabs are the separator, so strip any the environment may contain rather
     # than let a hostile value split into extra fields.
