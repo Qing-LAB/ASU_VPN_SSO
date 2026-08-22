@@ -575,6 +575,11 @@ asuvpn autoreconnect on
 or the menu item **Reconnect automatically if traffic stops**. When on, it is
 rate limited to once every five minutes.
 
+An automatic reconnect does **not** truncate the session log, so the lines
+explaining why it happened survive it — a connect you asked for still starts a
+fresh log. While the badge shows *not carrying traffic* the menu still offers
+Disconnect and Reconnect, because the tunnel is established, just not usable.
+
 ### The control pipe
 
 The helper keeps reading the same stdin pipe for the life of the tunnel. Closing

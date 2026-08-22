@@ -327,6 +327,25 @@ limited by a timestamp rather than a per-incident flag: each nudge produces a
 itself and a device that never returned would take a `SIGUSR2` every 40 seconds
 forever.
 
+Three details that are easy to get wrong, and were:
+
+- **The log is not truncated on an automatic reconnect.** Connecting normally
+  starts a fresh log, which is right when a person asked for one. It is wrong
+  when the applet reconnected by itself: the lines explaining *why* are the only
+  record of a breakage that was silent by definition, and wiping them leaves a
+  fresh log saying nothing happened.
+- **The rate-limit timestamps survive a reconnect.** Every automatic recovery
+  arrives back through `_start_tunnel`, so resetting them there — which an
+  earlier version did — cleared the limits on every cycle and let a tunnel that
+  kept breaking take a `SIGUSR2` or a Duo push each time round.
+- **A demoted tunnel is still an established one.** It has a helper and a
+  device, so the menu offers Disconnect and Reconnect rather than Cancel, and
+  `disconnect` tears it down instead of taking the abandon-the-attempt path.
+  Keying any of this purely on `CONNECTED` gets it wrong.
+
+`force` never overrides teardown: a disconnect or quit already under way
+outranks the watchdog.
+
 Automatic sign-in is off unless asked for, via the menu or
 `asuvpn autoreconnect on`. The setting is the presence of a file, so there is
 nothing to parse and a running applet picks up a change on its next check
@@ -416,7 +435,9 @@ where it can be, checked by `asuvpn selftest`.
 | The cookie never reaches a command line or the log | `--cookie-on-stdin` only | grep the log and the journal |
 | Interposing never costs routing | derive the script, step aside if unusable | environment tier |
 | A stalled tunnel is noticed rather than shown as connected | `--force-dpd`, plus a watchdog for what DPD cannot see | logic tier, and a sandbox scenario where the device never appears |
-| Recovery never costs a Duo push unless asked | `SIGUSR2` first, sign-in only on opt-in | sandbox scenario counts exactly one `SIGUSR2` |
+| Recovery never costs a Duo push unless asked | `SIGUSR2` first, sign-in only on opt-in | sandbox scenario counts exactly one `SIGUSR2` and one sign-in over 100s |
+| openconnect cannot drive the control channel | it is spawned with its own `stdin` pipe | compared `/proc/<pid>/fd/0` of both: distinct pipes, child's is `O_RDONLY` |
+| A device name never becomes a path unvalidated | checked at both ends, not just where it is produced | logic tier, with traversal and whitespace payloads |
 | `openconnect-sso` can still import `pkg_resources` | `setuptools<71` pinned with `pipx inject --force` | environment tier, by importing it |
 
 ## How this is tested
