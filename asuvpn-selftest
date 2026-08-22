@@ -630,6 +630,21 @@ def check_sso_environment(tray, sso, r):
                "            pipx inject openconnect-sso 'setuptools<71' --force")
 
 
+def check_no_bytecode(r):
+    """Nothing may write into the directory the helper runs out of as root.
+
+    This has regressed twice — once when the self-test began importing its
+    siblings, and again when every program started loading the shared contract.
+    Both times a __pycache__ appeared beside the helper, created with the
+    ambient umask and after install.sh had tightened everything else. Cheap to
+    check, evidently not obvious enough to remember.
+    """
+    stray = [name for name in os.listdir(HERE) if name == "__pycache__"]
+    r.check("loading the contract writes nothing beside the helper", not stray,
+            f"found {stray} in {HERE} — created with the ambient umask, in the"
+            " one directory that is executed as root")
+
+
 def check_installed_permissions(C, r):
     """The helper's own refusal criteria, applied now instead of at first connect."""
     problems = []
@@ -916,6 +931,7 @@ def main():
         check_message_catalogue(tray, binary, r)
         check_desktop_stack(tray, r)
         check_installed_permissions(C, r)
+        check_no_bytecode(r)
 
     if "wiring" in tiers:
         r.section("wiring — asuvpn-notify executed end to end")

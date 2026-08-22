@@ -26,6 +26,13 @@ import stat
 import sys
 
 
+# Set before the contract is loaded, and this is the reason: loading it writes
+# a __pycache__ into the directory beside us -- the one the helper runs out of
+# as root -- created with the ambient umask and after install.sh has tightened
+# everything else. Nothing here benefits from a bytecode cache; a few hundred
+# microseconds once per run is not worth writing into that directory.
+sys.dont_write_bytecode = True
+
 def _contract():
     """Load the shared contract by explicit path; see asuvpn_contract.py."""
     here = os.path.dirname(os.path.abspath(__file__))
