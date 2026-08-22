@@ -243,6 +243,60 @@ def check_tunnel_health(tray, r):
             f"lo={tray.route_count('lo')} fake={tray.route_count('asuvpn-nope')}")
 
 
+def check_notifications(tray, r):
+    """What the user is actually told when the tunnel comes and goes.
+
+    Exercised through a stand-in `self`, so no display is needed. The point is
+    that a drop is announced at all: the badge changing to a spinner is easy to
+    miss, and the reassuring half — that openconnect recovers this one on its
+    own, with no sign-in — is not something a spinner can convey.
+    """
+    if not hasattr(tray, "VpnTray"):
+        r.warn("a dropped tunnel is announced", "GUI classes unavailable here")
+        return
+
+    class Stub:
+        server = "vpn.example.edu"
+        state = tray.CONNECTING
+        detail = ""
+        tunnel_ever_connected = False
+        last_failure = "stale"
+
+        def __init__(self):
+            self.notes = []
+
+        def notify(self, summary, body="", icon=None):
+            self.notes.append(summary)
+
+        def _set_state(self, state, detail=""):
+            self.state, self.detail = state, detail
+
+        def _refresh(self):
+            pass
+
+    stub = Stub()
+    tray.VpnTray._announce_connected(stub, "10.1.2.3")
+    first = stub.notes[-1]
+    r.check("a first connect is announced as a connection",
+            first == "VPN connected" and stub.state == tray.CONNECTED,
+            f"got {first!r}, state {stub.state!r}")
+    r.check("reaching connected clears any earlier failure line",
+            stub.last_failure is None, f"got {stub.last_failure!r}")
+
+    tray.VpnTray._announce_link_lost(stub, "link lost, retrying")
+    r.check("a dropped tunnel is announced, not just badged",
+            stub.notes[-1] == "VPN connection lost"
+            and stub.state == tray.CONNECTING,
+            f"got {stub.notes[-1]!r}, state {stub.state!r} — without this the"
+            " user is never told the tunnel went away")
+
+    tray.VpnTray._announce_connected(stub, "10.1.2.9")
+    r.check("coming back is announced as a reconnection, not a fresh connect",
+            stub.notes[-1] == "VPN reconnected",
+            f"got {stub.notes[-1]!r} — the wording is how the user tells a"
+            " recovery from a connection they asked for")
+
+
 def check_liveness_probe(tray, r):
     """The probe's verdicts, against endpoints every machine has.
 
@@ -736,6 +790,7 @@ def main():
         check_state_payload(tray, r)
         check_tunnel_health(tray, r)
         check_liveness_probe(tray, r)
+        check_notifications(tray, r)
         check_output_framing(helper, r)
 
     if "environment" in tiers:

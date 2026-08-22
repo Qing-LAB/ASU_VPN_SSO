@@ -110,6 +110,17 @@ stateDiagram-v2
     connected --> failed: tunnel dropped
 ```
 
+Both state sources — the script contract and the log-matching fallback — reach
+`CONNECTED` and `CONNECTING` through `_announce_connected` and
+`_announce_link_lost` rather than setting state themselves. They had each built
+their own message, and the two had already drifted: one announced a recovery as
+a fresh connection, and neither said anything at all when the link dropped.
+
+The wording distinguishes what a transition costs. *VPN connection lost* and
+*VPN reconnecting* are free — same session, no sign-in — while *VPN signing in
+again* is the only one that will interrupt the user, so it is the only one
+phrased as an action being taken on their behalf.
+
 `failed` is a real state, not an error path: it keeps the last useful sentence
 (`last_failure`) so the user is told *why*, and it shows the attention icon.
 
@@ -471,7 +482,7 @@ where it can be, checked by `asuvpn selftest`.
 
 ## How this is tested
 
-Three tiers in `asuvpn-selftest` (49 checks), plus a scenario sandbox.
+Three tiers in `asuvpn-selftest` (53 checks), plus a scenario sandbox.
 
 The shaping constraint: **conventional unit tests would not have caught any of
 the bugs that actually hurt this project.** `Connected as`, the hardcoded script

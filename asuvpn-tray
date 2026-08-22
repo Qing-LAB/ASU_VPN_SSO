@@ -440,6 +440,7 @@ class VpnTray:
         self.health_demoted = False
         self.demoted_by = None
         self.tunnel_dns = ""
+        self.tunnel_ever_connected = False
         self.probe_cycle = 0
         self.probe_in_flight = False
         # -inf, not 0: time.monotonic() counts from boot, so a zero here would
@@ -1052,6 +1053,7 @@ class VpnTray:
         self.tunnel_device = None
         self.tunnel_ifindex = None
         self.tunnel_address = ""
+        self.tunnel_ever_connected = False
         self.strikes = {"device": 0, "probe": 0}
         self.health_demoted = False
         self.demoted_by = None
@@ -1144,16 +1146,14 @@ class VpnTray:
             return
         if state == CONNECTED:
             address = fields.get("addr", "")
-            self.last_failure = None
             self._adopt_tunnel(fields.get("dev") or self.tunnel_device, address,
                                fields.get("dns", ""))
             if self.state != CONNECTED:
-                self._set_state(CONNECTED, address)
-                self.notify("VPN connected", f"{self.server} — {address}".strip(" —"))
+                self._announce_connected(address)
             elif address and self.detail != address:
                 self._set_state(CONNECTED, address)
         elif state == CONNECTING and self.state == CONNECTED:
-            self._set_state(CONNECTING, "link lost, retrying")
+            self._announce_link_lost("link lost, retrying")
         # A disconnect event is left to _on_tunnel_exit, which already
         # distinguishes a requested teardown from a dropped tunnel.
 
@@ -1187,6 +1187,7 @@ class VpnTray:
         self.tunnel_ifindex = None
         self.tunnel_address = ""
         self.tunnel_dns = ""
+        self.tunnel_ever_connected = False
         self.strikes = {"device": 0, "probe": 0}
         self.health_demoted = False
         self.demoted_by = None
@@ -1322,6 +1323,35 @@ class VpnTray:
                         "the tunnel could not be recovered without it")
             self.reconnect(force=True, keep_log=True)
 
+    def _announce_connected(self, address):
+        """The single place a tunnel becomes usable, whichever source said so.
+
+        Both the script contract and the log-matching fallback land here, so the
+        badge, the wording and the notification cannot drift apart between them
+        — which they had, each building its own message.
+        """
+        first = not self.tunnel_ever_connected
+        self.tunnel_ever_connected = True
+        # Reaching CONNECTED clears any earlier failure line; otherwise a blip
+        # openconnect recovered from would be reported as the cause when the
+        # tunnel eventually drops, hours later.
+        self.last_failure = None
+        self._set_state(CONNECTED, address)
+        where = f"{self.server} — {address}".strip(" —")
+        self.notify("VPN connected" if first else "VPN reconnected", where)
+
+    def _announce_link_lost(self, detail):
+        """openconnect has lost the link and is re-establishing it itself.
+
+        Worth saying out loud. Nothing else tells the user, a badge changing to
+        a spinner is easy to miss, and the reassuring half — that this costs no
+        sign-in and no password — is not something a spinner can convey.
+        """
+        self._set_state(CONNECTING, detail)
+        self.notify("VPN connection lost",
+                    f"{self.server} — reconnecting, no sign-in needed",
+                    icon="dialog-warning-symbolic")
+
     def _on_tunnel_output(self, line, generation):
         if generation != self.helper_generation:
             # Still log it. A superseded helper's last words are its teardown
@@ -1362,7 +1392,7 @@ class VpnTray:
                 # exiting 0 while traffic goes nowhere.
                 for pattern in RECONNECTING_PATTERNS:
                     if pattern.search(line):
-                        self._set_state(CONNECTING, "link lost, retrying")
+                        self._announce_link_lost("link lost, retrying")
                         return False
             if self.state in (CONNECTING, CONNECTED):
                 for pattern in CONNECTED_PATTERNS:
@@ -1370,14 +1400,7 @@ class VpnTray:
                     if match:
                         address = (match.groupdict().get("addr") or "").strip()
                         if self.state != CONNECTED:
-                            # Reaching CONNECTED clears any earlier failure
-                            # line; otherwise a blip that openconnect recovered
-                            # from would be reported as the cause when the
-                            # tunnel eventually drops, hours later.
-                            self.last_failure = None
-                            self._set_state(CONNECTED, address)
-                            where = f"{self.server} — {address}".strip(" —")
-                            self.notify("VPN connected", where)
+                            self._announce_connected(address)
                         return False
         # Deliberately outside that guard. Scanning only in the fallback meant
         # that after any successful connect -- i.e. as soon as one state event
@@ -1910,16 +1933,6 @@ def main():
         action="store_true",
         help="do not fork into the background when starting the applet",
     )
-    # Older launchers and autostart files used flags rather than commands.
-    parser.add_argument("--no-connect", action="store_true", help=argparse.SUPPRESS)
-    for legacy, dest in (
-        ("--connect", "flag_connect"),
-        ("--disconnect", "flag_disconnect"),
-        ("--reconnect", "flag_reconnect"),
-    ):
-        parser.add_argument(
-            legacy, dest=dest, action="store_true", help=argparse.SUPPRESS
-        )
     # Split at the first bare "--" by hand. argparse.REMAINDER would swallow
     # every later flag, so "asuvpn connect --wait" would silently pass --wait to
     # openconnect instead of to us.
@@ -1942,15 +1955,6 @@ def main():
     args = parser.parse_args(argv)
 
     command = args.command
-    if args.no_connect:
-        command = "tray"
-    elif args.flag_disconnect:
-        command = "disconnect"
-    elif args.flag_reconnect:
-        command = "reconnect"
-    elif args.flag_connect:
-        command = "connect"
-
     server = args.server or configured_server() or DEFAULT_SERVER
 
     if command == "selftest":  # reached via `asuvpn --server x selftest`

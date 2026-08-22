@@ -127,6 +127,27 @@ connecting. It is not offered during teardown, which must not be interrupted.
 **Start on login (applet only)** puts the icon in your tray at login without
 connecting — so you are not met with a Duo push before you have asked for one.
 
+### What it tells you, and when
+
+A badge quietly changing to a spinner is easy to miss, so every transition that
+matters raises a desktop notification:
+
+| Notification | When | Costs you |
+| --- | --- | --- |
+| **VPN connected** | the tunnel came up for the first time | — |
+| **VPN connection lost** | `openconnect` lost the link and is re-establishing it | nothing — same session, no sign-in |
+| **VPN reconnected** | it came back, possibly on a new address | — |
+| **VPN not carrying traffic** | the watchdog found the device, its routes or the far end gone | — |
+| **VPN reconnecting** | `openconnect` was nudged to rebuild the tunnel | nothing — same session |
+| **VPN carrying traffic again** | the tunnel recovered | — |
+| **VPN signing in again** | the nudge did not help and automatic reconnection is on | **a Duo push and a password** |
+| **VPN disconnected** | the tunnel closed, with the reason if it was not you | — |
+| **VPN teardown warning** | the network may not have been restored | — |
+
+The distinction the wording carries is deliberate: *connection lost* and
+*reconnecting* are free and need nothing from you, while *signing in again* is
+the one that will interrupt you.
+
 Right-clicking the app icon in the dash also offers Disconnect and Reconnect.
 
 ### The command line
@@ -347,25 +368,60 @@ is one person.
 reconnect. You are never asked to disconnect, because closing the control pipe
 requires no privileges at all.
 
-### Making it prompt less — don't
+### Making it prompt less
 
-An earlier version of this file suggested a polkit rule returning
-`AUTH_ADMIN_KEEP` for this helper, to cache the password for a few minutes. That
-advice was wrong, and it is removed rather than corrected.
+The keyring is not the mechanism here, and it is worth being clear why: `polkit`
+authenticates through PAM against your account password. It never consults the
+login keyring, so there is nothing to store there. What can cache is polkit's
+own **temporary authorization** — `auth_admin_keep`, which retains an
+authorization for a few minutes.
 
-`pkexec` runs **every** program under the one action id
-`org.freedesktop.policykit.exec` — which is exactly why such a rule has to
-disambiguate on `action.lookup("program")`. But polkit's temporary authorization
-is keyed on the *action* and the session, not on the program. Authorising a
-single VPN connect under `AUTH_ADMIN_KEEP` therefore leaves `pkexec <anything>`
-passwordless for the rest of the retention window. It converts "malware has to
-phish your password" into "malware waits until you click Connect".
+Two facts about how that works, both checkable on your own machine with
+`pkaction --action-id org.freedesktop.policykit.exec --verbose`:
 
-`polkit.Result.YES` is worse again: permanent passwordless root for whatever sits
-at that path, and that path is inside your home directory.
+- `pkexec` runs **every** program under the single action id
+  `org.freedesktop.policykit.exec`, whose implicit result is `auth_admin` for
+  active, inactive and any.
+- The program is passed as a *detail*, not as part of the action id. A rule can
+  read it with `action.lookup("program")`, but the action being authorized is
+  the same one every `pkexec` on the system uses.
 
-If the per-connect prompt bothers you, the safe lever is connecting less often,
-not widening the authorisation.
+An earlier version of this file concluded from that pair that any
+`AUTH_ADMIN_KEEP` rule leaves `pkexec <anything>` passwordless. That is true of
+an **unscoped** rule and overstated for a scoped one: polkit re-evaluates the
+rules on every check and only consults a stored temporary authorization when the
+current evaluation itself returns a `_KEEP` result, so a rule that returns
+`auth_admin_keep` for one program and falls through for everything else does not
+hand out a general exemption.
+
+The reason not to do it anyway is simpler and does not depend on that detail:
+
+> **The helper lives in your home directory, and you can write it.**
+
+A rule keyed on that path caches an authorization for *whatever is at that path*.
+Today the per-connect prompt means an attacker who has replaced the file still
+has to wait for you to connect and approve it; with caching they can invoke it
+themselves inside the retention window. `polkit.Result.YES` removes even the
+waiting, permanently.
+
+So the honest options are:
+
+| Option | Prompt | Safe? |
+| --- | --- | --- |
+| As shipped | once per connect | yes — nothing to widen |
+| Connect less often, stay connected | rarely | yes, and the session lasts weeks |
+| `auth_admin_keep` scoped to the helper in `$HOME` | once per session | **no** — caches root for a file you can overwrite |
+| Move the helper to root-owned storage first, then scope a rule to *that* path | once per session | yes — and it removes the caveat below as well |
+
+The last row is the only way to get one password per session without giving
+something up, because it fixes the underlying problem rather than working around
+it. It costs the property that this app needs no root to install: the helper
+would have to be placed outside `$HOME` by an administrator once. That is a
+deliberate trade and is not done by default.
+
+Note that a **drop already costs you nothing** — `openconnect` re-establishes
+using the same session, and the applet's nudge goes down a pipe that is already
+open, needing no privilege at all. Only a fresh connect prompts.
 
 ### Things worth knowing before you trust it
 
