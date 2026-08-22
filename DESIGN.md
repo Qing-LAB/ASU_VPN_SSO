@@ -28,6 +28,7 @@ is a machine with no working network until it reboots.
 - [The state machine](#the-state-machine)
 - [Where state comes from](#where-state-comes-from)
 - [Concurrency](#concurrency)
+- [Watching the tunnel](#watching-the-tunnel)
 - [Teardown](#teardown)
 - [Exit codes](#exit-codes)
 - [Invariants](#invariants)
@@ -256,6 +257,81 @@ has started no threads at that point. `parent_pid` is captured **before** the
 the child's own pid — which made the guard fire every time and killed
 `openconnect` before it started.
 
+## Watching the tunnel
+
+### Why anything is needed
+
+`openconnect` re-establishes the tunnel on its own when dead peer detection
+fails, reusing the session cookie. That path is free — no sign-in, no Duo, no
+polkit — and the applet should stay out of its way.
+
+Two things defeat it, and both produce the same symptom: everything reports
+connected and nothing flows.
+
+**The server turns DPD off.** ASU negotiates `CSTP connected. DPD 0, Keepalive
+0`. With no probes and no keepalives there is no mechanism to notice the far end
+stopped answering, so `openconnect` waits forever. The helper therefore passes
+`--force-dpd 30`, documented as using DPD "even if the server hasn't requested
+it". Getting the interval wrong is cheap — a DPD failure re-establishes with the
+same cookie — so this errs toward checking.
+
+**The break is local.** A resume from suspend, a network change, or another
+daemon rewriting the routing table can leave the socket healthy while the routes
+that make the tunnel useful are gone. DPD passes, because the far end really is
+answering. Nothing below the applet can see this.
+
+### What is checked, and what is deliberately not
+
+Every check runs on the GLib main loop every `HEALTH_INTERVAL` seconds and is a
+couple of reads from `/sys` and `/proc` — no packets, no subprocess. Two
+consecutive bad checks are required, because routes are briefly absent while
+`openconnect` reinstalls them during a legitimate reconnect.
+
+Three of the four checks that suggest themselves first are **wrong**, and each
+was tried against a live ASU tunnel before being discarded:
+
+| Rejected check | Value on a healthy ASU tunnel |
+| --- | --- |
+| `operstate == "up"` | `unknown` — tun devices never report `up` |
+| `IFF_RUNNING` (`0x40`) | clear; flags are `0x1091` |
+| a default route via the device | absent — split tunnel, 53 IPv4 + 6 IPv6 routes and the default stays on WiFi |
+| counters advancing | flat; an idle tunnel moves nothing |
+
+What survives is true of every working tunnel and false of a broken one:
+
+| Verdict | Meaning |
+| --- | --- |
+| `the tunnel device is gone` | `/sys/class/net/<dev>` no longer exists |
+| `the tunnel device was replaced by a different one` | the name is back but the `ifindex` is not the one this session created |
+| `the tunnel device is down` | `IFF_UP` clear |
+| `no routes point at the tunnel any more` | zero routes in `/proc/net/route` and `/proc/net/ipv6_route` — the case DPD cannot see |
+
+The facts behind each verdict are logged whether or not anything is wrong, so
+the next silent break arrives with evidence attached rather than as a mystery.
+
+### Escalating, cheapest first
+
+The two recoveries differ by a Duo push and a typed password, so they are not
+interchangeable:
+
+| Step | Cost | Rate limit |
+| --- | --- | --- |
+| `SIGUSR2` to `openconnect` via the control pipe | none — same session | `NUDGE_MIN_GAP`, 120s |
+| leave *Connected*, notify | none | — |
+| full sign-in (`reconnect`) | Duo approval **and** polkit password | `AUTORECONNECT_MIN_GAP`, 300s, and opt-in |
+
+The nudge travels down the **existing** control pipe, so it needs no new
+privileged call — the helper is already root and already listening. It is rate
+limited by a timestamp rather than a per-incident flag: each nudge produces a
+`reconnect` event, which looks like a fresh healthy start, so a flag would reset
+itself and a device that never returned would take a `SIGUSR2` every 40 seconds
+forever.
+
+Automatic sign-in is off unless asked for, via the menu or
+`asuvpn autoreconnect on`. The setting is the presence of a file, so there is
+nothing to parse and a running applet picks up a change on its next check
+without any message passing.
+
 ## Teardown
 
 Closing the control pipe **is** the disconnect signal. The tray holds the write
@@ -339,6 +415,8 @@ where it can be, checked by `asuvpn selftest`.
 | Nothing run as root is writable by a second principal | helper refuses with 26 | environment tier, and `install.sh` |
 | The cookie never reaches a command line or the log | `--cookie-on-stdin` only | grep the log and the journal |
 | Interposing never costs routing | derive the script, step aside if unusable | environment tier |
+| A stalled tunnel is noticed rather than shown as connected | `--force-dpd`, plus a watchdog for what DPD cannot see | logic tier, and a sandbox scenario where the device never appears |
+| Recovery never costs a Duo push unless asked | `SIGUSR2` first, sign-in only on opt-in | sandbox scenario counts exactly one `SIGUSR2` |
 | `openconnect-sso` can still import `pkg_resources` | `setuptools<71` pinned with `pipx inject --force` | environment tier, by importing it |
 
 ## How this is tested

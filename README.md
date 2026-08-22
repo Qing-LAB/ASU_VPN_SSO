@@ -144,6 +144,7 @@ asuvpn log -f           # follow this session's log
 asuvpn quit             # close the tunnel and stop the applet
 asuvpn tray             # run the applet in the foreground, do not connect
 asuvpn selftest         # check this installation against this machine
+asuvpn autoreconnect    # show or set automatic reconnection: [on|off]
 ```
 
 Every command prints the resulting state, so nothing happens silently.
@@ -471,20 +472,108 @@ which the log patterns never reliably did.
 
 ### When the link drops
 
-openconnect handles reconnection itself, and the applet follows rather than
-interferes. Dead peer detection notices the break, and it retries for
-`--reconnect-timeout` seconds (default 300) using the **same session cookie** —
-so a WiFi toggle, or moving between networks, normally recovers with no new
-sign-in and no Duo push. It copes with your address changing underneath it.
+There are two different things called "reconnection" here, and they cost very
+different amounts. This matters, because one of them is free and invisible and
+the other interrupts you:
 
-Two limits, both outside our control. The server advertises its own window
-(`Server reports that reconnect-after-drop is allowed within N seconds` — you
-will see the number in `asuvpn log`), and the session cookie eventually expires.
-Past either, openconnect gives up and a fresh sign-in is needed.
+| | openconnect re-establishes | `asuvpn reconnect` |
+| --- | --- | --- |
+| Session cookie | **reuses** the existing one | fetches a new one |
+| Your password | not asked | not asked — read from the keyring |
+| **Duo / 2FA** | **no** | **yes** |
+| **polkit password prompt** | **no** | **yes, typed** |
+| Triggered by | dead peer detection, or a nudge | the menu, the CLI, the watchdog escalating |
+| Good until | the session expires — openconnect logs the date | — |
 
-The tray shows this as **Connecting… — link lost, retrying**, driven by
-`attempt-reconnect` and `reconnect` events, so `asuvpn status` stops exiting 0
+`openconnect` handles the first kind itself and the applet follows rather than
+interferes: it retries for `--reconnect-timeout` seconds (default 300) using the
+same session cookie, so a WiFi toggle or moving between networks normally
+recovers with no sign-in and no Duo push. It copes with your address changing
+underneath it. Past the retry window, or once the session expires, a fresh
+sign-in is needed and that is the expensive kind.
+
+The tray shows the cheap kind as **Connecting… — link lost, retrying**, driven
+by `attempt-reconnect` and `reconnect` events, so `asuvpn status` stops exiting 0
 while traffic is going nowhere.
+
+#### Dead peer detection is forced on
+
+That first mechanism only works if dead peer detection is running, and **ASU's
+server turns it off**. A real session logs:
+
+```
+CSTP connected. DPD 0, Keepalive 0
+```
+
+With `DPD 0` there are no probes and no keepalives, so `openconnect` has no way
+to learn the far end stopped answering — it sits in a connected state
+indefinitely while nothing flows. That is what a silent breakage is.
+
+So the helper passes `--force-dpd 30`, which `openconnect` documents as using
+DPD "even if the server hasn't requested it". Being wrong about the interval is
+cheap: a DPD failure makes `openconnect` re-establish with the *same* cookie, so
+an over-eager setting costs a brief reconnect, never a re-authentication. Pass
+your own to override it:
+
+```bash
+asuvpn connect -- --force-dpd 60
+```
+
+### Watching the tunnel itself
+
+Dead peer detection covers the far end going away. It cannot see the case where
+the far end is fine but the tunnel has stopped being usable locally — a resume
+from suspend, a network change, or another daemon rewriting the routing table.
+Every layer still believes it is connected, which is why that failure is silent.
+
+So the applet checks the tunnel every 20 seconds while it claims to be
+connected, and acts after two consecutive bad checks. What it checks is
+deliberately narrow, because **three of the four things one would check first
+are wrong** — each was tried against a live ASU tunnel and each would have
+raised a false alarm on a perfectly healthy link:
+
+| Tempting check | Why it is wrong here |
+| --- | --- |
+| `operstate == "up"` | a tun device reports `unknown`, never `up` |
+| `IFF_RUNNING` | not set on a tun device either |
+| a default route through the tunnel | ASU is a **split tunnel** — the default route stays on your WiFi, and only the advertised prefixes are routed in |
+| traffic is flowing | an idle tunnel moves no bytes at all |
+
+What is left is what is true of every working tunnel and false of a broken one:
+the device still exists, it is still the same device this session created (by
+`ifindex`, not by name), it is still administratively up, and the routes that
+make it useful are still installed. That last one is precisely what dead peer
+detection cannot see.
+
+Every check is a couple of reads from `/sys` and `/proc` — no packets are sent
+and no subprocess is spawned. The result is logged either way, so the next
+silent break leaves evidence instead of a mystery:
+
+```
+[tray] tunnel check 1/2: no routes point at the tunnel any more (dev=asuvpn0, routes=0)
+[tray] asked openconnect to re-establish (same session, no sign-in needed)
+```
+
+#### What it does about it
+
+Cheapest first, because the two recoveries are not interchangeable:
+
+1. **Nudge.** Send `openconnect` a `SIGUSR2`, which it documents as forcing "an
+   immediate disconnection and reconnection". The session is reused, so this
+   costs no sign-in, no Duo push and no password — you need not even be at the
+   keyboard. Rate limited to once every two minutes.
+2. **Say so.** The badge leaves *Connected*, so `asuvpn status` stops exiting 0,
+   and a notification explains what was observed.
+3. **Sign in again — only if you asked for it.** Off by default, because it
+   means a Duo approval and typing your password into a polkit dialog.
+
+```bash
+asuvpn autoreconnect          # on or off
+asuvpn autoreconnect on
+```
+
+or the menu item **Reconnect automatically if traffic stops**. When on, it is
+rate limited to once every five minutes.
 
 ### The control pipe
 
@@ -676,6 +765,8 @@ asuvpn log -f
 | `WARNING: … is not executable, so openconnect's own default script is left in place` | The `vpnc-script` this system uses could not be found, so state falls back to reading `openconnect`'s output. Routing is unaffected. Install `vpnc-scripts`. |
 | `Script … returned error 127` | The `vpnc-script` failed, so routes and DNS were never configured. Install `vpnc-scripts`, then `asuvpn selftest`. |
 | `ModuleNotFoundError: No module named 'pkg_resources'` | The `setuptools<71` pin did not take. `pipx inject openconnect-sso 'setuptools<71' --force` — the `--force` is what makes it apply. |
+| Badge says **not carrying traffic** | The watchdog found the tunnel device or its routes gone. It has already nudged `openconnect` once; `asuvpn log` says what it saw. If it does not recover, `asuvpn reconnect`. |
+| Tunnel silently stops working, badge stays green | Should no longer happen: `--force-dpd 30` is passed because ASU negotiates DPD off, and the watchdog covers what DPD cannot see. If it recurs, `asuvpn log` now records every check. |
 | Self-check reports a failure | `asuvpn selftest` prints a detail line under each failure saying what will break and how to fix it. |
 
 ## Repository layout
