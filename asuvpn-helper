@@ -54,6 +54,19 @@ FALLBACK_VPNC_SCRIPT = "/usr/share/vpnc-scripts/vpnc-script"
 # every other uid, and only root could reach the socket inside it anyway.
 RUNTIME_ROOT = "/run/asuvpn"
 
+# ASU's server negotiates "CSTP connected. DPD 0, Keepalive 0" -- dead peer
+# detection disabled. With no DPD, openconnect has no way to notice the far end
+# has stopped answering: it sits in a connected state indefinitely while nothing
+# flows. That is the silent breakage, and openconnect's own --force-dpd exists
+# for exactly it ("use DPD at the specified interval even if the server hasn't
+# requested it").
+#
+# Cheap to be wrong about. A DPD failure makes openconnect re-establish using
+# the *same* session cookie -- no sign-in, no Duo push, no polkit prompt -- so
+# an interval that is too eager costs a brief reconnect, not a re-authentication.
+# A caller who passes their own --force-dpd is left alone.
+DEFAULT_DPD_INTERVAL = 30
+
 # openconnect's documented script contract, not log text. These five values have
 # been stable since vpnc; the log wording has not.
 REASON_STATES = {
@@ -87,6 +100,12 @@ UNSUPPORTED_OPTIONS = (
 BUNDLED_SHORT_RE = re.compile(r"^-[A-Za-z]{2,}$")
 
 syslog.openlog("asuvpn-helper", syslog.LOG_PID, syslog.LOG_DAEMON)
+
+# Set once teardown starts, so threads can tell "we are shutting down" from
+# "something broke". Without it, closing the event socket on the way out looks
+# identical to the socket failing mid-tunnel, and every clean disconnect would
+# report a spurious warning.
+closing = threading.Event()
 
 
 def unsupported_option(option):
@@ -209,11 +228,21 @@ def event_channel():
 
 
 def serve_events(server, token, ifname, owned):
-    """Translate openconnect's script events into state lines for the tray."""
+    """Translate openconnect's script events into state lines for the tray.
+
+    A return from here is one-way: the tray latches on the first real event and
+    stops trusting log text, so if this thread dies mid-tunnel no further state
+    would ever arrive and the badge would freeze at whatever it last showed.
+    Teardown closes the socket deliberately, which is the expected way out and
+    says nothing; anything else is worth a line.
+    """
     while True:
         try:
             data, _ = server.recvfrom(4096)
-        except OSError:
+        except OSError as exc:
+            if not closing.is_set():
+                log(f"WARNING: the state event channel stopped ({exc});"
+                    " the tray will fall back to reading openconnect's output")
             return
         parts = data.decode("utf-8", "replace").split("\t")
         # Length and token both checked: a short or unrecognised datagram is
@@ -334,6 +363,16 @@ def requested_interface(extra):
         elif arg.startswith("--interface="):
             chosen = arg.split("=", 1)[1]
     return chosen
+
+
+def requested_dpd(extra):
+    """Whether the caller set their own DPD interval, so ours is not imposed."""
+    for index, arg in enumerate(extra):
+        if arg == "--force-dpd" and index + 1 < len(extra):
+            return extra[index + 1]
+        if arg.startswith("--force-dpd="):
+            return arg.split("=", 1)[1]
+    return None
 
 
 def requested_script(extra):
@@ -517,6 +556,26 @@ class Tunnel:
         self.exited.set()
         return self.returncode
 
+    def nudge(self):
+        """Ask openconnect to re-establish, keeping the session.
+
+        SIGUSR2 is documented as forcing "an immediate disconnection and
+        reconnection ... to quickly recover from LAN IP address changes". It
+        reuses the session cookie, so unlike a tray-level reconnect it costs no
+        sign-in, no Duo push and no polkit prompt. That makes it the right first
+        response to a tunnel that has stopped carrying traffic.
+        """
+        with self._lock:
+            if self._closing or self.exited.is_set():
+                return False
+        try:
+            self.proc.send_signal(signal.SIGUSR2)
+        except (ProcessLookupError, OSError) as exc:
+            log(f"could not signal openconnect to reconnect: {exc}")
+            return False
+        log("asked openconnect to re-establish the tunnel (SIGUSR2)")
+        return True
+
     def shutdown(self):
         """Ask openconnect to close the tunnel cleanly, escalating if it refuses.
 
@@ -562,9 +621,15 @@ def relay_output(proc):
 def watch_control_channel(tunnel):
     try:
         for line in sys.stdin:
-            if line.strip().lower() in ("quit", "disconnect"):
+            verb = line.strip().lower()
+            if verb in ("quit", "disconnect"):
                 log("disconnect requested")
                 return
+            if verb == "reconnect":
+                # Deliberately does not return: this re-establishes the tunnel
+                # and keeps the control channel open, where quit tears it down.
+                tunnel.nudge()
+                continue
         log("tray applet closed the control pipe")
     except (BrokenPipeError, ValueError, OSError) as exc:
         log(f"control pipe error: {exc}")
@@ -658,6 +723,12 @@ def main():
         extra = list(strip_script_option(extra))
         extra = [*extra, "--script", NOTIFY]
 
+    if requested_dpd(extra) is None:
+        extra = [*extra, "--force-dpd", str(DEFAULT_DPD_INTERVAL)]
+        log(f"forcing dead peer detection every {DEFAULT_DPD_INTERVAL}s"
+            " (this server negotiates it off, which is what makes a dropped"
+            " tunnel look connected)")
+
     command = [
         openconnect,
         "--useragent",
@@ -680,6 +751,13 @@ def main():
         log(f"{ifname} already exists; refusing to take over"
             " a device we did not create")
         return 23
+
+    # Announced explicitly rather than left to be parsed out of the command line
+    # below. The tray watches this device's health, and it needs the name even
+    # when the event channel could not be set up and state is coming from log
+    # matching. Scraping it back out of a logged argv would be exactly the kind
+    # of magic-string coupling the rest of this design removes.
+    emit(f"[helper] DEVICE {one_token(ifname)}\n")
 
     # Logged only once every check has passed, immediately before the spawn.
     # Logging it earlier meant syslog recorded root command lines that were then
@@ -760,6 +838,7 @@ def main():
     else:
         log(f"openconnect exited with status {returncode}")
     verify_teardown(ifname, interfaces_before, tunnel.killed, owned.get("ifindex"))
+    closing.set()  # the socket close below is deliberate, not a failure
     if events is not None:
         events.close()
     if event_dir:
