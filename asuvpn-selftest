@@ -195,6 +195,40 @@ def check_permission_rules(helper, r):
         os.chmod(d, 0o755)  # nosec B103  # noqa: S103
 
 
+def check_tunnel_health(tray, r):
+    """The watchdog's verdicts, against devices that are certainly present.
+
+    `lo` stands in for a tun device deliberately: it too reports
+    operstate=unknown and carries routes, so it exercises the exact conditions
+    that made the obvious checks wrong. Three of the four things one would reach
+    for first — operstate == "up", IFF_RUNNING, a default route through the
+    device — are false on a healthy tunnel, and a watchdog built on them would
+    cry wolf on every session.
+    """
+    try:
+        with open("/sys/class/net/lo/ifindex") as fh:
+            lo_index = int(fh.read().strip())
+    except (OSError, ValueError):
+        r.warn("a healthy device is not reported as broken", "no lo to test with")
+        return
+    reason, facts = tray.tunnel_health("lo", lo_index)
+    r.check("a healthy device is not reported as broken", reason is None,
+            f"lo was called broken: {reason!r} ({facts}) — a watchdog that"
+            " false-alarms on a working link is worse than none")
+    reason, _ = tray.tunnel_health("asuvpn-no-such-device", None)
+    r.check("a missing device is reported",
+            reason is not None and "gone" in reason, f"got {reason!r}")
+    reason, _ = tray.tunnel_health("lo", lo_index + 100000)
+    r.check("a device that is not the one we created is reported",
+            reason is not None and "replaced" in reason, f"got {reason!r}")
+    reason, _ = tray.tunnel_health(None, None)
+    r.check("no device to watch is not an error", reason is None,
+            f"got {reason!r}")
+    r.check("routes are counted for a real device and not for a fake one",
+            tray.route_count("lo") > 0 and tray.route_count("asuvpn-nope") == 0,
+            f"lo={tray.route_count('lo')} fake={tray.route_count('asuvpn-nope')}")
+
+
 def check_state_payload(tray, r):
     """The one place a malformed or hostile event meets the state machine."""
     cases = [
@@ -655,6 +689,7 @@ def main():
         check_reason_contract(helper, r)
         check_permission_rules(helper, r)
         check_state_payload(tray, r)
+        check_tunnel_health(tray, r)
         check_output_framing(helper, r)
 
     if "environment" in tiers:

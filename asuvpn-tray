@@ -63,11 +63,29 @@ SERVER_FILE = _xdg_dir("XDG_CONFIG_HOME", ".config") / "asuvpn" / "server"
 AUTOSTART_FILE = (
     _xdg_dir("XDG_CONFIG_HOME", ".config") / "autostart" / "asuvpn-tray.desktop"
 )
+# Presence is the setting; there is nothing to parse and nothing to corrupt.
+AUTORECONNECT_FILE = _xdg_dir("XDG_CONFIG_HOME", ".config") / "asuvpn" / "autoreconnect"
 MAX_LOG_LINES = 4000
 MAX_LOG_BYTES = 4 * 1024 * 1024
 # Must outlast the helper's worst case: 15s + 10s + 5s of signal escalation,
 # then draining output and checking the routing table afterwards.
 TEARDOWN_TIMEOUT = 75
+
+# How often the tunnel is checked while it claims to be connected, and how many
+# consecutive bad checks are needed before saying so. Two strikes rather than
+# one because routes are briefly absent while openconnect reinstalls them
+# during a reconnect, and a single sample lands in that window often enough.
+HEALTH_INTERVAL = 20
+HEALTH_STRIKES = 2
+IFF_UP = 0x1
+# Automatic reconnection costs a Duo push and a polkit prompt, so it is off
+# unless asked for, and rate limited when it is on.
+AUTORECONNECT_MIN_GAP = 300
+# Nudging costs nothing but a reconnect, so it may repeat -- but not every time
+# the watchdog fires. A tunnel whose device never comes back would otherwise
+# take a SIGUSR2 every 40s forever, because each nudge produces a `reconnect`
+# event that looks like a fresh, healthy start.
+NUDGE_MIN_GAP = 120
 
 # Not 2: argparse already exits 2 for any bad command line, so a script could
 # not tell "wrong server" from "you typo'd a flag".
@@ -146,12 +164,101 @@ RECONNECTING_PATTERNS = tuple(re.compile(r) for _, r, _ in RECONNECTING_MESSAGES
 FAILURE_MESSAGES = (
     ("Cookie was rejected", r"Cookie was rejected", True),
     ("Failed to connect to", r"Failed to connect to", True),
-    ("certificate verify failed", r"certificate verify failed", True),
+    # Not the bare phrase. ASU's chain is not in the system trust store, so a
+    # perfectly healthy connect always logs "Server certificate verify failed:
+    # signer not found" and then succeeds on the --servercert pin instead --
+    # which had us announce "openconnect reported a problem" on every single
+    # session. A real pin mismatch still ends "verify failed: <something else>"
+    # and is still caught.
+    ("certificate verify failed",
+     r"certificate verify failed(?!: signer not found)", True),
     ("Failed to open HTTPS connection", r"Failed to open HTTPS connection", True),
 )
 FAILURE_PATTERNS = tuple(
     re.compile(r, re.IGNORECASE) for _, r, _ in FAILURE_MESSAGES
 )
+
+
+def route_count(device):
+    """How many routes point at this device, IPv4 and IPv6.
+
+    Read straight out of /proc rather than shelled out to `ip`: this runs on the
+    GLib main loop every few seconds, and two file reads cost microseconds where
+    a subprocess would stall the UI.
+    """
+    if not device:
+        return 0
+    total = 0
+    try:
+        with open("/proc/net/route") as fh:
+            next(fh, None)  # header
+            total += sum(1 for line in fh
+                         if (f := line.split()) and f[0] == device)
+    except OSError:
+        return None
+    try:
+        with open("/proc/net/ipv6_route") as fh:
+            total += sum(1 for line in fh
+                         if (f := line.split()) and f[-1] == device)
+    except OSError:
+        pass  # a kernel without IPv6; the v4 count still stands
+    return total
+
+
+def tunnel_health(device, ifindex):
+    """Why the tunnel cannot be carrying traffic, or None. Facts, not packets.
+
+    Deliberately narrow, because three of the four checks that suggest
+    themselves first are wrong here — each was tried against a live ASU tunnel
+    and each would have raised a false alarm on a perfectly healthy link:
+
+      * `operstate` is "unknown" for a tun device, never "up"
+      * IFF_RUNNING is not set on a tun device either
+      * there is no default route through it: ASU is a split tunnel, so the
+        default route stays on the physical link and only the advertised
+        prefixes are routed in (53 IPv4 + 6 IPv6 routes on a live session)
+      * an idle tunnel moves no bytes at all, so flat counters mean nothing
+
+    What survives is the set of things that are true of every working tunnel and
+    false of a broken one: the device still exists, it is still the incarnation
+    this session created, it is still administratively up, and the routes that
+    make it useful are still installed. The last is the one openconnect's own
+    dead-peer detection cannot see — it will happily keep a session alive while
+    something else has wiped the routes out from under it.
+    """
+    if not device:
+        return None, {}  # no event channel and no DEVICE line; nothing to watch
+    facts = {"dev": device}
+    try:
+        with open(f"/sys/class/net/{device}/ifindex") as fh:
+            current = int(fh.read().strip())
+    except (OSError, ValueError):
+        return "the tunnel device is gone", facts
+    facts["ifindex"] = current
+    if ifindex is not None and current != ifindex:
+        return "the tunnel device was replaced by a different one", facts
+    try:
+        with open(f"/sys/class/net/{device}/flags") as fh:
+            flags = int(fh.read().strip(), 16)
+        facts["flags"] = f"0x{flags:x}"
+        if not flags & IFF_UP:
+            return "the tunnel device is down", facts
+    except (OSError, ValueError):
+        pass  # unreadable flags are not evidence of a fault
+    routes = route_count(device)
+    facts["routes"] = routes
+    if routes == 0:
+        return "no routes point at the tunnel any more", facts
+    return None, facts
+
+
+def set_autoreconnect(enabled):
+    """Presence of the file is the setting, so there is nothing to misparse."""
+    if enabled:
+        AUTORECONNECT_FILE.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        AUTORECONNECT_FILE.touch()
+    else:
+        AUTORECONNECT_FILE.unlink(missing_ok=True)
 
 
 def parse_state_payload(payload):
@@ -275,6 +382,18 @@ class VpnTray:
         self.helper_spoke = False
         self.state_events = False
         self.last_failure = None
+        # What the watchdog watches. The device comes from the helper's DEVICE
+        # line (or a state event), the ifindex is read once when the tunnel
+        # comes up so a device that is later replaced can be told apart from
+        # ours, and the address is kept so a recovered tunnel can be restored
+        # to the label it had.
+        self.tunnel_device = None
+        self.tunnel_ifindex = None
+        self.tunnel_address = ""
+        self.health_strikes = 0
+        self.health_demoted = False
+        self.last_nudge = 0.0
+        self.last_autoreconnect = 0.0
         self.reconnect_pending = False
         self.quitting = False
         self._log_bytes = 0
@@ -305,6 +424,9 @@ class VpnTray:
         self.indicator.set_title(APP_NAME)
         self._build_menu()
         self._refresh()
+        # On the main loop, not a thread: every check is a handful of file reads
+        # and every outcome changes state, which may only happen here anyway.
+        GLib.timeout_add_seconds(HEALTH_INTERVAL, self._health_check)
 
     # ---------------------------------------------------------------- menu
 
@@ -353,6 +475,15 @@ class VpnTray:
         self.autostart_item.set_active(AUTOSTART_FILE.exists())
         self.autostart_item.connect("toggled", self._on_autostart_toggled)
         self.menu.append(self.autostart_item)
+
+        # Off by default: reconnecting means a fresh sign-in, which means a Duo
+        # push and a polkit prompt. That is a reasonable thing to ask for and a
+        # rude thing to assume.
+        self.autoreconnect_item = Gtk.CheckMenuItem(
+            label="Reconnect automatically if traffic stops")
+        self.autoreconnect_item.set_active(AUTORECONNECT_FILE.exists())
+        self.autoreconnect_item.connect("toggled", self._on_autoreconnect_toggled)
+        self.menu.append(self.autoreconnect_item)
 
         self.menu.append(Gtk.SeparatorMenuItem())
 
@@ -555,8 +686,11 @@ class VpnTray:
         self.log("[tray] disconnecting")
         threading.Thread(target=self._disconnect_thread, daemon=True).start()
 
-    def reconnect(self):
-        if self.state in BUSY_STATES:
+    def reconnect(self, force=False):
+        # `force` exists for the watchdog, which has already demoted the badge
+        # out of CONNECTED to say the tunnel is not usable -- and would then be
+        # refused by its own honesty, because CONNECTING is a busy state.
+        if self.state in BUSY_STATES and not force:
             return
         if self.helper_proc is None or self.helper_proc.poll() is not None:
             self.connect()
@@ -827,6 +961,18 @@ class VpnTray:
         self.helper_spoke = False
         self.state_events = False
         self.last_failure = None
+        # What the watchdog watches. The device comes from the helper's DEVICE
+        # line (or a state event), the ifindex is read once when the tunnel
+        # comes up so a device that is later replaced can be told apart from
+        # ours, and the address is kept so a recovered tunnel can be restored
+        # to the label it had.
+        self.tunnel_device = None
+        self.tunnel_ifindex = None
+        self.tunnel_address = ""
+        self.health_strikes = 0
+        self.health_demoted = False
+        self.last_nudge = 0.0
+        self.last_autoreconnect = 0.0
         try:
             proc = subprocess.Popen(
                 command,
@@ -912,6 +1058,7 @@ class VpnTray:
         if state == CONNECTED:
             address = fields.get("addr", "")
             self.last_failure = None
+            self._adopt_tunnel(fields.get("dev") or self.tunnel_device, address)
             if self.state != CONNECTED:
                 self._set_state(CONNECTED, address)
                 self.notify("VPN connected", f"{self.server} — {address}".strip(" —"))
@@ -922,6 +1069,110 @@ class VpnTray:
         # A disconnect event is left to _on_tunnel_exit, which already
         # distinguishes a requested teardown from a dropped tunnel.
 
+    # ------------------------------------------------------------- watchdog
+
+    def _adopt_tunnel(self, device, address):
+        """Record what the watchdog should be watching, once it is up."""
+        self.tunnel_address = address
+        self.health_strikes = 0
+        self.health_demoted = False
+        if not device:
+            return
+        self.tunnel_device = device
+        # Taken now, while openconnect has just created it. Comparing it later
+        # is what tells "our tunnel is still here" from "a device with the same
+        # name is here", which is not the same claim.
+        try:
+            with open(f"/sys/class/net/{device}/ifindex") as fh:
+                self.tunnel_ifindex = int(fh.read().strip())
+        except (OSError, ValueError):
+            self.tunnel_ifindex = None
+
+    def _forget_tunnel(self):
+        self.tunnel_device = None
+        self.tunnel_ifindex = None
+        self.tunnel_address = ""
+        self.health_strikes = 0
+        self.health_demoted = False
+
+    def autoreconnect_enabled(self):
+        return AUTORECONNECT_FILE.exists()
+
+    def _health_check(self):
+        """Ask the kernel whether the tunnel could still be carrying traffic.
+
+        openconnect's dead-peer detection covers the case where the far end
+        stops answering. It cannot see the case where the tunnel is fine but
+        something local — a resume, a WiFi change, another daemon rewriting the
+        table — has taken the routes away. That is the breakage that looks
+        silent, because every layer involved still believes it is connected.
+        """
+        if self.quitting:
+            return True
+        if self.state not in (CONNECTED, CONNECTING) or self.helper_proc is None:
+            return True
+        reason, facts = tunnel_health(self.tunnel_device, self.tunnel_ifindex)
+
+        if reason is None:
+            if self.health_strikes:
+                self.log(f"[tray] tunnel healthy again ({self._facts(facts)})")
+            self.health_strikes = 0
+            # Only ever undo our own demotion: a CONNECTING we did not cause is
+            # openconnect reconnecting, and that is its story to finish.
+            if self.health_demoted and self.state == CONNECTING:
+                self.health_demoted = False
+                self._set_state(CONNECTED, self.tunnel_address)
+                self.notify("VPN carrying traffic again", self.server)
+            return True
+
+        if self.state != CONNECTED:
+            return True  # already reported, or openconnect is mid-reconnect
+        self.health_strikes += 1
+        self.log(f"[tray] tunnel check {self.health_strikes}/{HEALTH_STRIKES}:"
+                 f" {reason} ({self._facts(facts)})")
+        if self.health_strikes >= HEALTH_STRIKES:
+            self._tunnel_unhealthy(reason)
+        return True
+
+    @staticmethod
+    def _facts(facts):
+        """Always logged, healthy or not, so the next silent break has evidence."""
+        return ", ".join(f"{k}={v}" for k, v in facts.items()) or "no detail"
+
+    def _tunnel_unhealthy(self, reason):
+        """Escalate, cheapest first.
+
+        The two recoveries cost wildly different amounts, so they are not
+        interchangeable. Asking openconnect to re-establish reuses the session
+        cookie: no sign-in, no Duo push, no polkit prompt, and the user need not
+        even be at the keyboard. A tray-level reconnect throws the session away
+        and starts again from the browser, which means a Duo approval and typing
+        a password into a polkit dialog. So the free one is always tried first,
+        and the expensive one only when it was asked for.
+        """
+        self.log(f"[tray] the tunnel is not usable: {reason}")
+        self.health_demoted = True
+        self._set_state(CONNECTING, f"not carrying traffic — {reason}")
+
+        now = time.monotonic()
+        if (now - self.last_nudge >= NUDGE_MIN_GAP
+                and self._send_helper("reconnect")):
+            self.last_nudge = now
+            self.health_strikes = 0
+            self.log("[tray] asked openconnect to re-establish"
+                     " (same session, no sign-in needed)")
+            self.notify("VPN reconnecting", reason)
+            return
+
+        # The free option is spent, or there was no one to ask.
+        self.notify("VPN not carrying traffic", reason,
+                    icon="dialog-warning-symbolic")
+        if (self.autoreconnect_enabled()
+                and now - self.last_autoreconnect >= AUTORECONNECT_MIN_GAP):
+            self.last_autoreconnect = now
+            self.log("[tray] signing in again to rebuild the tunnel")
+            self.reconnect(force=True)
+
     def _on_tunnel_output(self, line, generation):
         if generation != self.helper_generation:
             # Still log it. A superseded helper's last words are its teardown
@@ -930,6 +1181,10 @@ class VpnTray:
             return False
         if line.startswith("[helper]"):
             self.helper_spoke = True
+            if line.startswith("[helper] DEVICE "):
+                self.tunnel_device = line[len("[helper] DEVICE "):].strip()
+                self.log(line)
+                return False
             if line.startswith("[helper] refusing"):
                 # The helper stopped before openconnect was started at all.
                 # Without this the user is shown "openconnect exited with
@@ -995,6 +1250,7 @@ class VpnTray:
             self.log(f"[tray] a previous tunnel closed (status {returncode})")
             return False
         self.helper_proc = None
+        self._forget_tunnel()
         if self.reconnect_pending:
             # _reconnect_now takes it from here; stay busy until it does.
             self.log("[tray] tunnel closed, signing in again")
@@ -1050,6 +1306,19 @@ class VpnTray:
                     proc.stdin.close()
             except (OSError, ValueError):
                 pass
+
+    def _send_helper(self, verb):
+        """Write one control verb, leaving the pipe open. False if it went nowhere."""
+        with self._stdin_lock:
+            proc = self.helper_proc
+            if proc is None or proc.stdin is None or proc.stdin.closed:
+                return False
+            try:
+                proc.stdin.write(verb + "\n")
+                proc.stdin.flush()
+                return True
+            except (OSError, ValueError):
+                return False
 
     def _teardown_helper(self):
         """Close the control pipe and wait. False means it is still alive."""
@@ -1111,6 +1380,18 @@ class VpnTray:
             item.handler_block_by_func(self._on_autostart_toggled)
             item.set_active(not item.get_active())
             item.handler_unblock_by_func(self._on_autostart_toggled)
+
+    def _on_autoreconnect_toggled(self, item):
+        try:
+            set_autoreconnect(item.get_active())
+        except OSError as exc:
+            self.log(f"[tray] could not change the setting: {exc}")
+            item.handler_block_by_func(self._on_autoreconnect_toggled)
+            item.set_active(not item.get_active())
+            item.handler_unblock_by_func(self._on_autoreconnect_toggled)
+            return
+        self.log("[tray] automatic reconnection "
+                 + ("enabled" if item.get_active() else "disabled"))
 
     def _write_autostart(self, enabled):
         if enabled:
@@ -1264,7 +1545,7 @@ def serve_ipc(tray, server):
 # ------------------------------------------------------------- command line
 
 COMMANDS = ("connect", "disconnect", "reconnect", "status", "log", "tray", "quit",
-            "selftest")
+            "selftest", "autoreconnect")
 
 COMMAND_HELP = """
 commands:
@@ -1276,6 +1557,7 @@ commands:
   tray          run the applet in the foreground without connecting
   quit          close the tunnel and stop the applet
   selftest      check this installation against this machine
+  autoreconnect show or set automatic reconnection: autoreconnect [on|off]
 
 exit codes:
   0  the request was carried out; for status and --wait, connected
@@ -1302,6 +1584,22 @@ def run_selftest(argv):
     except OSError as exc:
         print(f"could not run {selftest}: {exc}", file=sys.stderr)
         return 1
+
+
+def run_autoreconnect(argv):
+    if not argv:
+        print("on" if AUTORECONNECT_FILE.exists() else "off")
+        return 0
+    if len(argv) > 1 or argv[0] not in ("on", "off"):
+        print("usage: asuvpn autoreconnect [on|off]", file=sys.stderr)
+        return 2
+    try:
+        set_autoreconnect(argv[0] == "on")
+    except OSError as exc:
+        print(f"could not change the setting: {exc}", file=sys.stderr)
+        return 1
+    print("on" if AUTORECONNECT_FILE.exists() else "off")
+    return 0
 
 
 def show_log(follow):
@@ -1480,6 +1778,12 @@ def main():
     # rather than being rejected here as unknown flags.
     if argv and argv[0] == "selftest":
         return run_selftest(argv[1:])
+    # Intercepted for the same reason: it takes a value, and threading an
+    # optional positional through argparse's `choices` would complicate every
+    # other command to serve this one. The applet reads the file on each check,
+    # so a change here takes effect on a running tray with no message passing.
+    if argv and argv[0] == "autoreconnect":
+        return run_autoreconnect(argv[1:])
     if "--" in argv:
         separator = argv.index("--")
         argv, passthrough = argv[:separator], argv[separator + 1 :]
@@ -1501,6 +1805,8 @@ def main():
 
     if command == "selftest":  # reached via `asuvpn --server x selftest`
         return run_selftest([])
+    if command == "autoreconnect":
+        return run_autoreconnect([])
     if command == "log":
         return show_log(args.follow)
     if command == "status":
