@@ -663,6 +663,42 @@ def check_notify_roundtrip(r):
                 f"the chained script saw the token: {got[1:2]}")
 
 
+def check_fatal_reporting(r):
+    """A refusal must reach the user as a sentence, not as an exit number.
+
+    Runs the helper on paths that stop before openconnect is ever spawned, so
+    nothing here starts a tunnel or touches the real binary. The marker matters:
+    the tray used to pick these out by testing whether the line began with
+    "refusing", and four of the seven refusals did not, so those arrived as a
+    bare "openconnect exited with status N".
+    """
+    path = os.path.join(HERE, "asuvpn-helper")
+    if not os.access(path, os.X_OK):
+        r.warn("a refused connect explains itself", f"{path} not executable")
+        return
+    cases = [
+        (["--", "--background"], "an option that would detach openconnect"),
+        (["--", "--interface", "../../etc/passwd"], "an impossible device name"),
+    ]
+    unmarked = []
+    for extra, label in cases:
+        try:
+            out = subprocess.run(
+                [path, "--host", "https://example.invalid",
+                 "--fingerprint", "pin-sha256:x", *extra],
+                input="not-a-real-cookie\n", stdin=None, capture_output=True,
+                text=True, timeout=30)
+        except (OSError, subprocess.SubprocessError) as exc:
+            r.warn("a refused connect explains itself", f"{label}: {exc}")
+            return
+        marked = any(line.startswith("[helper] FATAL ")
+                     for line in out.stdout.splitlines())
+        if not (marked and out.returncode in (22, 25)):
+            unmarked.append(f"{label}: rc={out.returncode} out={out.stdout!r}")
+    r.check("a refused connect explains itself rather than exiting a number",
+            not unmarked, "; ".join(unmarked))
+
+
 def check_event_translation(helper, tray, r):
     """A datagram in, a state line out — including several hostile ones.
 
@@ -805,6 +841,7 @@ def main():
         r.section("wiring — asuvpn-notify executed end to end")
         check_notify_roundtrip(r)
         check_event_translation(helper, tray, r)
+        check_fatal_reporting(r)
 
     counts = r.counts
     print(f"\n{counts[PASS]} passed, {counts[FAIL]} failed, {counts[WARN]} warnings")

@@ -194,8 +194,9 @@ is no log yet.
 
 A tunnel that fails reports `openconnect`'s own exit status, or `128 + n` if it
 was killed by signal *n*. Codes in the twenties come from the helper refusing to
-start, and it always logs a sentence saying which — the tray shows that sentence
-rather than the bare number:
+start before `openconnect` was ever run. Each one is reported to you as the
+helper's own sentence rather than as the number — the helper marks those lines,
+so this does not depend on how any of them happen to be worded:
 
 | Code | The helper refused because |
 | --- | --- |

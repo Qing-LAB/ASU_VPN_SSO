@@ -29,6 +29,7 @@ is a machine with no working network until it reboots.
 - [Where state comes from](#where-state-comes-from)
 - [Concurrency](#concurrency)
 - [Watching the tunnel](#watching-the-tunnel)
+- [Two orderings that are load-bearing](#two-orderings-that-are-load-bearing)
 - [Teardown](#teardown)
 - [Exit codes](#exit-codes)
 - [Invariants](#invariants)
@@ -391,6 +392,26 @@ Automatic sign-in is off unless asked for, via the menu or
 nothing to parse and a running applet picks up a change on its next check
 without any message passing.
 
+### Two orderings that are load-bearing
+
+**The exit callback is queued before the event that releases teardown.** In
+`_tunnel_thread`'s `finally`, `GLib.idle_add(_on_tunnel_exit)` comes before
+`exited.set()`. Teardown wakes on that event and queues `_reconnect_now`; with
+the old order it could win the race, so `_on_tunnel_exit` would run *after* the
+reconnect had begun, find `reconnect_pending` already cleared and the state back
+at `AUTHENTICATING`, and report a perfectly healthy reconnect as a failure.
+
+**What the tunnel was is read before it is forgotten.** `_on_tunnel_exit`
+captures `was_connected` before `_reset_tunnel_state()`, because a tunnel the
+watchdog demoted is no longer in `CONNECTED` but certainly was one, and
+"connection dropped" explains its death better than an exit status does.
+
+There is exactly one `_reset_tunnel_state()`, called from `__init__`,
+`_start_tunnel` and `_on_tunnel_exit`. It was open-coded in three places and had
+already diverged: the copy in `_start_tunnel` omitted `tunnel_dns`, so a new
+tunnel kept probing the *previous* one's resolver — an address with no reason to
+be reachable through it.
+
 ## Teardown
 
 Closing the control pipe **is** the disconnect signal. The tray holds the write
@@ -438,9 +459,12 @@ Only *our* device is ever deleted, identified by the ifindex captured when
 
 ### `asuvpn-helper`
 
-These reach you as the tunnel's exit status, and the helper also logs a sentence
-explaining each one — which the tray now shows as the failure detail rather than
-a bare number.
+These reach you as the tunnel's exit status. The helper emits each with a
+`[helper] FATAL ` marker and the tray shows that sentence as the failure detail
+instead of the number. The marker replaced a test for lines beginning with
+"refusing", which four of the seven refusals did not — so those reached the user
+as a bare status code with the explanation sitting unread in the log. Wording is
+not an interface, here either.
 
 | Code | Meaning |
 | --- | --- |
@@ -477,12 +501,13 @@ where it can be, checked by `asuvpn selftest`.
 | A stalled tunnel is noticed rather than shown as connected | `--force-dpd`, plus a watchdog for what DPD cannot see | logic tier, and a sandbox scenario where the device never appears |
 | Recovery never costs a Duo push unless asked | `SIGUSR2` first, sign-in only on opt-in | sandbox scenario counts exactly one `SIGUSR2` and one sign-in over 100s |
 | openconnect cannot drive the control channel | it is spawned with its own `stdin` pipe | compared `/proc/<pid>/fd/0` of both: distinct pipes, child's is `O_RDONLY` |
+| A refusal is reported as a sentence, not a number | `[helper] FATAL ` marker, set by the helper | wiring tier, by running two refused connects |
 | A device name never becomes a path unvalidated | checked at both ends, not just where it is produced | logic tier, with traversal and whitespace payloads |
 | `openconnect-sso` can still import `pkg_resources` | `setuptools<71` pinned with `pipx inject --force` | environment tier, by importing it |
 
 ## How this is tested
 
-Three tiers in `asuvpn-selftest` (53 checks), plus a scenario sandbox.
+Three tiers in `asuvpn-selftest` (54 checks), plus a scenario sandbox.
 
 The shaping constraint: **conventional unit tests would not have caught any of
 the bugs that actually hurt this project.** `Connected as`, the hardcoded script

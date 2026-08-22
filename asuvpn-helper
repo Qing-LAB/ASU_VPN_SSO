@@ -114,8 +114,8 @@ def unsupported_option(option):
     A function rather than an inline loop so `asuvpn selftest` can put the
     whole blocklist through its paces without spawning anything.
     """
-    if option.split("=", 1)[0] in UNSUPPORTED_OPTIONS:
-        name = option.split("=", 1)[0]
+    name = option.split("=", 1)[0]
+    if name in UNSUPPORTED_OPTIONS:
         return f"refusing {name}: it would detach openconnect from this helper"
     if BUNDLED_SHORT_RE.match(option):
         return (f"refusing {option}: bundled short options cannot be checked"
@@ -291,6 +291,22 @@ def emit(text):
         sys.stdout.write(text)
         sys.stdout.flush()
     except (BrokenPipeError, ValueError, OSError):
+        pass
+
+
+def fatal(message):
+    """A refusal that stops the tunnel before openconnect is ever started.
+
+    Marked, not merely worded. The tray shows this sentence in place of
+    "openconnect exited with status 24", and it used to find it by testing
+    whether the line began with "refusing" — which four of the seven refusals
+    did not, so those reached the user as a bare number with the explanation
+    sitting unread in the log.
+    """
+    emit(f"[helper] FATAL {message}\n")
+    try:
+        syslog.syslog(syslog.LOG_ERR, message)
+    except (OSError, ValueError):
         pass
 
 
@@ -653,24 +669,24 @@ def main():
     for path in (HERE, os.path.abspath(__file__), NOTIFY):
         reason = unsafe_write_access(path)
         if reason:
-            log(f"refusing to run: {path} is {reason}")
+            fatal(f"refusing to run: {path} is {reason}")
             return 26
 
     openconnect = find_openconnect()
     if not openconnect:
-        log("cannot find the openconnect binary")
+        fatal("openconnect is not installed")
         return 20
 
     cookie = sys.stdin.readline().rstrip("\n")
     if not cookie:
-        log("no session cookie arrived on stdin, aborting")
+        fatal("no session cookie arrived from the sign-in")
         return 21
 
     extra = [a for a in args.extra if a != "--"]
     for option in extra:
         refusal = unsupported_option(option)
         if refusal:
-            log(refusal)
+            fatal(refusal)
             return 25
     # Name the device so teardown can prove which interface is ours before
     # deleting anything as root. A caller-supplied name is honoured instead.
@@ -678,14 +694,26 @@ def main():
     caller_named = ifname is not None
     if caller_named:
         if not INTERFACE_RE.match(ifname):
-            log(f"refusing an unusable interface name: {ifname!r}")
+            fatal(f"refusing an unusable interface name: {ifname!r}")
             return 22
     else:
         ifname = free_interface_name()
         if ifname is None:
-            log("no free asuvpnN interface name available")
+            fatal("no free asuvpnN interface name is available")
             return 24
         extra = [*extra, "--interface", ifname]
+
+    # Before anything is allocated. Checking after the event channel was open
+    # meant this exit path left its socket and directory behind in /run.
+    interfaces_before = tunnel_interfaces()
+    if interface_exists(ifname):
+        # Only reachable for a caller-supplied name now, since our own is chosen
+        # free. Never delete a device we were merely *told* to name: `--interface
+        # docker0` would otherwise have root destroy the caller's bridge before
+        # openconnect had even started.
+        fatal(f"{ifname} already exists; refusing to take over"
+              " a device this session did not create")
+        return 23
 
     # State comes from openconnect's script contract rather than its log text.
     # A caller-supplied --script is chained, not discarded.
@@ -727,9 +755,12 @@ def main():
 
     if requested_dpd(extra) is None:
         extra = [*extra, "--force-dpd", str(DEFAULT_DPD_INTERVAL)]
-        log(f"forcing dead peer detection every {DEFAULT_DPD_INTERVAL}s"
-            " (this server negotiates it off, which is what makes a dropped"
-            " tunnel look connected)")
+        # Says what was done, not what the server did: this runs before the
+        # server has said anything, and asserting its behaviour here would be
+        # wrong for every gateway that does negotiate DPD.
+        log(f"forcing dead peer detection every {DEFAULT_DPD_INTERVAL}s;"
+            " a server that negotiates it off leaves a dropped tunnel"
+            " looking connected")
 
     command = [
         openconnect,
@@ -743,16 +774,6 @@ def main():
         *extra,
         args.host,
     ]
-
-    interfaces_before = tunnel_interfaces()
-    if interface_exists(ifname):
-        # Only reachable for a caller-supplied name now, since our own is chosen
-        # free. Never delete a device we were merely *told* to name: `--interface
-        # docker0` would otherwise have root destroy the caller's bridge before
-        # openconnect had even started.
-        log(f"{ifname} already exists; refusing to take over"
-            " a device we did not create")
-        return 23
 
     # Announced explicitly rather than left to be parsed out of the command line
     # below. The tray watches this device's health, and it needs the name even
