@@ -1,0 +1,10 @@
+#!/usr/bin/env sso-python
+# SANDBOX-MARKER
+# This first line is replaced by enter.sh: the tray finds the SSO venv's
+# python by reading this file's shebang, so the staged copy must name the
+# stand-in interpreter by absolute path on the machine running the tests.
+import sys
+sys.stdin.readline()
+print("HOST=https://sslvpn.asu.edu")
+print("COOKIE=webvpn=SANDBOX-NEVER-REAL")
+print("FINGERPRINT=pin-sha256:SANDBOXAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")

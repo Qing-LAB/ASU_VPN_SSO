@@ -8,3 +8,13 @@ __pycache__/
 # editor/session metadata
 .reasonix/
 .ruff_cache/
+.mypy_cache/
+
+# sandbox runtime state, staged fresh by tests/sandbox/enter.sh
+tests/sandbox/app/
+tests/sandbox/rbin/
+tests/sandbox/home/
+tests/sandbox/xauth
+tests/sandbox/tray.err
+tests/sandbox/evil_contract.py
+tests/sandbox/ctl

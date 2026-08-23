@@ -1,0 +1,5 @@
+#!/bin/sh
+# SANDBOX-MARKER-VPNCSCRIPT
+# shellcheck disable=SC2154  # reason arrives in the environment, set by openconnect
+case "$reason" in pre-init|connect|disconnect|attempt-reconnect|reconnect) : ;; esac
+exit 0

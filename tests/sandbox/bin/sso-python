@@ -1,0 +1,4 @@
+#!/bin/sh
+# SANDBOX-MARKER
+if [ "$1" = "-c" ]; then echo ready; exit 0; fi
+exec /usr/bin/python3 "$@"

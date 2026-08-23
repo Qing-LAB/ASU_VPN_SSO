@@ -1,0 +1,84 @@
+#!/bin/bash
+# Enter the scenario sandbox: an unprivileged user + mount namespace in which
+# every binary a scenario could reach outside this repository is covered by a
+# stand-in, and a guard refuses to run anything unless all of them are.
+#
+#   tests/sandbox/enter.sh sec.sh          # run one scenario
+#   tests/sandbox/enter.sh /bin/bash       # look around by hand
+#
+# Isolation is structural, not careful: bind mounts inside a namespace leave
+# the real filesystem untouched and cannot be forgotten on the way out. An
+# earlier symlink-based arrangement let tests reach real binaries twice — once
+# opening the real ASU sign-in browser. Do not go back to that.
+set -euo pipefail
+SB="$(cd "$(dirname "$0")" && pwd)"
+REPO="$(cd "$SB/../.." && pwd)"
+
+REAL_SSO="$(command -v openconnect-sso || true)"
+if [ -z "$REAL_SSO" ]; then
+    echo "openconnect-sso is not on PATH; it must exist for the fake to cover it" >&2
+    exit 91
+fi
+REAL_SSO="$(realpath "$REAL_SSO")"
+
+# Stage what the scenarios run. app/ is refreshed from the repository every
+# time so a scenario can never test stale code. rbin/ holds runtime copies of
+# the fakes because the fake openconnect-sso needs a shebang naming an
+# absolute path on *this* machine: the tray reads that shebang to find the
+# venv python, so it has to point at the stand-in interpreter.
+rm -rf "$SB/app" "$SB/rbin"
+mkdir -p "$SB/app" "$SB/rbin" "$SB/home"
+for f in asuvpn-tray asuvpn-helper asuvpn-notify asuvpn-selftest; do
+    install -m 0755 "$REPO/$f" "$SB/app/$f"
+done
+install -m 0644 "$REPO/asuvpn_contract.py" "$SB/app/asuvpn_contract.py"
+for f in openconnect pkexec sso-python vpnc-script; do
+    install -m 0755 "$SB/bin/$f" "$SB/rbin/$f"
+done
+{ printf '#!%s\n' "$SB/rbin/sso-python"; tail -n +2 "$SB/bin/openconnect-sso"; } \
+    > "$SB/rbin/openconnect-sso"
+chmod 0755 "$SB/rbin/openconnect-sso"
+
+# Scenarios that drive the tray need an X display; /run is a fresh tmpfs
+# inside the namespace, so the session's X cookie must be copied out of it
+# beforehand.
+if [ -n "${XAUTHORITY:-}" ] && [ -r "$XAUTHORITY" ]; then
+    install -m 0600 "$XAUTHORITY" "$SB/xauth"
+fi
+
+# A bare scenario name is resolved against this directory.
+if [ "$#" -ge 1 ] && [ -x "$SB/$1" ]; then
+    first="$SB/$1"; shift; set -- "$first" "$@"
+fi
+
+# --map-root-user makes the helper's privileged paths live (euid 0 inside);
+# --map-auto maps this user's /etc/subgid block as well, so gids other than
+# our own exist inside. That second mapping is what lets sec.sh stage a file
+# owned by a *second* group and watch the real helper refuse it — a predicate
+# truth table cannot prove that end to end; only a second principal can.
+exec unshare -Urm --map-root-user --map-auto /bin/bash -s -- \
+    "$SB" "$REAL_SSO" "$@" <<'INNER'
+set -euo pipefail
+SB="$1"; REAL_SSO="$2"; shift 2
+export PATH="$SB/rbin:$PATH"
+mount -t tmpfs tmpfs /run
+mkdir -p /run/user/1000
+mount --bind "$SB/rbin/openconnect" /usr/sbin/openconnect
+[ -e /usr/bin/openconnect ] && mount --bind "$SB/rbin/openconnect" /usr/bin/openconnect
+mount --bind "$SB/rbin/pkexec" /usr/bin/pkexec
+mount --bind "$SB/rbin/openconnect-sso" "$REAL_SSO"
+mount --bind "$SB/rbin/vpnc-script" /usr/share/vpnc-scripts/vpnc-script
+fail=0
+check(){ grep -qa 'SANDBOX-MARKER' "$1" 2>/dev/null || { echo "GUARD FAIL: $2" >&2; fail=1; }; }
+check /usr/sbin/openconnect openconnect
+check /usr/bin/pkexec pkexec
+check "$REAL_SSO" openconnect-sso
+check /usr/share/vpnc-scripts/vpnc-script vpnc-script
+for b in openconnect openconnect-sso pkexec; do
+    p="$(command -v "$b" || true)"
+    case "$p" in "$SB/rbin/$b") ;; *) echo "GUARD FAIL: PATH resolves $b to ${p:-nothing}" >&2; fail=1;; esac
+done
+[ "$fail" -eq 0 ] || { echo "ABORTING: isolation incomplete" >&2; exit 90; }
+echo "guard: every binary a scenario could reach is a stand-in" >&2
+exec "$@"
+INNER

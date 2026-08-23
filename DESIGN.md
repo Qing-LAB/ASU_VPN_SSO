@@ -90,10 +90,11 @@ the same privilege. Both lists name all four now.
 Verified by tampering rather than by reading: making the contract
 world-writable, making its directory world-writable, and replacing it with a
 symlink to a writable file are each refused, the last because `os.stat` follows
-the link and sees the target. A *shared group* is refused too, though that one
-is covered by the logic tier's truth table rather than end to end — a user
-namespace maps only one gid, so a second principal cannot be created inside the
-sandbox to test it with.
+the link and sees the target. A *shared group* is refused too, end to end: the
+sandbox maps this user's `/etc/subgid` block, so `sec.sh` stages a file owned
+by a second group and watches the real helper refuse — the loader path for the
+contract, and exit 26 for the helper itself. Both assertions are
+mutation-verified (neuter either layer and the scenario fails loudly).
 
 ### Settings belong to the user side
 
@@ -359,9 +360,10 @@ answering. Nothing below the applet can see this.
 
 ### What is checked, and what is deliberately not
 
-Every check runs on the GLib main loop every `HEALTH_INTERVAL` seconds and is a
-couple of reads from `/sys` and `/proc` — no packets, no subprocess. Two
-consecutive bad checks are required, because routes are briefly absent while
+Every check runs on the GLib main loop every `health-interval` seconds (a
+setting, like every tunable in this section) and is a couple of reads from
+`/sys` and `/proc` — no packets, no subprocess. Two consecutive bad checks are
+required (`health-strikes`), because routes are briefly absent while
 `openconnect` reinstalls them during a legitimate reconnect.
 
 Three of the four checks that suggest themselves first are **wrong**, and each
@@ -389,8 +391,8 @@ the next silent break arrives with evidence attached rather than as a mystery.
 ### The probe, for the blind spot they share
 
 All of the above can pass while the tunnel carries nothing. So every
-`PROBE_EVERY` cycles the applet opens a TCP connection through the tunnel and
-closes it, on a worker thread — `PROBE_TIMEOUT` seconds on the GLib main loop
+`probe-every` cycles the applet opens a TCP connection through the tunnel and
+closes it, on a worker thread — `probe-timeout` seconds on the GLib main loop
 would freeze the UI.
 
 The target is derived, not configured: `INTERNAL_IP4_DNS`, forwarded from
@@ -422,9 +424,9 @@ interchangeable:
 
 | Step | Cost | Rate limit |
 | --- | --- | --- |
-| `SIGUSR2` to `openconnect` via the control pipe | none — same session | `NUDGE_MIN_GAP`, 120s |
+| `SIGUSR2` to `openconnect` via the control pipe | none — same session | `nudge-min-gap`, default 120s |
 | leave *Connected*, notify | none | — |
-| full sign-in (`reconnect`) | Duo approval **and** polkit password | `AUTORECONNECT_MIN_GAP`, 300s, and opt-in |
+| full sign-in (`reconnect`) | Duo approval **and** polkit password | `autoreconnect-min-gap`, default 300s, and opt-in |
 
 The nudge travels down the **existing** control pipe, so it needs no new
 privileged call — the helper is already root and already listening. It is rate
@@ -491,8 +493,8 @@ The escalation ladder, deliberately generous:
 | `SIGTERM` | 10 s | yes |
 | `SIGKILL` | 5 s | **no** |
 
-`TEARDOWN_TIMEOUT` is 75 s so the tray outlasts the whole ladder plus draining
-output and checking the routing table.
+`teardown-timeout` defaults to 75 s so the tray outlasts the whole ladder plus
+draining output and checking the routing table.
 
 Three independent guards, each covering a different death:
 
@@ -568,13 +570,14 @@ where it can be, checked by `asuvpn selftest`.
 | Recovery never costs a Duo push unless asked | `SIGUSR2` first, sign-in only on opt-in | sandbox scenario counts exactly one `SIGUSR2` and one sign-in over 100s |
 | openconnect cannot drive the control channel | it is spawned with its own `stdin` pipe | compared `/proc/<pid>/fd/0` of both: distinct pipes, child's is `O_RDONLY` |
 | A refusal is reported as a sentence, not a number | `[helper] FATAL ` marker, set by the helper | wiring tier, by running two refused connects |
-| Everything executed as root is unwritable by a second principal | bootstrap check before load, plus the helper's own list | environment tier, and by making each file writable in turn |
+| Everything executed as root is unwritable by a second principal | bootstrap check before load, plus the helper's own list | environment tier, by making each file writable in turn, and end to end for a shared group in the sandbox (`sec.sh` b/b2) |
 | A device name never becomes a path unvalidated | checked at both ends, not just where it is produced | logic tier, with traversal and whitespace payloads |
 | `openconnect-sso` can still import `pkg_resources` | `setuptools<71` pinned with `pipx inject --force` | environment tier, by importing it |
 
 ## How this is tested
 
-Three tiers in `asuvpn-selftest` (67 checks), plus a scenario sandbox.
+Three tiers in `asuvpn-selftest` (68 checks), plus the scenario sandbox in
+[tests/sandbox](tests/sandbox/README.md).
 
 The shaping constraint: **conventional unit tests would not have caught any of
 the bugs that actually hurt this project.** `Connected as`, the hardcoded script
@@ -586,19 +589,24 @@ statement, and asks the binary for its default script path.
 
 ### The sandbox
 
-Scenario tests run inside an **unprivileged user + mount namespace**, with fakes
-bind-mounted over `/usr/sbin/openconnect`, `/usr/bin/pkexec`, the real
-`openconnect-sso`, and the `vpnc-script`. A guard refuses to start unless every
-one of them resolves to a fake.
+Scenario tests live in [tests/sandbox](tests/sandbox/README.md) and run inside
+an **unprivileged user + mount namespace**, with fakes bind-mounted over
+`/usr/sbin/openconnect`, `/usr/bin/pkexec`, the real `openconnect-sso`, and the
+`vpnc-script`. A guard refuses to start unless every one of them resolves to a
+fake. The namespace also maps this user's `/etc/subgid` block, so a file owned
+by a *second group* can be staged inside it — which is what lets the
+shared-group refusal run end to end instead of only as a predicate truth table.
 
 This replaced an arrangement based on symlinks, which twice let a test reach a
 real binary — once opening the real ASU sign-in browser. A namespace cannot leak
 that way: the real filesystem is never modified, and is byte-identical
 afterwards.
 
-The stand-in `openconnect` prints only strings copied from the real v9.12
-catalogue and invokes `--script` the way the real one does, so the contract is
-exercised rather than mocked around.
+The stand-in `openconnect` prints only lines that are either prefixed
+`[stand-in] ` (harness telemetry, which no real line begins with) or copied
+from the installed binary's catalogue, and it invokes `--script` the way the
+real one does, so the contract is exercised rather than mocked around.
+`asuvpn selftest` enforces the wording rule mechanically.
 
 ### Mutation testing
 
@@ -618,9 +626,14 @@ breaking the code on purpose:
 | make the install directory world-writable | nothing run as root is writable |
 | a `vpnc-script` with `case` branches missing two reasons | the default script handles every reason |
 | an `openconnect-sso` venv without `pkg_resources` | `openconnect-sso` can import `pkg_resources` |
+| teach the stand-in an invented line (`Connected as …`) | the stand-in only speaks lines from the installed catalogue |
+| neuter the contract's shared-group predicate | `sec.sh` (b2): the helper no longer exits 26 |
+| neuter the loader's inline check as well | `sec.sh` (b): a group-shared contract executes |
 
-The second-to-last is the one that matters most: it is the check that would have
-caught the original `Connected as` failure.
+The fallback-patterns row is the one that matters most: it is the check that
+would have caught the original `Connected as` failure, and the stand-in row
+closes the same hole from the test side — a fake can no longer drift into
+wording the real binary cannot say.
 
 ### Not crying wolf
 
@@ -651,8 +664,8 @@ close.
 `strings libopenconnect.so.5`, never from memory. Set `still_expected` to
 `False` for a pattern kept only for older releases.
 
-**Adding a `reason`.** `REASON_STATES` in `asuvpn-helper` maps it to a state;
-the tray accepts `connected`, `connecting` and `disconnected` only. The
+**Adding a `reason`.** `REASON_STATES` in `asuvpn_contract.py` maps it to a
+state; the tray accepts `connected`, `connecting` and `disconnected` only. The
 self-test asserts the map matches the documented contract, so it will fail until
 you update it there too — deliberately.
 

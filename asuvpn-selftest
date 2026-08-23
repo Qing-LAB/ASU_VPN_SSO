@@ -573,6 +573,61 @@ def check_message_catalogue(tray, binary, r):
                  + (f" in {os.path.basename(libs[0])}" if libs else ""))
 
 
+def check_standin_catalogue(binary, r):
+    """The sandbox stand-in may only say things openconnect can say.
+
+    A stand-in is only as good as the strings it imitates: an earlier fake
+    printed "Connected as", which the real binary had stopped saying, and
+    every test passed while the applet was dead against the real thing. So
+    every literal the scenario sandbox's fake openconnect prints must either
+    start with "[stand-in] " — declared harness telemetry, which no real line
+    begins with — or begin with a prefix the installed binary's own catalogue
+    contains. Wording stays copied, never remembered.
+
+    An installed copy has no sandbox beside it and nothing to drift, so the
+    check passes vacuously there; it bites in a checkout.
+    """
+    name = "the sandbox stand-in only speaks lines from the installed catalogue"
+    fake = os.path.join(HERE, "tests", "sandbox", "bin", "openconnect")
+    if not os.path.exists(fake):
+        r.ok(name, "no sandbox beside this copy; installed copies have none")
+        return
+    if not binary:
+        r.warn(name, "openconnect itself is missing, so there is no catalogue"
+               " to hold the stand-in against")
+        return
+    try:
+        with open(fake, encoding="utf-8") as fh:
+            source = fh.read()
+    except OSError as exc:
+        r.fail(name, f"cannot read {fake}: {exc}")
+        return
+    literals = re.findall(r'(?:\bsay|\bprint)\(f?"([^"]*)"', source)
+    if not literals:
+        r.fail(name, "no printed literals found in the stand-in; this check no"
+               " longer understands how the fake speaks")
+        return
+    catalogue, _ = read_catalogue(binary)
+    if len(catalogue) < 1024:
+        r.warn(name, "could not read the binary's message catalogue")
+        return
+    # A message's literal prefix is everything before its first placeholder;
+    # ten characters keeps incidental fragments from vouching for a line.
+    prefixes = {m.split(b"%", 1)[0]
+                for m in re.findall(rb"[\x20-\x7e]{10,}", catalogue)}
+    prefixes = {p for p in prefixes if len(p) >= 10}
+    telemetry = [t for t in literals if t.startswith("[stand-in] ")]
+    imitated = [t for t in literals if not t.startswith("[stand-in] ")]
+    invented = [t for t in imitated
+                if not any(t.encode().startswith(p) for p in prefixes)]
+    if invented:
+        r.fail(name, "invented wording the installed binary cannot say: "
+               + "; ".join(repr(t) for t in invented))
+    else:
+        r.ok(name, f"{len(imitated)} imitated lines anchored to the catalogue,"
+             f" {len(telemetry)} marked [stand-in]")
+
+
 def check_desktop_stack(tray, r):
     if tray.GUI_ERROR is None:
         r.ok("GTK, AppIndicator and libnotify bindings are importable")
@@ -936,6 +991,7 @@ def main():
         binary = check_openconnect(helper, tray, r)
         check_default_script(helper, C, binary, r)
         check_message_catalogue(tray, binary, r)
+        check_standin_catalogue(binary, r)
         check_desktop_stack(tray, r)
         check_installed_permissions(C, r)
         check_no_bytecode(r)

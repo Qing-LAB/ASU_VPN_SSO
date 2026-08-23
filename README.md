@@ -963,7 +963,9 @@ pylint --disable=all --enable=E --ignored-modules=gi,gi.repository /tmp/asuvpn-l
 bandit -q -r /tmp/asuvpn-lint -ll
 vulture --min-confidence 70 /tmp/asuvpn-lint/*.py
 mypy --ignore-missing-imports /tmp/asuvpn-lint/*.py
-shellcheck -S style bootstrap.sh install.sh
+shellcheck -S style bootstrap.sh install.sh tests/sandbox/*.sh \
+           tests/sandbox/bin/pkexec tests/sandbox/bin/sso-python \
+           tests/sandbox/bin/vpnc-script
 ```
 
 All of these are expected to be clean. None of them need installing: `pipx run
@@ -1002,12 +1004,16 @@ escalation, and a restored default route.
 The state framework was exercised through the real script contract: a stand-in
 openconnect that invokes `--script` with `reason=connect`, `attempt-reconnect`,
 `reconnect` and `disconnect`, confirming the tray follows each one and displays
-the assigned address. The permission refusal was tested by making the directory
-world-writable and group-shared in turn, and by confirming an ordinary
+the assigned address. The permission refusal was tested by making each file and
+the directory world-writable in turn, by staging a file owned by a genuinely
+*second* group and watching the real helper refuse it (the scenario asserts,
+and fails loudly if the refusal does not happen), and by confirming an ordinary
 user-private-group checkout still runs.
 
-The stand-ins run inside an unprivileged **mount namespace**, bind-mounted over
-`/usr/sbin/openconnect`, `/usr/bin/pkexec`, `openconnect-sso` and the
+The stand-ins and the scenarios live in
+[tests/sandbox](tests/sandbox/README.md) and run inside an unprivileged
+**user + mount namespace**, bind-mounted over `/usr/sbin/openconnect`,
+`/usr/bin/pkexec`, `openconnect-sso` and the
 `vpnc-script`, with a guard that refuses to start unless every one of them
 resolves to a fake. Earlier rounds used symlinks, and twice a gap in that
 arrangement let a test reach a real binary. A namespace cannot leak: the real
@@ -1054,6 +1060,10 @@ keyring probe reports correctly, and GNOME resolves the launcher and icon.
 > the installed binary's own message catalogue (`strings libopenconnect.so.5`)
 > rather than from memory, and replayed against realistic v9.12 transcripts
 > for the DTLS, TLS-only, proxied, rehandshake and drop-then-recover cases.
+> `asuvpn selftest` now also holds the stand-in itself to that rule: every
+> line it prints must be marked `[stand-in] ` or begin with a prefix from the
+> installed binary's own catalogue, so a fake cannot drift back into invented
+> wording.
 
 **Exercised end to end since:** a full connect through the real `pkexec`
 prompt, a real Duo approval and ASU's own gateway, watched over a working

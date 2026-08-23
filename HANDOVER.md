@@ -20,7 +20,7 @@ Everything is committed and pushed to `main` at
 | Programs | `asuvpn-tray` (you), `asuvpn-helper` (root, via pkexec), `asuvpn-notify` (root, run by openconnect), `asuvpn-selftest` (you) |
 | Shared | `asuvpn_contract.py` — loaded by explicit path, never imported |
 | Settings | `~/.config/asuvpn/asuvpn.conf`, generated from the contract's schema |
-| Checks | `asuvpn selftest` — 67, in three tiers |
+| Checks | `asuvpn selftest` — 68, in three tiers; scenario suite in [tests/sandbox](tests/sandbox/README.md) |
 | Analysers | ruff, pyflakes, pylint, mypy, bandit, vulture, shellcheck — all clean |
 | Tested against | openconnect v9.12-3.3, Ubuntu, GNOME, ASU's `sslvpn.asu.edu` |
 
@@ -51,16 +51,22 @@ not, and each cost a round of rework.
 
 - The watchdog's escalation ladder, the nudge rate limits, notification wording,
   every failure path, and the config driving behaviour end to end.
+- The **shared-group** permission refusal, end to end since 2026-08-22: the
+  sandbox now maps this user's `/etc/subgid` block (`--map-auto`), so
+  `tests/sandbox/sec.sh` stages a file owned by a second group and watches the
+  real helper refuse — loader path for the contract, exit 26 for the helper
+  itself — with both assertions mutation-verified. (Earlier, the namespace
+  mapped a single gid, the scenario's `chgrp` failed silently, and the case was
+  honestly recorded here as not proven at all.)
 - These use stand-ins. **A stand-in is only as good as the strings it imitates**
-  — see the `Connected as` story below.
+  — see the `Connected as` story below. Since 2026-08-22 the selftest enforces
+  that mechanically: every line the stand-in prints is either marked
+  `[stand-in] ` or anchored to the installed binary's own catalogue.
 
 ### Not proven at all
 
 - Anything on a distribution other than Ubuntu/Debian, or a desktop other than
   GNOME.
-- The **shared-group** permission refusal end to end. The predicate is unit
-  tested, but a user namespace maps a single gid, so a second principal cannot
-  be created inside the sandbox. Do not write this up as if it were covered.
 
 ---
 
@@ -167,6 +173,11 @@ bind-mounted over `/usr/sbin/openconnect`, `/usr/bin/pkexec`, the real
 unless every one of them resolves to a fake. A namespace cannot leak: the real
 filesystem is never modified. **Do not go back to symlinks.**
 
+It lives in [tests/sandbox](tests/sandbox/README.md) — committed since
+2026-08-22, after it was found to exist only in a session's temp directory,
+one reboot away from ceasing to exist while three documents described it in
+the present tense.
+
 ### 6. Duplication drifts, and drift is invisible
 
 Five message prefixes, two config mechanisms, nine tunables across two programs,
@@ -195,7 +206,8 @@ because code cannot be shared before the sharing mechanism is loaded.
   passes what it needs as arguments.
 - **Loading the contract writes `__pycache__`** into the directory the helper
   runs out of as root, unless `sys.dont_write_bytecode` is set first. This has
-  regressed twice; it is now check #67.
+  regressed twice; it is now its own check ("loading the contract writes
+  nothing beside the helper").
 - **The running applet holds its code in memory.** After `install.sh`, a plain
   `asuvpn reconnect` still runs the old tray. `asuvpn quit` then connect.
 
@@ -218,7 +230,8 @@ because code cannot be shared before the sharing mechanism is loaded.
 ## How to work on it
 
 ```bash
-asuvpn selftest                 # 67 checks; run before and after any change
+asuvpn selftest                 # 68 checks; run before and after any change
+tests/sandbox/enter.sh sec.sh   # scenario tests, in a namespace of stand-ins
 ./install.sh                    # copies into ~/.local, runs the self-check
 asuvpn log -f                   # what it is actually doing
 ```

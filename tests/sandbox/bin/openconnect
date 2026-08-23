@@ -1,0 +1,54 @@
+#!/usr/bin/python3
+# SANDBOX-MARKER
+#
+# Stand-in openconnect. It models three things and nothing else: the
+# --version output the helper derives the vpnc-script path from, the script
+# contract (--script invoked with reason= in the environment, exactly like
+# the real binary), and a teardown that answers signals.
+#
+# The honesty rule, learned the expensive way: every line this fake prints
+# either begins with "[stand-in] " — unmistakably harness telemetry, which no
+# real openconnect line begins with — or is wording copied from the installed
+# binary's own message catalogue. `asuvpn selftest` enforces this rule
+# mechanically; an earlier fake printed "Connected as", which the real binary
+# had stopped saying, and every test passed while the applet was dead.
+import os, signal, subprocess, sys, time
+args = sys.argv[1:]
+def opt(n):
+    for i,a in enumerate(args):
+        if a==n and i+1<len(args): return args[i+1]
+        if a.startswith(n+"="): return a.split("=",1)[1]
+    return None
+if "--version" in args:
+    print("OpenConnect version v9.12-3.3")
+    print("Default vpnc-script (override with --script): /usr/share/vpnc-scripts/vpnc-script")
+    sys.exit(0)
+script = opt("--script") or "/usr/share/vpnc-scripts/vpnc-script"
+dev = opt("--interface") or "tun0"
+sys.stdin.readline()
+def say(m): print(m, flush=True)
+def run_script(reason, addr="10.242.7.31"):
+    env = dict(os.environ)
+    env.update({"reason":reason,"TUNDEV":os.environ.get("FAKE_TUNDEV", dev),
+                "VPNGATEWAY":"192.0.2.1","INTERNAL_IP4_ADDRESS":addr,
+                "INTERNAL_IP4_MTU":"1406",
+                "INTERNAL_IP4_DNS":os.environ.get("FAKE_DNS","")})
+    subprocess.call(["/bin/sh","-c",script], env=env)
+state = {"stop":False,"nudges":0}
+def on_stop(_s,_f): state["stop"]=True
+def on_usr2(_s,_f):
+    state["nudges"] += 1
+    say("[stand-in] SIGUSR2 received, re-establishing")  # the real binary reconnects on SIGUSR2 but logs no line for it
+    run_script("attempt-reconnect")
+    run_script("reconnect", "10.242.9.99")
+    say("Configured as 10.242.9.99, with SSL connected and DTLS connected")
+signal.signal(signal.SIGINT,on_stop); signal.signal(signal.SIGTERM,on_stop)
+signal.signal(signal.SIGUSR2, (lambda *_: say("[stand-in] SIGUSR2 ignored (deaf mode)")) if os.environ.get("FAKE_DEAF") else on_usr2)
+say("Connected to 192.0.2.4:443")
+say("CSTP connected. DPD 0, Keepalive 0")     # exactly what ASU negotiates
+run_script("pre-init"); run_script("connect")
+say("Configured as 10.242.7.31, with SSL connected and DTLS connected")
+while not state["stop"]: time.sleep(0.05)
+run_script("disconnect"); say("[stand-in] logout sent")
+say(f"[stand-in] nudges received: {state['nudges']}")
+sys.exit(0)
