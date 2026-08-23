@@ -911,7 +911,9 @@ HH:MM:SS  [old tunnel] …      a superseded helper's last words
 ```
 
 The kind word is part of the line — grep for `WARNING` (no colon), not
-`WARNING:`.
+`WARNING:`. A line like `[tray] ignoring 'check' while disconnecting` is the
+applet declining a message that arrived too late to matter — normal during
+teardown, and logged precisely so a declined action never reads as a hang.
 
 | Symptom | Cause and fix |
 | --- | --- |

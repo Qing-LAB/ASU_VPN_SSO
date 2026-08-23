@@ -20,7 +20,7 @@ Everything is committed and pushed to `main` at
 | Programs | `asuvpn-tray` (you), `asuvpn-helper` (root, via pkexec), `asuvpn-notify` (root, run by openconnect), `asuvpn-selftest` (you) |
 | Shared | `asuvpn_contract.py` — loaded by explicit path, never imported |
 | Settings | `~/.config/asuvpn/asuvpn.conf`, generated from the contract's schema |
-| Checks | `asuvpn selftest` — 83, in three tiers; scenario suite in [tests/sandbox](tests/sandbox/README.md) |
+| Checks | `asuvpn selftest` — 84, in three tiers; scenario suite in [tests/sandbox](tests/sandbox/README.md) |
 | Analysers | ruff, pyflakes, pylint, mypy, bandit, vulture, shellcheck — all clean |
 | Tested against | openconnect v9.12-3.3, Ubuntu, GNOME, ASU's `sslvpn.asu.edu` |
 
@@ -219,9 +219,9 @@ others use `abspath`, and the reference copy in the contract says which.
   `SIGKILL` — the one thing that stops `vpnc-script` restoring the routing table.
 - **`preexec_fn` runs in the child.** `os.getpid()` there is the child's. Capture
   the parent pid *before* `Popen`.
-- **`GLib.idle_add` before releasing anyone waiting.** In `_tunnel_thread`'s
-  `finally`, queue `_on_tunnel_exit` *then* set `exited`, or teardown can win the
-  race and a healthy reconnect gets reported as a failure.
+- **Post the exit message before releasing anyone waiting.** In
+  `_tunnel_thread`'s `finally`, post `helper-exited` *then* set `exited`, or
+  teardown can win the race and a healthy reconnect gets reported as a failure.
 - **`~` is root's home in the helper.** It never reads user config; the tray
   passes what it needs as arguments.
 - **Loading the contract writes `__pycache__`** into the directory the helper
@@ -235,17 +235,11 @@ others use `abspath`, and the reference copy in the contract says which.
 
 ## What to do next, roughly in order
 
-1. **The state-machine revision** — the user-directed core work. The
-   2026-08-23 review traced its worst findings (a probe verdict stomping a
-   user's Disconnect, a timer racing an exit callback into a false FAILED, the
-   ladder skipping an untried nudge) to one cause: state changed by scattered
-   hand-written conditionals instead of one authority processing messages.
-   [STATE-MACHINE-PLAN.md](STATE-MACHINE-PLAN.md) is the consolidated plan —
-   the inventory of today's state, the proposed machine, the migration steps,
-   and the decisions that are the user's. **Migration starts only after the
-   user approves that plan.** The guards added by the review are point fixes;
-   the machine is the structural fix that makes them unnecessary.
-2. **Live-verify the routes-lost fix.** The break was staged live on
+1. **Live-verify the routes-lost fix** — now also the state machine's first
+   live outing. The rebuild landed 2026-08-23 (eight states, one transition
+   table — see DESIGN's state-machine section; STATE-MACHINE-PLAN.md records
+   the rationale and the user's decisions). It is suite- and sandbox-proven;
+   live confidence accrues with use, and the flush test doubles as its trial. The break was staged live on
    2026-08-23 (`sudo ip route flush dev asuvpn0`) and defeated the ladder as
    then designed, three ways at once: a same-address `reconnect` does not
    reinstall routes (the stock vpnc-script only routes on `reason=connect`),
@@ -271,7 +265,7 @@ others use `abspath`, and the reference copy in the contract says which.
 ## How to work on it
 
 ```bash
-asuvpn selftest                 # 83 checks; run before and after any change
+asuvpn selftest                 # 84 checks; run before and after any change
 tests/sandbox/enter.sh sec.sh   # scenario tests, in a namespace of stand-ins
 ./install.sh                    # copies into ~/.local, runs the self-check
 asuvpn log -f                   # what it is actually doing

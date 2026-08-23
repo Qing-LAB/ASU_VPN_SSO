@@ -395,7 +395,7 @@ def check_notifications(tray, r):
     tray.VpnTray._announce_link_lost(stub, "link lost, retrying")
     r.check("a dropped tunnel is announced, not just badged",
             stub.notes[-1] == "VPN connection lost"
-            and stub.state == tray.CONNECTING,
+            and stub.state == tray.RECOVERING,
             f"got {stub.notes[-1]!r}, state {stub.state!r} — without this the"
             " user is never told the tunnel went away")
 
@@ -413,31 +413,30 @@ def check_demotion_rules(tray, r):
     reconnect event promoted the badge and reset the incident even though the
     probe had never passed again — so the badge flapped every two minutes, the
     notification repeated, and because the demote cadence equalled the nudge
-    rate limit, the sign-in branch was unreachable even when opted in. The
-    rules under test: only the demoting source promotes, the incident keeps
-    its state across the reconnect event, one nudge per incident, and one
-    warning notification at the moment the free option is spent.
+    rate limit, the sign-in branch was unreachable even when opted in.
 
-    Exercised through a stand-in `self` borrowing the real methods, so no
-    display is needed and the real state machine is what runs.
+    Driven the way the applet itself now works: messages injected into the
+    real transition table, on a stand-in `self` that stubs only the side
+    effects (log, notify, the badge, the worker threads). The machine under
+    test is the machine that ships.
     """
+    rows_missing = [(state, kind)
+                    for (state, kind), name in tray.TRANSITIONS.items()
+                    if not callable(getattr(tray.VpnTray, "_tr_" + name, None))]
+    r.check("every transition row names a real handler", not rows_missing,
+            f"rows without handlers: {rows_missing}")
 
-    class Stub:
-        _apply_state_event = tray.VpnTray._apply_state_event
-        _adopt_tunnel = tray.VpnTray._adopt_tunnel
-        _announce_connected = tray.VpnTray._announce_connected
-        _unhealthy = tray.VpnTray._unhealthy
-        _tunnel_unhealthy = tray.VpnTray._tunnel_unhealthy
-        _healthy = tray.VpnTray._healthy
-        _probe_result = tray.VpnTray._probe_result
+    # The base class comes out of a path-loaded module, which the type
+    # checker cannot see into — the same limitation as the loaders'
+    # ModuleSpec residue, suppressed here at its one occurrence.
+    class Stub(tray.StateMachine):  # type: ignore[misc, name-defined]
         server = "vpn.example.edu"
 
         def __init__(self):
             self.state = tray.CONNECTING
             self.detail = ""
             self.state_events = False
-            self.quitting = self.cancelled = False
-            self.health_demoted = False
+            self.quitting = False
             self.demoted_by = None
             self.strikes = {"device": 0, "probe": 0}
             self.nudge_spent = self.failure_notified = False
@@ -450,13 +449,12 @@ def check_demotion_rules(tray, r):
             self.last_nudge = float("-inf")
             self.last_autoreconnect = float("-inf")
             self.helper_generation = 0
+            self.helper_proc = None
             self.probe_in_flight = False
+            self.teardown_intent = None
+            self.reconnect_keep_log = False
             self.autoreconnect = False
-            self.notes, self.sent, self.logged = [], [], []
-            self.reconnects = []
-
-        def reconnect(self, force=False, keep_log=False):
-            self.reconnects.append(force)
+            self.notes, self.sent, self.logged, self.signins = [], [], [], []
 
         def notify(self, summary, body="", icon=None):
             self.notes.append(summary)
@@ -471,6 +469,9 @@ def check_demotion_rules(tray, r):
             self.sent.append(verb)
             return True
 
+        def _act_start_signin(self, keep_log):
+            self.signins.append(keep_log)
+
         def autoreconnect_enabled(self):
             return self.autoreconnect
 
@@ -478,19 +479,20 @@ def check_demotion_rules(tray, r):
     strikes = max(1, tray.SETTINGS["health-strikes"])
     stub._apply_state_event("connected dev=asuvpn0 addr=10.0.0.1 dns=10.0.0.53")
     for _ in range(strikes):
-        stub._unhealthy("probe", "nothing answers", "no reply")
+        stub.dispatch(tray.MSG_CHECK, source="probe",
+                      reason="nothing answers", detail="no reply")
     r.check("a broken tunnel is demoted and nudged exactly once",
-            stub.state == tray.CONNECTING and stub.sent == ["reconnect"]
+            stub.state == tray.DEMOTED and stub.sent == ["reconnect"]
             and stub.notes[-1] == "VPN reconnecting",
             f"state={stub.state!r} sent={stub.sent} notes={stub.notes}")
 
     stub._apply_state_event("connected dev=asuvpn0 addr=10.0.0.2 dns=10.0.0.53")
     r.check("a reconnect event mid-demotion adopts the tunnel but not the badge",
-            stub.state == tray.CONNECTING and stub.health_demoted
+            stub.state == tray.DEMOTED
             and stub.tunnel_address == "10.0.0.2"
             and "VPN reconnected" not in stub.notes,
-            f"state={stub.state!r} demoted={stub.health_demoted}"
-            f" addr={stub.tunnel_address!r} notes={stub.notes}")
+            f"state={stub.state!r} addr={stub.tunnel_address!r}"
+            f" notes={stub.notes}")
 
     # Wind the clock past the rate limit before the next round: the incident
     # flag, not the timestamp, must be what refuses a second nudge — otherwise
@@ -499,7 +501,8 @@ def check_demotion_rules(tray, r):
     # count at one, not the fixture stopping early.
     stub.last_nudge -= max(1, tray.SETTINGS["nudge-min-gap"]) + 1
     for _ in range(2 * strikes):
-        stub._unhealthy("probe", "nothing answers", "no reply")
+        stub.dispatch(tray.MSG_CHECK, source="probe",
+                      reason="nothing answers", detail="no reply")
     r.check("an incident takes one nudge, then says the free option is spent",
             stub.sent == ["reconnect"]
             and stub.notes.count("VPN not carrying traffic") == 1,
@@ -512,29 +515,30 @@ def check_demotion_rules(tray, r):
             and any("sign-in is off" in line for line in stub.logged),
             f"logged={stub.logged}")
 
-    stub._healthy("device", "the device checks still pass")
+    stub.dispatch(tray.MSG_CHECK, source="device", reason=None,
+                  detail="the device checks still pass")
     r.check("a source that did not demote cannot promote",
-            stub.state == tray.CONNECTING and stub.health_demoted,
-            f"state={stub.state!r} demoted={stub.health_demoted} — the device"
-            " check cleared a probe demotion, which flaps the badge against"
-            " a tunnel that is genuinely carrying nothing")
+            stub.state == tray.DEMOTED,
+            f"state={stub.state!r} — the device check cleared a probe"
+            " demotion, which flaps the badge against a tunnel that is"
+            " genuinely carrying nothing")
 
     # A verdict landing after teardown began must change nothing: this once
-    # stomped a user's Disconnect back to CONNECTING and handed a requested
-    # teardown to the escalation ladder.
+    # stomped a user's Disconnect back into the escalation ladder. The table
+    # simply has no row for it.
     stub.state = tray.DISCONNECTING
-    stub._probe_result(False, "no reply", stub.helper_generation)
+    stub.dispatch(tray.MSG_CHECK, source="probe",
+                  reason="nothing answers", detail="no reply")
     r.check("a probe verdict arriving mid-teardown changes nothing",
             stub.state == tray.DISCONNECTING and stub.strikes["probe"] == 0,
             f"state={stub.state!r} strikes={stub.strikes}")
-    stub.state = tray.CONNECTING
+    stub.state = tray.DEMOTED
 
-    stub._healthy("probe", "answered")
+    stub.dispatch(tray.MSG_CHECK, source="probe", reason=None, detail="answered")
     r.check("the demoting source is what promotes, and it resets the incident",
             stub.state == tray.CONNECTED
             and stub.notes[-1] == "VPN carrying traffic again"
-            and not stub.health_demoted and not stub.nudge_spent
-            and not stub.failure_notified,
+            and not stub.nudge_spent and not stub.failure_notified,
             f"state={stub.state!r} notes={stub.notes}")
 
     # A nudge that is merely held (rate-limited) is not spent: escalating past
@@ -544,17 +548,19 @@ def check_demotion_rules(tray, r):
     try:
         held = Stub()
         held.autoreconnect = True
+        held._apply_state_event(
+            "connected dev=asuvpn0 addr=10.0.0.1 dns=10.0.0.53")
         held.last_nudge = time.monotonic() - 1
         for _ in range(strikes):
-            held._unhealthy("probe", "nothing answers", "no reply")
+            held.dispatch(tray.MSG_CHECK, source="probe",
+                          reason="nothing answers", detail="no reply")
     finally:
         tray.SETTINGS["nudge-min-gap"] = original_gap
     r.check("a held nudge is waited out, never escalated past",
-            held.reconnects == [] and held.sent == []
+            held.signins == [] and held.sent == []
             and any("holding the free re-establish" in line
                     for line in held.logged),
-            f"reconnects={held.reconnects} sent={held.sent}"
-            f" logged={held.logged}")
+            f"signins={held.signins} sent={held.sent} logged={held.logged}")
 
     # A reconnect that lands on a *different* device incarnation must not
     # inherit the old one's route-family observations: a stale IPv6 latch
@@ -564,7 +570,7 @@ def check_demotion_rules(tray, r):
                "no lo to stage the adoption with")
     else:
         fresh = Stub()
-        fresh.health_demoted = True
+        fresh.state = tray.DEMOTED
         fresh.routes_seen = {"routes4": True, "routes6": True}
         fresh.tunnel_ifindex = -1  # provably not lo's real index
         fresh._adopt_tunnel("lo", "10.0.0.9", "")
@@ -577,16 +583,19 @@ def check_demotion_rules(tray, r):
     # The verb a user reaches for. A demoted tunnel is established, so the
     # menu offers Reconnect — and `connect` has to mean the same intent there,
     # not a silent refusal that reads as "cannot connect". A plain CONNECTED
-    # still refuses quietly, as ever.
+    # still declines, as ever.
     demoted = Stub()
-    demoted.health_demoted, demoted.state = True, tray.CONNECTING
-    tray.VpnTray.connect(demoted)
+    demoted.state = tray.DEMOTED
+    demoted.dispatch(tray.MSG_CONNECT, keep_log=False)
     connected = Stub()
     connected.state = tray.CONNECTED
-    tray.VpnTray.connect(connected)
+    connected.dispatch(tray.MSG_CONNECT, keep_log=False)
     r.check("connect on a demoted tunnel means reconnect, and only there",
-            demoted.reconnects == [True] and connected.reconnects == [],
-            f"demoted={demoted.reconnects} connected={connected.reconnects}")
+            demoted.signins == [False]
+            and any("reconnecting instead" in line for line in demoted.logged)
+            and connected.signins == [] and connected.state == tray.CONNECTED,
+            f"demoted={demoted.signins} connected={connected.signins}"
+            f" state={connected.state!r}")
 
 
 def check_log_rotation(tray, r):

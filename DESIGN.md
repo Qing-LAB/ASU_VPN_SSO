@@ -174,43 +174,70 @@ never written to the log.
 
 ## The state machine
 
-Six states. The tray holds exactly one, and every transition happens on the GLib
-main loop — worker threads post through `GLib.idle_add` rather than assigning.
+Eight states, one table, one dispatcher. Everything that can happen — a user
+verb, a script-contract event, a watchdog verdict, a helper exit — is a
+**message**; `StateMachine.dispatch` looks the pair `(current state, message)`
+up in the `TRANSITIONS` table at the top of `asuvpn-tray` and runs that row's
+handler. Nothing else in the program assigns the state or the incident
+bookkeeping. Watchers, workers and log readers only *inject* messages
+(`dispatch` on the main loop, `post` from a thread) — the rule that replaced
+the scattered hand-written conditionals whose disagreements produced the
+worst bugs this project has had: a probe verdict stomping a user's
+Disconnect, a timer racing an exit callback into a false FAILED, an
+escalation skipping an untried free recovery.
+
+A pair the table does not list is **dropped, and the drop is logged**
+(`[tray] ignoring 'check' while disconnecting`) — silence was how late
+verdicts once got to act. Every transition happens on the GLib main loop.
 
 ```mermaid
 stateDiagram-v2
     [*] --> disconnected
     disconnected --> authenticating: connect
     failed --> authenticating: connect
-    authenticating --> connecting: cookie handed to the helper
+    authenticating --> connecting: sign-in ok, cookie to the helper
     authenticating --> failed: no saved password, keyring locked, sign-in failed
-    connecting --> connected: reason=connect
-    connected --> connecting: reason=attempt-reconnect
-    connecting --> connected: reason=reconnect
+    connecting --> connected: tunnel-up (reason=connect)
+    connected --> recovering: link-lost (reason=attempt-reconnect)
+    recovering --> connected: tunnel-up (reason=reconnect)
+    connected --> demoted: strikes(one source) ≥ health-strikes
+    demoted --> demoted: tunnel-up — adopt only, incident kept
+    demoted --> connected: the demoting source passes again
     connected --> disconnecting: disconnect, reconnect, quit
+    recovering --> disconnecting: disconnect, cancel, quit
+    demoted --> disconnecting: disconnect, reconnect, connect, quit
     authenticating --> disconnecting: cancel while a helper is alive
     connecting --> disconnecting: cancel
     disconnecting --> disconnected: helper exited
+    disconnecting --> authenticating: helper exited, intent reconnect
     disconnecting --> failed: helper did not exit in time
-    connected --> connecting: watchdog demotes (not carrying traffic)
-    connecting --> connected: the demoting source passes again
     connecting --> failed: openconnect exited
     connected --> failed: tunnel dropped
 ```
 
-One state wears a disguise: a tunnel the watchdog has **demoted** shows as
-`connecting` plus a flag (`health_demoted`) rather than as a seventh state.
-It is an established session that is not carrying traffic — so the menu
-offers Disconnect and Reconnect rather than Cancel, `disconnect` tears it
-down, and `connect` delegates to `reconnect`. Every rule that keys on that
-flag is a reminder that it wants to be a real state; the planned revision in
-[STATE-MACHINE-PLAN.md](STATE-MACHINE-PLAN.md) makes it one.
+`RECOVERING` (openconnect re-establishing its own session) and `DEMOTED`
+(established but not carrying traffic — the watchdog's verdict) used to hide
+inside `connecting` behind a flag; the flag's scattered readers were where
+the state bugs lived. Both display as "Connecting…" with their detail line,
+exactly as before, so nothing a user sees changed. A `DEMOTED` tunnel is
+still an established session: the menu offers Disconnect and Reconnect, and
+the table maps `connect` there to a reconnect rather than a silent refusal.
+(Making it a real state also surfaced a dead spot: the menu's own Reconnect
+on a demoted tunnel used to be silently refused by the busy-state test — the
+table row fixed what the flag had hidden.)
 
-Both state sources — the script contract and the log-matching fallback — reach
-`CONNECTED` and `CONNECTING` through `_announce_connected` and
-`_announce_link_lost` rather than setting state themselves. They had each built
-their own message, and the two had already drifted: one announced a recovery as
-a fresh connection, and neither said anything at all when the link dropped.
+The machine lives in `class StateMachine`, which `VpnTray` inherits. The
+split is deliberate: the machine declares the exact surface it needs from
+its host (the state fields, and stubs for `log`, `notify`, `_set_state`, the
+workers), and `asuvpn selftest` subclasses it with recorded side effects and
+drives the very table that ships — plus a check that every table row names a
+real handler.
+
+Both state sources — the script contract and the log-matching fallback — send
+the *same* `tunnel-up` / `link-lost` messages, so one set of rows serves both
+and the two can no longer drift apart (they had, once: one announced a
+recovery as a fresh connection and neither said anything when the link
+dropped).
 
 The wording distinguishes what a transition costs. *VPN connection lost* and
 *VPN reconnecting* are free — same session, no sign-in — while *VPN signing in
@@ -220,15 +247,18 @@ phrased as an action being taken on their behalf.
 `failed` is a real state, not an error path: it keeps the last useful sentence
 (`last_failure`) so the user is told *why*, and it shows the attention icon.
 
-Two rules that are easy to break and were both broken at some point:
+Two rules the table now makes structural rather than careful:
 
-- **Nothing may leave `disconnecting` except teardown finishing.** A late
-  `reconnect` event arriving mid-teardown used to flip the badge back to
-  `connected`, after which a clean user-requested disconnect was reported as
-  `connection dropped`.
-- **`reconnect` stays busy the whole way through.** It sets `disconnecting`
-  with `reconnect_pending`, so `asuvpn reconnect --wait` cannot mistake the
-  momentary gap for completion.
+- **Nothing leaves `disconnecting` except the helper's exit.** The state has
+  rows only for `helper-exited`, `teardown-finished`, `teardown-timeout` and
+  `quit`; a late event or verdict finds no row and is dropped with a log
+  line. (A late `reconnect` event once flipped the badge back to `connected`
+  mid-teardown, and a probe strike once handed a user's Disconnect to the
+  escalation ladder.)
+- **`reconnect` stays busy the whole way through.** The teardown carries
+  `intent = reconnect`, so the badge goes `disconnecting → authenticating`
+  with no momentary gap for `asuvpn reconnect --wait` to mistake for
+  completion.
 
 ## Where state comes from
 
@@ -247,7 +277,7 @@ environment. The mapping the helper applies:
 | --- | --- | --- |
 | `pre-init` | *(none)* | nothing — the tunnel is not configured yet |
 | `connect` | `connected` | **Connected — 10.x.x.x** |
-| `attempt-reconnect` | `connecting` | **Connecting… — link lost, retrying** |
+| `attempt-reconnect` | `recovering` | **Connecting… — link lost, retrying** |
 | `reconnect` | `connected` | **Connected — 10.x.x.x** (address may have changed) |
 | `disconnect` | *(deferred)* | left to the exit path, which knows whether you asked for it |
 
@@ -543,8 +573,9 @@ nudge held and for how long, the free option already spent, sign-in off, or
 sign-in waiting out its gap. A log that shows verdicts but not decisions reads
 as a hang, which is how the first live routes-lost break read.
 
-`force` never overrides teardown: a disconnect or quit already under way
-outranks the watchdog.
+Teardown always outranks the watchdog: `disconnecting` has no row for a
+verdict or for a reconnect, so nothing the ladder decides can interrupt a
+disconnect or quit already under way.
 
 Automatic sign-in is off unless asked for, via the menu or
 `asuvpn autoreconnect on` — both edit the `autoreconnect` line of
@@ -555,20 +586,20 @@ used the presence of a marker file; `install.sh` still deletes the leftover.)
 
 ### Two orderings that are load-bearing
 
-**The exit callback is queued before the event that releases teardown.** In
-`_tunnel_thread`'s `finally`, `GLib.idle_add(_on_tunnel_exit)` comes before
-`exited.set()`. Teardown wakes on that event and queues `_reconnect_now`; with
-the old order it could win the race, so `_on_tunnel_exit` would run *after* the
-reconnect had begun, find `reconnect_pending` already cleared and the state back
-at `AUTHENTICATING`, and report a perfectly healthy reconnect as a failure.
+**The exit message is posted before the event that releases teardown.** In
+`_tunnel_thread`'s `finally`, `post(helper-exited)` comes before
+`exited.set()`. The reconnect worker wakes on that event and posts
+`teardown-finished`; with the old order it could win the race, so the exit
+would be weighed *after* the reconnect had already begun, and a perfectly
+healthy recovery would be reported as a failure.
 
-**What the tunnel was is read before it is forgotten.** `_on_tunnel_exit`
-captures `was_connected` before `_reset_tunnel_state()`, because a tunnel the
-watchdog demoted is no longer in `CONNECTED` but certainly was one, and
+**What the tunnel was is read before it is forgotten.** The `helper-exited`
+row captures `was_connected` before `_reset_tunnel_state()`, because a
+DEMOTED tunnel is no longer in `CONNECTED` but certainly was one, and
 "connection dropped" explains its death better than an exit status does.
 
-There is exactly one `_reset_tunnel_state()`, called from `__init__`,
-`_start_tunnel` and `_on_tunnel_exit`. It was open-coded in three places and had
+There is exactly one `_reset_tunnel_state()`, called from `__init__`, the
+tunnel starter and the `helper-exited` row. It was open-coded in three places and had
 already diverged: the copy in `_start_tunnel` omitted `tunnel_dns`, so a new
 tunnel kept probing the *previous* one's resolver — an address with no reason to
 be reachable through it.
@@ -668,7 +699,7 @@ where it can be, checked by `asuvpn selftest`.
 
 ## How this is tested
 
-Three tiers in `asuvpn-selftest` (83 checks), plus the scenario sandbox in
+Three tiers in `asuvpn-selftest` (84 checks), plus the scenario sandbox in
 [tests/sandbox](tests/sandbox/README.md).
 
 The shaping constraint: **conventional unit tests would not have caught any of
@@ -741,6 +772,9 @@ breaking the code on purpose:
 | keep the old device's route families across a replacement | a replaced device forgets the old one's route families |
 | let a probe verdict act during teardown | a probe verdict arriving mid-teardown changes nothing |
 | let a probe exception escape its thread | an unusable probe target is inconclusive — and the harness records a crashed check as its own failure |
+| delete the demoted-connect row from the table | connect on a demoted tunnel means reconnect, and only there |
+| delete or repoint the mid-demotion event row | a reconnect event mid-demotion adopts the tunnel but not the badge |
+| point a table row at a handler that does not exist | every transition row names a real handler |
 
 The fallback-patterns row is the one that matters most: it is the check that
 would have caught the original `Connected as` failure, and the stand-in row
@@ -765,6 +799,15 @@ close. (This section used to restate the list, went stale against the ledger
 twice, and no longer tries.)
 
 ## Changing things
+
+**Adding a state or a transition.** States are the constants above `ICONS`;
+every message is an `MSG_*` constant; every behavior is a row in
+`TRANSITIONS` plus a `_tr_*` handler on `StateMachine`. A row without a
+handler fails the selftest's table check; a message arriving in a state with
+no row is dropped and logged, never guessed at. If the handler needs a new
+side effect from the host, add a raising stub to `StateMachine`'s declared
+surface and the real method to `VpnTray` — an incomplete host fails at the
+first call, not silently.
 
 **Adding or updating a log pattern.** They live in `CONNECTED_MESSAGES`,
 `RECONNECTING_MESSAGES` and `FAILURE_MESSAGES` in `asuvpn-tray`, as

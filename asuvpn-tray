@@ -114,10 +114,17 @@ IFF_UP = 0x1
 EXIT_WRONG_SERVER = 4
 EXIT_NOT_RUNNING = 3
 
+# The eight states. Every situation has exactly one name: RECOVERING
+# (openconnect is re-establishing its own session) and DEMOTED (established
+# but not carrying traffic — the watchdog's verdict) used to hide inside
+# CONNECTING behind a flag, and the flag's scattered readers were where the
+# state bugs lived.
 DISCONNECTED = "disconnected"
 AUTHENTICATING = "authenticating"
 CONNECTING = "connecting"
 CONNECTED = "connected"
+RECOVERING = "recovering"
+DEMOTED = "demoted"
 DISCONNECTING = "disconnecting"
 FAILED = "failed"
 
@@ -126,19 +133,94 @@ ICONS = {
     AUTHENTICATING: "network-vpn-acquiring-symbolic",
     CONNECTING: "network-vpn-acquiring-symbolic",
     CONNECTED: "network-vpn-symbolic",
+    RECOVERING: "network-vpn-acquiring-symbolic",
+    DEMOTED: "network-vpn-acquiring-symbolic",
     DISCONNECTING: "network-vpn-acquiring-symbolic",
     FAILED: "network-error-symbolic",
 }
 
-BUSY_STATES = (AUTHENTICATING, CONNECTING, DISCONNECTING)
+BUSY_STATES = (AUTHENTICATING, CONNECTING, RECOVERING, DEMOTED, DISCONNECTING)
 
+# RECOVERING and DEMOTED keep the wording users already know; the detail line
+# ("link lost, retrying" / "not carrying traffic — …") is what distinguishes
+# them, exactly as before they were real states.
 STATE_LABELS = {
     DISCONNECTED: "Disconnected",
     AUTHENTICATING: "Signing in…",
     CONNECTING: "Connecting…",
     CONNECTED: "Connected",
+    RECOVERING: "Connecting…",
+    DEMOTED: "Connecting…",
     DISCONNECTING: "Disconnecting…",
     FAILED: "Not connected",
+}
+
+# ---------------------------------------------------- the message vocabulary
+#
+# Everything that can happen is a message; the machine below is the only thing
+# that turns messages into state. Watchers, workers, log readers and user
+# verbs INJECT these — they never assign state themselves.
+MSG_CONNECT = "connect"                    # user: keep_log
+MSG_DISCONNECT = "disconnect"              # user
+MSG_RECONNECT = "reconnect"                # user or ladder: keep_log
+MSG_CANCEL = "cancel"                      # user
+MSG_QUIT = "quit"                          # user
+MSG_AUTH_OK = "auth-ok"                    # sign-in: host, cookie, fingerprint, attempt
+MSG_AUTH_FAILED = "auth-failed"            # sign-in: reason, attempt
+MSG_TUNNEL_UP = "tunnel-up"                # event/fallback: device, address, dns
+MSG_LINK_LOST = "link-lost"                # event/fallback
+MSG_DEVICE = "device-named"                # helper: device
+MSG_FATAL = "fatal"                        # helper: sentence
+MSG_WARNING = "warning"                    # helper: sentence
+MSG_PROBLEM = "problem"                    # failure-pattern scan: sentence
+MSG_CHECK = "check"                # watchdog: source, reason (None=ok), detail
+MSG_HELPER_EXITED = "helper-exited"        # reader thread: status, generation
+MSG_TEARDOWN_FINISHED = "teardown-finished"  # reconnect worker: old tunnel gone
+MSG_TEARDOWN_TIMEOUT = "teardown-timeout"    # any teardown worker: during
+
+ANY = "*"
+
+# The transition table: (state, message) -> handler. A pair not listed here
+# is dropped, and the drop is logged — silence was how verdicts landing
+# mid-teardown got to act. `asuvpn selftest` walks this table and drives the
+# load-bearing rows with real message sequences.
+TRANSITIONS = {
+    (DISCONNECTED, MSG_CONNECT): "start_signin",
+    (FAILED, MSG_CONNECT): "start_signin",
+    (DEMOTED, MSG_CONNECT): "connect_means_reconnect",
+    (DISCONNECTED, MSG_RECONNECT): "start_signin",
+    (FAILED, MSG_RECONNECT): "start_signin",
+    (CONNECTED, MSG_RECONNECT): "teardown_reconnect",
+    (DEMOTED, MSG_RECONNECT): "teardown_reconnect",
+    (DISCONNECTED, MSG_DISCONNECT): "already_disconnected",
+    (FAILED, MSG_DISCONNECT): "already_disconnected",
+    (AUTHENTICATING, MSG_DISCONNECT): "cancel_attempt",
+    (CONNECTING, MSG_DISCONNECT): "cancel_attempt",
+    (CONNECTED, MSG_DISCONNECT): "teardown_disconnect",
+    (RECOVERING, MSG_DISCONNECT): "teardown_disconnect",
+    (DEMOTED, MSG_DISCONNECT): "teardown_disconnect",
+    (AUTHENTICATING, MSG_CANCEL): "cancel_attempt",
+    (CONNECTING, MSG_CANCEL): "cancel_attempt",
+    (RECOVERING, MSG_CANCEL): "cancel_attempt",
+    (ANY, MSG_QUIT): "quit_everything",
+    (AUTHENTICATING, MSG_AUTH_OK): "start_tunnel",
+    (AUTHENTICATING, MSG_AUTH_FAILED): "signin_failed",
+    (CONNECTING, MSG_TUNNEL_UP): "tunnel_came_up",
+    (RECOVERING, MSG_TUNNEL_UP): "tunnel_came_up",
+    (CONNECTED, MSG_TUNNEL_UP): "refresh_address",
+    (DEMOTED, MSG_TUNNEL_UP): "adopt_only",
+    (CONNECTED, MSG_LINK_LOST): "link_lost",
+    (RECOVERING, MSG_LINK_LOST): "still_recovering",
+    (CONNECTED, MSG_CHECK): "weigh_check",
+    (RECOVERING, MSG_CHECK): "weigh_check",
+    (DEMOTED, MSG_CHECK): "weigh_check",
+    (ANY, MSG_DEVICE): "remember_device",
+    (ANY, MSG_FATAL): "remember_fatal",
+    (ANY, MSG_PROBLEM): "remember_problem",
+    (ANY, MSG_WARNING): "teardown_warning",
+    (ANY, MSG_HELPER_EXITED): "helper_exited",
+    (DISCONNECTING, MSG_TEARDOWN_FINISHED): "teardown_finished",
+    (DISCONNECTING, MSG_TEARDOWN_TIMEOUT): "teardown_timed_out",
 }
 
 # Taken from the message catalogue of the installed openconnect, not from
@@ -471,7 +553,582 @@ def probe_credentials(sso_path):
     }.get(answer[-1].strip(), CREDENTIALS_UNKNOWN)
 
 
-class VpnTray:
+class StateMachine:
+    """The applet's decision core: messages in, state out, nowhere else.
+
+    Separable from the GTK class on purpose — `asuvpn selftest` subclasses
+    this with stubbed side effects and drives the very table that ships. The
+    concrete class supplies the side effects: log, notify, _set_state,
+    _send_helper, _act_start_signin, _act_start_tunnel, autoreconnect_enabled,
+    and the teardown worker threads.
+    """
+
+    # What the machine reads and writes. Declared so the boundary is written
+    # down — and so the analysers hold every host to it.
+    state: str
+    detail: str
+    server: str
+    state_events: bool
+    quitting: bool
+    demoted_by: str | None
+    strikes: dict
+    nudge_spent: bool
+    failure_notified: bool
+    routes_seen: dict
+    tunnel_device: str | None
+    tunnel_ifindex: int | None
+    tunnel_address: str
+    tunnel_dns: str
+    tunnel_ever_connected: bool
+    last_failure: str | None
+    last_nudge: float
+    last_autoreconnect: float
+    helper_generation = 0
+    auth_generation = 0
+    helper_spoke = False
+    helper_proc: subprocess.Popen | None
+    probe_in_flight: bool
+    teardown_intent: str | None
+    reconnect_keep_log: bool
+
+    # The side effects the host must supply. Stubs, not annotations, so an
+    # incomplete host fails loudly at the first call.
+    def log(self, *_args, **_kwargs):
+        raise NotImplementedError
+
+    def notify(self, *_args, **_kwargs):
+        raise NotImplementedError
+
+    def _set_state(self, *_args, **_kwargs):
+        raise NotImplementedError
+
+    def _send_helper(self, *_args, **_kwargs):
+        raise NotImplementedError
+
+    def _act_start_signin(self, *_args, **_kwargs):
+        raise NotImplementedError
+
+    def _kill_auth(self, *_args, **_kwargs):
+        raise NotImplementedError
+
+    def _act_start_tunnel(self, *_args, **_kwargs):
+        raise NotImplementedError
+
+    def autoreconnect_enabled(self, *_args, **_kwargs):
+        raise NotImplementedError
+
+    def _disconnect_thread(self, *_args, **_kwargs):
+        raise NotImplementedError
+
+    def _reconnect_thread(self, *_args, **_kwargs):
+        raise NotImplementedError
+
+    def _cancel_tunnel_thread(self, *_args, **_kwargs):
+        raise NotImplementedError
+
+    def _quit_thread(self, *_args, **_kwargs):
+        raise NotImplementedError
+
+    # ------------------------------------------------------- state machine
+    #
+    # Messages in, state out — nowhere else. The user verbs, the sign-in
+    # worker, the helper's reader, the watchdog and the teardown workers all
+    # INJECT messages; the TRANSITIONS table at the top of the file decides
+    # what each message means in the current state; the `_tr_*` handlers and
+    # the `_act_*` actions they call are the only writers of `self.state`
+    # and the incident bookkeeping.
+
+    def dispatch(self, kind, **data):
+        """The one place messages become state. Main loop only.
+
+        A (state, message) pair the table does not list is dropped, and the
+        drop is logged — silence is how verdicts landing mid-teardown once
+        got to act on a tunnel the user was already closing.
+        """
+        name = TRANSITIONS.get((self.state, kind)) or TRANSITIONS.get((ANY, kind))
+        if name is None:
+            self.log(f"[tray] ignoring '{kind}' while {self.state}")
+            return False
+        getattr(self, f"_tr_{name}")(data)
+        return False  # idle-callback friendly: never re-queues
+
+    def post(self, kind, **data):
+        """Inject a message from a worker thread; it runs on the main loop."""
+        GLib.idle_add(lambda: bool(self.dispatch(kind, **data)))
+
+    # The user verbs are message injections, nothing more.
+
+    def connect(self, keep_log=False):
+        self.dispatch(MSG_CONNECT, keep_log=keep_log)
+
+    def disconnect(self):
+        self.dispatch(MSG_DISCONNECT)
+
+    def reconnect(self, keep_log=False):
+        self.dispatch(MSG_RECONNECT, keep_log=keep_log)
+
+    def cancel(self):
+        self.dispatch(MSG_CANCEL)
+
+    def quit(self):
+        self.dispatch(MSG_QUIT)
+
+    # -- rows: user verbs
+
+    def _tr_start_signin(self, data):
+        self._act_start_signin(keep_log=data.get("keep_log", False))
+
+    def _tr_connect_means_reconnect(self, _data):
+        # The menu offers Reconnect on a demoted tunnel, and the CLI verb
+        # means the same intent — "get me connected" — which for a tunnel
+        # that is up but carrying nothing is a teardown and a fresh sign-in.
+        # Refusing silently read as "cannot connect" against exactly this
+        # state on a live break.
+        self.log("[tray] connect asked for while the tunnel is demoted;"
+                 " reconnecting instead")
+        self._tr_teardown_reconnect({"keep_log": False})
+
+    def _tr_already_disconnected(self, _data):
+        self._set_state(DISCONNECTED)
+
+    def _tr_teardown_disconnect(self, _data):
+        if self.helper_proc is None or self.helper_proc.poll() is not None:
+            self._set_state(DISCONNECTED)
+            return
+        self.teardown_intent = "disconnect"
+        self._set_state(DISCONNECTING)
+        self.log("[tray] disconnecting")
+        threading.Thread(target=self._disconnect_thread, daemon=True).start()
+
+    def _tr_teardown_reconnect(self, data):
+        keep = data.get("keep_log", False)
+        if self.helper_proc is None or self.helper_proc.poll() is not None:
+            # Nothing to tear down. The bump retires the dead helper's
+            # still-queued exit message: the health timer can run before
+            # queued idles, and without it that message would paint FAILED
+            # over the sign-in this line starts.
+            self.helper_generation += 1
+            self._reset_tunnel_state()
+            self._set_state(DISCONNECTED)
+            self._act_start_signin(keep_log=keep)
+            return
+        # Stay busy for the whole tear-down-then-connect sequence. Surfacing
+        # a momentary "disconnected" would make `asuvpn reconnect --wait`
+        # believe it had finished, and would flicker the panel icon.
+        self.teardown_intent = "reconnect"
+        self.reconnect_keep_log = keep
+        self._set_state(DISCONNECTING, "reconnecting")
+        self.log("[tray] reconnecting")
+        threading.Thread(target=self._reconnect_thread, daemon=True).start()
+
+    def _tr_cancel_attempt(self, _data):
+        self.auth_generation += 1  # invalidate any sign-in still in flight
+        self.log("[tray] cancelled by user")
+        self._kill_auth()
+        if self.helper_proc is not None and self.helper_proc.poll() is None:
+            # A tunnel may already be coming up, so report it as still
+            # closing rather than claiming to be disconnected while
+            # openconnect lives.
+            self.teardown_intent = "cancel"
+            self._set_state(DISCONNECTING)
+            threading.Thread(target=self._cancel_tunnel_thread,
+                             daemon=True).start()
+            return
+        self._set_state(DISCONNECTED)
+
+    def _tr_quit_everything(self, _data):
+        if self.quitting:
+            return  # a second Quit must not start a second teardown
+        self.quitting = True
+        # Whichever branch we take, an in-flight sign-in has to die with us
+        # or it outlives the tray as an orphan with a browser window.
+        self.auth_generation += 1
+        self._kill_auth()
+        if self.helper_proc is not None and self.helper_proc.poll() is None:
+            self.teardown_intent = "quit"
+            self._set_state(DISCONNECTING)
+            self.log("[tray] quitting, closing the tunnel first")
+            threading.Thread(target=self._quit_thread, daemon=True).start()
+        else:
+            Gtk.main_quit()
+
+    # -- rows: sign-in results
+
+    def _tr_start_tunnel(self, data):
+        if data["attempt"] != self.auth_generation:
+            # Cancelled or superseded while the sign-in was finishing. Going
+            # ahead would raise a root password prompt for a connection
+            # nobody is waiting for any more.
+            self.log("[tray] sign-in finished too late to be used; not connecting")
+            return
+        self._act_start_tunnel(data["host"], data["cookie"], data["fingerprint"])
+
+    def _tr_signin_failed(self, data):
+        if data["attempt"] != self.auth_generation:
+            return
+        message = data["reason"]
+        self.log(f"[tray] {message}")
+        self._set_state(FAILED, message)
+        self.notify("Sign-in failed", message)
+
+    # -- rows: what the tunnel reports
+
+    def _tr_tunnel_came_up(self, data):
+        self._adopt_tunnel(data["device"], data["address"], data["dns"])
+        self._announce_connected(data["address"])
+
+    def _tr_refresh_address(self, data):
+        self._adopt_tunnel(data["device"], data["address"], data["dns"])
+        address = data["address"]
+        if address and self.detail != address:
+            self._set_state(CONNECTED, address)
+
+    def _tr_adopt_only(self, data):
+        # A reconnect landed mid-demotion: adopt the tunnel — address,
+        # device, resolver — but the promotion belongs to the source that
+        # demoted. Taking openconnect's word here flapped the badge every
+        # two minutes against a tunnel whose routes were gone.
+        self._adopt_tunnel(data["device"], data["address"], data["dns"])
+
+    def _tr_link_lost(self, _data):
+        self._announce_link_lost("link lost, retrying")
+
+    def _tr_still_recovering(self, _data):
+        # openconnect retries emit attempt-reconnect on every attempt; one
+        # announcement was made on the first, and a line per retry would spam
+        # both the log and the ignore-trail during a long outage.
+        return
+
+    def _tr_remember_device(self, data):
+        # Validated on the way in as well as on the way out: this is about
+        # to be interpolated into a path under /sys, and "it was checked at
+        # the other end" is not a property this side can verify.
+        device = data["device"]
+        self.tunnel_device = device if C.INTERFACE_RE.match(device) else None
+
+    def _tr_remember_fatal(self, data):
+        # The helper stopped before openconnect was started at all, so its
+        # own sentence explains the exit status far better than the number.
+        self.last_failure = data["sentence"]
+
+    def _tr_remember_problem(self, data):
+        self.last_failure = data["sentence"]
+
+    def _tr_teardown_warning(self, data):
+        # Anything suggesting the network did not come back.
+        self.notify("VPN teardown warning", data["sentence"],
+                    icon="dialog-warning-symbolic")
+
+    # -- rows: the watchdog's verdicts
+
+    def _tr_weigh_check(self, data):
+        source, reason, detail = data["source"], data["reason"], data["detail"]
+        if reason is None:
+            self._check_clear(source, detail)
+            return
+        if self.state == RECOVERING:
+            # openconnect owns its own recovery; the watchdog stands aside.
+            return
+        self._check_strike(source, reason, detail)
+
+    def _check_clear(self, source, detail):
+        """One source reports clear. Only the demoting source promotes.
+
+        Sources are tracked separately on purpose: a probe failure leaves
+        the device and its routes perfectly intact, so letting the device
+        check promote the badge back would flap it every twenty seconds
+        against a tunnel that is genuinely carrying nothing.
+        """
+        if self.strikes[source]:
+            self.log(f"[tray] tunnel {source} check clear again ({detail})")
+        self.strikes[source] = 0
+        if self.state == DEMOTED and self.demoted_by == source:
+            self.demoted_by = None
+            self.nudge_spent = False
+            self.failure_notified = False
+            self._set_state(CONNECTED, self.tunnel_address)
+            self.notify("VPN carrying traffic again", self.server)
+
+    def _check_strike(self, source, reason, detail):
+        strikes = max(1, SETTINGS["health-strikes"])
+        self.strikes[source] += 1
+        self.log(f"[tray] tunnel {source} check {self.strikes[source]}"
+                 f"/{strikes}: {reason} ({detail})")
+        if self.strikes[source] >= strikes:
+            self.demoted_by = source
+            self._act_ladder(reason)
+
+    # -- rows: teardown outcomes
+
+    def _tr_helper_exited(self, data):
+        status, generation = data["status"], data["generation"]
+        if generation != self.helper_generation:
+            # An older tunnel finished dying after a new one took over.
+            # Saying anything more would drop the handle on the live one.
+            self.log(f"[tray] a previous tunnel closed (status {status})")
+            return
+        self.helper_proc = None
+        # Read before the reset wipes it: a DEMOTED tunnel is no longer
+        # CONNECTED but certainly was one, and "connection dropped" explains
+        # its death far better than a bare exit status does.
+        was_connected = (self.state in (CONNECTED, RECOVERING, DEMOTED)
+                         or self.tunnel_ever_connected)
+        intent = self.teardown_intent
+        self._reset_tunnel_state()
+        if intent == "reconnect":
+            # _tr_teardown_finished takes it from here; stay busy until then.
+            self.log("[tray] tunnel closed, signing in again")
+            return
+        self.teardown_intent = None
+        if intent == "cancel":
+            self._set_state(DISCONNECTED)
+            return
+        if intent in ("disconnect", "quit") or self.state in (DISCONNECTING,
+                                                              DISCONNECTED):
+            self._set_state(DISCONNECTED)
+            self.log("[tray] disconnected")
+            self.notify("VPN disconnected", self.server)
+            return
+        if status is None:
+            status = -1  # the reader thread died before it could reap
+        # 126/127 are pkexec's own codes for "dismissed" and "not permitted",
+        # but openconnect can return them too. Only read them that way if the
+        # helper never got far enough to say anything.
+        if status == 126 and not self.helper_spoke:
+            message = "authorization cancelled"
+        elif status == 127 and not self.helper_spoke:
+            message = "not authorized to run the helper"
+        elif self.last_failure:
+            message = self.last_failure
+        elif was_connected:
+            message = "connection dropped"
+        else:
+            message = f"openconnect exited with status {status}"
+        self._set_state(FAILED, message)
+        self.log(f"[tray] {message}")
+        self.notify("VPN disconnected", message)
+
+    def _tr_teardown_finished(self, _data):
+        keep = self.reconnect_keep_log
+        self.reconnect_keep_log = False
+        self.teardown_intent = None
+        self.helper_proc = None
+        self._set_state(DISCONNECTED)
+        self._act_start_signin(keep_log=keep)
+
+    def _tr_teardown_timed_out(self, data):
+        self.teardown_intent = None
+        if data["during"] == "reconnect":
+            # Carrying on would null out our only handle on a live root
+            # tunnel and then start a second one beside it.
+            self.reconnect_keep_log = False
+            self._set_state(FAILED, "old tunnel would not close; not reconnecting")
+            self.log("[tray] reconnect abandoned: the previous tunnel is still up")
+            return
+        self._set_state(FAILED, "helper did not exit — the tunnel may still be up")
+        self.notify(
+            "VPN teardown warning",
+            "The helper did not exit. Check 'asuvpn log'.",
+            icon="dialog-warning-symbolic",
+        )
+
+    def _act_ladder(self, reason):
+        """Escalate, cheapest first.
+
+        The two recoveries cost wildly different amounts, so they are not
+        interchangeable. Asking openconnect to re-establish reuses the session
+        cookie: no sign-in, no Duo push, no polkit prompt, and the user need not
+        even be at the keyboard. A tray-level reconnect throws the session away
+        and starts again from the browser, which means a Duo approval and typing
+        a password into a polkit dialog. So the free one is always tried first,
+        and the expensive one only when it was asked for.
+        """
+        # Notified once per incident, not once per check: this is reached
+        # repeatedly while the tunnel stays broken, and a desktop notification
+        # every forty seconds is its own fault.
+        first = self.state != DEMOTED
+        self.log(f"[tray] the tunnel is not usable: {reason}")
+        self.strikes = {"device": 0, "probe": 0}
+        self._set_state(DEMOTED, f"not carrying traffic — {reason}")
+
+        now = time.monotonic()
+        # One nudge per incident. An incident no longer ends at the reconnect
+        # event the nudge produces (see _adopt_tunnel), so "already nudged and
+        # still demoted" is the evidence the nudge did not fix this — asking
+        # again looped at the rate limit forever against a routes-lost break,
+        # while the sign-in branch below was never reached. The timestamp still
+        # guards incidents arriving back to back.
+        if (not self.nudge_spent
+                and now - self.last_nudge >= SETTINGS["nudge-min-gap"]
+                and self._send_helper(C.CONTROL_RECONNECT)):
+            self.nudge_spent = True
+            self.last_nudge = now
+            self.log("[tray] asked openconnect to re-establish"
+                     " (same session, no sign-in needed)")
+            if first:
+                self.notify("VPN reconnecting", reason)
+            return
+
+        # The nudge was not sent. Said once per incident, at the moment that
+        # becomes true — which may be cycles after the demotion, when a nudge
+        # that looked promising did not stick.
+        if not self.failure_notified:
+            self.failure_notified = True
+            self.notify("VPN not carrying traffic", reason,
+                        icon="dialog-warning-symbolic")
+
+        # From here on, every path logs the decision it took and why. A log
+        # that shows verdicts but no decisions reads as a hang: on 2026-08-23
+        # the cycles after a spent nudge logged their strikes and then went
+        # quiet, and what the watchdog was waiting for was anyone's guess.
+        if self.nudge_spent:
+            self.log("[tray] the free re-establish was already tried for this"
+                     " incident and traffic did not return")
+        elif now - self.last_nudge < SETTINGS["nudge-min-gap"]:
+            # Held, not spent: the free option has not been tried for this
+            # incident. Falling through here once bought with a Duo push what
+            # waiting under two minutes would have gotten for free — so wait;
+            # a later cycle lands past the gap and nudges.
+            wait = int(SETTINGS["nudge-min-gap"] - (now - self.last_nudge))
+            self.log(f"[tray] holding the free re-establish for another {wait}s"
+                     " (nudge-min-gap)")
+            return
+        else:
+            self.log("[tray] could not ask openconnect to re-establish;"
+                     " the helper is not listening")
+
+        # The free option is spent, or there is no one to ask: only now may
+        # the expensive path be considered.
+        if not self.autoreconnect_enabled():
+            self.log("[tray] automatic sign-in is off; staying demoted until a"
+                     " check clears — Reconnect or Disconnect when ready")
+            return
+        remaining = SETTINGS["autoreconnect-min-gap"] - (now - self.last_autoreconnect)
+        if remaining > 0:
+            self.log(f"[tray] automatic sign-in allowed again in"
+                     f" {int(remaining)}s (autoreconnect-min-gap)")
+            return
+        self.last_autoreconnect = now
+        self.log("[tray] signing in again to rebuild the tunnel")
+        # Announced, because it is about to raise a Duo push and a password
+        # dialog and the user should know what asked for them.
+        self.notify("VPN signing in again",
+                    "the tunnel could not be recovered without it")
+        self._tr_teardown_reconnect({"keep_log": True})
+
+    def _announce_connected(self, address):
+        """The single place a tunnel becomes usable, whichever source said so.
+
+        Both the script contract and the log-matching fallback land here, so the
+        badge, the wording and the notification cannot drift apart between them
+        — which they had, each building its own message.
+        """
+        first = not self.tunnel_ever_connected
+        self.tunnel_ever_connected = True
+        # Reaching CONNECTED clears any earlier failure line; otherwise a blip
+        # openconnect recovered from would be reported as the cause when the
+        # tunnel eventually drops, hours later.
+        self.last_failure = None
+        self._set_state(CONNECTED, address)
+        where = f"{self.server} — {address}".strip(" —")
+        self.notify("VPN connected" if first else "VPN reconnected", where)
+
+    def _announce_link_lost(self, detail):
+        """openconnect has lost the link and is re-establishing it itself.
+
+        Worth saying out loud. Nothing else tells the user, a badge changing to
+        a spinner is easy to miss, and the reassuring half — that this costs no
+        sign-in and no password — is not something a spinner can convey.
+        """
+        self._set_state(RECOVERING, detail)
+        self.notify("VPN connection lost",
+                    f"{self.server} — reconnecting, no sign-in needed",
+                    icon="dialog-warning-symbolic")
+
+    def _apply_state_event(self, payload):
+        """Translate a script-contract event into a message; decide nothing.
+
+        The wire words are REASON_STATES' values. This used to act on state
+        directly, carrying its own private copy of the teardown guard — the
+        transition table owns every such decision now, so this watcher only
+        reports what it saw.
+        """
+        state, fields = parse_state_payload(payload)
+        if state not in ("connected", "connecting", "disconnected"):
+            return
+        self.state_events = True  # the log-matching fallback is now redundant
+        if state == "connected":
+            self.dispatch(MSG_TUNNEL_UP,
+                          device=fields.get("dev") or self.tunnel_device,
+                          address=fields.get("addr", ""),
+                          dns=fields.get("dns", ""))
+        elif state == "connecting":
+            self.dispatch(MSG_LINK_LOST)
+        # A "disconnected" event is deliberately not a message: the exit path
+        # already distinguishes a requested teardown from a dropped tunnel.
+
+    def _adopt_tunnel(self, device, address, dns=""):
+        """Record what the watchdog should be watching, once it is up."""
+        self.tunnel_address = address
+        # The probe target, taken from what this tunnel says to resolve
+        # against. Nothing is hardcoded: a VPN that pushes no resolver simply
+        # gets the device checks, which need no target at all.
+        if dns:
+            self.tunnel_dns = dns
+        if self.state != DEMOTED:
+            # A fresh adoption starts with a clean slate. One arriving *during*
+            # a demotion is the reconnect a nudge produced, and openconnect
+            # asserting "connected" is exactly what it asserted before the
+            # watchdog found otherwise — so the slate stays dirty until the
+            # demoting source itself passes (_check_clear does the promoting).
+            # Clearing it here let a reconnect that fixed nothing restart the
+            # incident every two minutes: badge flap, repeated notifications,
+            # and an escalation that could never be reached.
+            self.strikes = {"device": 0, "probe": 0}
+            self.demoted_by = None
+            self.nudge_spent = False
+            self.failure_notified = False
+            self.routes_seen = {"routes4": False, "routes6": False}
+        if not device or not C.INTERFACE_RE.match(device):
+            return
+        self.tunnel_device = device
+        # Taken now, while openconnect has just created it.
+        index = read_ifindex(device)
+        if index is not None and index != self.tunnel_ifindex:
+            # A different incarnation of the device. Which route families the
+            # old one carried says nothing about this one, and a stale latch
+            # here would hold a demotion forever against a working tunnel
+            # whose new session simply has no routes of that family.
+            self.routes_seen = {"routes4": False, "routes6": False}
+        self.tunnel_ifindex = index
+
+    def _reset_tunnel_state(self):
+        """Forget everything the watchdog knows about a tunnel.
+
+        One place, because this was open-coded in three and they had already
+        diverged: the copy in the tunnel starter omitted tunnel_dns, so a new tunnel
+        kept probing the *previous* one's resolver until an event replaced it —
+        and if no event ever arrived, indefinitely, against an address that need
+        not be reachable through the new tunnel at all.
+
+        The rate-limit timestamps are deliberately not reset here. Every
+        automatic recovery passes through this, so clearing them would clear the
+        limits that stop recovery becoming a loop.
+        """
+        self.tunnel_device = None
+        self.tunnel_ifindex = None
+        self.tunnel_address = ""
+        self.tunnel_dns = ""
+        self.tunnel_ever_connected = False
+        self.strikes = {"device": 0, "probe": 0}
+        self.demoted_by = None
+        self.nudge_spent = False
+        self.failure_notified = False
+        self.routes_seen = {"routes4": False, "routes6": False}
+
+
+
+class VpnTray(StateMachine):
     def __init__(self, server, extra_openconnect_args):
         self.server = server
         self.extra_args = extra_openconnect_args
@@ -488,9 +1145,9 @@ class VpnTray:
         # must not be able to report exit over the top of its replacement, which
         # would drop the tray's only handle on a live root openconnect.
         self.helper_generation = 0
-        # Sign-ins get one too. `cancelled` alone is not enough: a new connect
-        # clears it, which would un-cancel a sign-in thread still in flight and
-        # let it start a tunnel on top of the new one.
+        # Sign-ins get one too: cancel, quit and every new connect bump it,
+        # so a sign-in still in flight can tell nobody wants it any more and
+        # cannot start a tunnel on top of a newer one.
         self.auth_generation = 0
         self.helper_spoke = False
         self.state_events = False
@@ -509,7 +1166,9 @@ class VpnTray:
         # exactly when a tunnel brought up at login is most likely to need one.
         self.last_nudge = float("-inf")
         self.last_autoreconnect = float("-inf")
-        self.reconnect_pending = False
+        # Why the current teardown is happening ("disconnect", "cancel",
+        # "reconnect", "quit"); the helper-exited rows read it.
+        self.teardown_intent = None
         self.reconnect_keep_log = False
         self.quitting = False
         self._log_bytes = 0
@@ -520,7 +1179,6 @@ class VpnTray:
         self.log_window = None
         self.log_buffer = None
         self.log_view = None
-        self.cancelled = False
 
         try:
             # 0700/0600: the log holds the address the VPN assigned, the routes
@@ -639,19 +1297,17 @@ class VpnTray:
         )
 
         self.connect_item.set_visible(self.state in (DISCONNECTED, FAILED))
-        # A tunnel the watchdog has demoted is still a tunnel: it has a helper
-        # and a device, and the two things a user wants at that moment are
-        # exactly Disconnect and Reconnect. Keying purely on CONNECTED hid both
-        # and offered Cancel instead, which is the wrong word for tearing down
-        # an established session.
-        established = self.state == CONNECTED or (
-            self.health_demoted and self.state == CONNECTING)
+        # A DEMOTED tunnel is still a tunnel: it has a helper and a device,
+        # and the two things a user wants at that moment are exactly
+        # Disconnect and Reconnect — Cancel is the wrong word for tearing
+        # down an established session.
+        established = self.state in (CONNECTED, DEMOTED)
         self.disconnect_item.set_visible(established)
         self.reconnect_item.set_visible(established)
         # Not while disconnecting: teardown must not be interrupted, and there
         # would be nothing left to cancel anyway.
         self.cancel_item.set_visible(
-            self.state in (AUTHENTICATING, CONNECTING) and not self.health_demoted)
+            self.state in (AUTHENTICATING, CONNECTING, RECOVERING))
 
     def _set_state(self, state, detail=""):
         self.state = state
@@ -800,29 +1456,15 @@ class VpnTray:
 
     # ------------------------------------------------------------- actions
 
-    def connect(self, keep_log=False):
+    def _act_start_signin(self, keep_log):
         """Sign in and bring the tunnel up.
 
-        `keep_log` exists for the watchdog. Truncating on connect is right when
-        a person asked for one — a fresh session, a fresh log. It is wrong when
-        the applet reconnected by itself, because the lines explaining *why* are
-        the only record of a breakage that was silent by definition, and
-        wiping them leaves the user with a mystery and a fresh log saying
-        nothing happened.
+        `keep_log` is the automatic-recovery flavor. Truncating on connect is
+        right when a person asked for one — a fresh session, a fresh log. It
+        is wrong when the applet reconnected by itself, because the lines
+        explaining *why* are the only record of a breakage that was silent by
+        definition.
         """
-        if self.health_demoted and self.state == CONNECTING:
-            # An established tunnel the watchdog demoted. The menu offers
-            # Reconnect here instead of Connect, and the CLI verb means the
-            # same intent — "get me connected" — which for a tunnel that is up
-            # but carrying nothing is a teardown and a fresh sign-in. Refusing
-            # silently, as a plain busy state does below, read as "cannot
-            # connect" against exactly this state on 2026-08-23.
-            self.log("[tray] connect asked for while the tunnel is demoted;"
-                     " reconnecting instead")
-            self.reconnect(force=True)
-            return
-        if self.state in BUSY_STATES or self.state == CONNECTED:
-            return
         sso = find_openconnect_sso()
         if not sso:
             self._set_state(FAILED, "openconnect-sso not found")
@@ -834,7 +1476,6 @@ class VpnTray:
             self.log(f"[tray] helper is missing or not executable: {HELPER}")
             return
 
-        self.cancelled = False
         if not keep_log:
             with self._log_lock:
                 # A fresh session starts a fresh log, but the previous
@@ -854,102 +1495,11 @@ class VpnTray:
             target=self._auth_thread, args=(sso, self.auth_generation), daemon=True
         ).start()
 
-    def disconnect(self):
-        # A disconnect arriving mid sign-in means "stop", and the browser window
-        # needs closing even though there is no tunnel yet.
-        if self.state == DISCONNECTING:
-            return  # already tearing down; a second pass races the first
-        # Any interrupted connect goes to cancel(), including one where pkexec is
-        # already up. cancel() terminates it, which dismisses the polkit dialog;
-        # merely closing its stdin does not, because pkexec never reads it — and
-        # that left the applet stuck in "Disconnecting…" with no way back.
-        # A CONNECTING the watchdog demoted is an established tunnel wearing a
-        # warning, not a connect in progress: cancelling it would take the
-        # "abandon the attempt" path for a session that really is up.
-        if self.state in (AUTHENTICATING, CONNECTING) and not self.health_demoted:
-            self.cancel()
-            return
-        if self.helper_proc is None or self.helper_proc.poll() is not None:
-            self._set_state(DISCONNECTED)
-            return
-        self._set_state(DISCONNECTING)
-        self.log("[tray] disconnecting")
-        threading.Thread(target=self._disconnect_thread, daemon=True).start()
-
-    def reconnect(self, force=False, keep_log=False):
-        # Teardown is never interrupted, force or not. `force` exists so the
-        # watchdog can act after demoting the badge out of CONNECTED — it would
-        # otherwise be refused by its own honesty, since CONNECTING is a busy
-        # state — but a disconnect or a quit already under way outranks it.
-        if self.state == DISCONNECTING:
-            return
-        if self.state in BUSY_STATES and not force:
-            return
-        if self.helper_proc is None or self.helper_proc.poll() is not None:
-            if force:
-                # The watchdog demoted the badge to a busy state to be honest
-                # about the tunnel, and connect() refuses from a busy state.
-                # Without this the escalation reaches here and silently does
-                # nothing — in the one case, a helper already dead, where
-                # signing in again is the only thing left that could work.
-                #
-                # The bump retires the dead helper's still-queued exit
-                # callback. The health timer can run before queued idles, so
-                # without it that callback lands mid-sign-in, finds a state it
-                # does not expect, and paints FAILED with a "disconnected"
-                # notification over a recovery that is going fine.
-                self.helper_generation += 1
-                self._reset_tunnel_state()
-                self._set_state(DISCONNECTED)
-            self.connect(keep_log=keep_log)
-            return
-        # Stay busy for the whole tear-down-then-connect sequence. Surfacing a
-        # momentary "disconnected" would make `asuvpn reconnect --wait` believe
-        # it had finished, and would flicker the panel icon.
-        self.reconnect_pending = True
-        # Read back by _reconnect_now, which GLib calls with no arguments.
-        self.reconnect_keep_log = keep_log
-        self._set_state(DISCONNECTING, "reconnecting")
-        self.log("[tray] reconnecting")
-        threading.Thread(target=self._reconnect_thread, daemon=True).start()
-
     def _reconnect_thread(self):
         if not self._teardown_helper():
-            # Carrying on would null out our only handle on a live root tunnel
-            # and then start a second one beside it.
-            GLib.idle_add(self._reconnect_abandoned)
+            self.post(MSG_TEARDOWN_TIMEOUT, during="reconnect")
             return
-        GLib.idle_add(self._reconnect_now)
-
-    def _reconnect_abandoned(self):
-        self.reconnect_pending = False
-        self._set_state(FAILED, "old tunnel would not close; not reconnecting")
-        self.log("[tray] reconnect abandoned: the previous tunnel is still up")
-        return False
-
-    def _reconnect_now(self):
-        self.reconnect_pending = False
-        keep = self.reconnect_keep_log
-        self.reconnect_keep_log = False
-        self.helper_proc = None
-        self._set_state(DISCONNECTED)
-        self.connect(keep_log=keep)
-        return False
-
-    def cancel(self):
-        if self.state == DISCONNECTING:
-            return
-        self.cancelled = True
-        self.auth_generation += 1  # invalidate any sign-in still in flight
-        self.log("[tray] cancelled by user")
-        self._kill_auth()
-        if self.helper_proc is not None and self.helper_proc.poll() is None:
-            # A tunnel may already be coming up, so report it as still closing
-            # rather than claiming to be disconnected while openconnect lives.
-            self._set_state(DISCONNECTING)
-            threading.Thread(target=self._cancel_tunnel_thread, daemon=True).start()
-            return
-        self._set_state(DISCONNECTED)
+        self.post(MSG_TEARDOWN_FINISHED)
 
     def _cancel_tunnel_thread(self):
         proc = self.helper_proc
@@ -963,22 +1513,7 @@ class VpnTray:
         except (ProcessLookupError, PermissionError, OSError):
             pass
         if not self._teardown_helper():
-            GLib.idle_add(self._teardown_failed)
-
-    def quit(self):
-        if self.quitting:
-            return  # a second Quit must not start a second teardown
-        self.quitting = True
-        # Whichever branch we take, an in-flight sign-in has to die with us or
-        # it outlives the tray as an orphan with a browser window.
-        self.auth_generation += 1
-        self._kill_auth()
-        if self.helper_proc is not None and self.helper_proc.poll() is None:
-            self._set_state(DISCONNECTING)
-            self.log("[tray] quitting, closing the tunnel first")
-            threading.Thread(target=self._quit_thread, daemon=True).start()
-        else:
-            Gtk.main_quit()
+            self.post(MSG_TEARDOWN_TIMEOUT, during="cancel")
 
     def _kill_auth(self):
         """Stop the sign-in subprocess, reading the handle exactly once."""
@@ -1014,7 +1549,9 @@ class VpnTray:
 
     def _auth_thread(self, sso, attempt):
         def superseded():
-            return self.cancelled or attempt != self.auth_generation
+            # The generation is bumped by cancel, quit and every new connect,
+            # so it alone says whether anyone still wants this sign-in.
+            return attempt != self.auth_generation
 
         credentials = probe_credentials(sso)
 
@@ -1032,7 +1569,7 @@ class VpnTray:
             CREDENTIALS_LOCKED: "keyring did not answer — unlock it and try again",
         }.get(credentials)
         if blocked:
-            GLib.idle_add(self._auth_failed, blocked)
+            self.post(MSG_AUTH_FAILED, reason=blocked, attempt=attempt)
             return
         if credentials == CREDENTIALS_NONE:
             self.log("[tray] no saved username; the browser will ask for everything")
@@ -1058,7 +1595,9 @@ class VpnTray:
                 start_new_session=True,
             )
         except OSError as exc:
-            GLib.idle_add(self._auth_failed, f"could not start openconnect-sso: {exc}")
+            self.post(MSG_AUTH_FAILED,
+                      reason=f"could not start openconnect-sso: {exc}",
+                      attempt=attempt)
             return
 
         # Publish it only after a re-check, so a cancel that landed during the
@@ -1110,7 +1649,9 @@ class VpnTray:
         if superseded():
             return
         if returncode != 0:
-            GLib.idle_add(self._auth_failed, f"sign-in failed (exit {returncode})")
+            self.post(MSG_AUTH_FAILED,
+                      reason=f"sign-in failed (exit {returncode})",
+                      attempt=attempt)
             return
 
         details = {}
@@ -1127,39 +1668,23 @@ class VpnTray:
             details[key.strip().upper()] = value
 
         if not {"HOST", "COOKIE", "FINGERPRINT"} <= details.keys():
-            GLib.idle_add(self._auth_failed, "sign-in returned no session")
+            self.post(MSG_AUTH_FAILED, reason="sign-in returned no session",
+                      attempt=attempt)
             return
 
-        GLib.idle_add(
-            self._start_tunnel,
-            details["HOST"],
-            details["COOKIE"],
-            details["FINGERPRINT"],
-            attempt,
-        )
-
-    def _auth_failed(self, message):
-        self.log(f"[tray] {message}")
-        self._set_state(FAILED, message)
-        self.notify("Sign-in failed", message)
-        return False
+        self.post(MSG_AUTH_OK, host=details["HOST"], cookie=details["COOKIE"],
+                  fingerprint=details["FINGERPRINT"], attempt=attempt)
 
     # ----------------------------------------------------- phase 2: tunnel
 
-    def _start_tunnel(self, host, cookie, fingerprint, attempt):
-        if self.cancelled or attempt != self.auth_generation:
-            # Cancelled or superseded while the sign-in was finishing. Going
-            # ahead would raise a root password prompt for a connection nobody
-            # is waiting for any more.
-            self.log("[tray] sign-in finished too late to be used; not connecting")
-            return False
+    def _act_start_tunnel(self, host, cookie, fingerprint):
         if self.helper_proc is not None and self.helper_proc.poll() is None:
             # Overwriting helper_proc here would lose the only handle on a live
             # root openconnect, leaving it running with nothing able to stop it.
             # Say so in the UI: returning quietly strands us in "Signing in…".
             self._set_state(FAILED, "a tunnel is already running")
             self.log("[tray] a tunnel is already running; not starting a second")
-            return False
+            return
         self._set_state(CONNECTING, "authorizing")
         self.log(f"[tray] signed in, starting openconnect for {host}")
         command = [
@@ -1207,7 +1732,7 @@ class VpnTray:
             exited.set()
             self._set_state(FAILED, f"could not run pkexec: {exc}")
             self.log(f"[tray] {exc}")
-            return False
+            return
 
         # Published as a pair, under the same lock _teardown_helper reads them
         # with. Assigning the event before the process meant a teardown running
@@ -1229,7 +1754,6 @@ class VpnTray:
             args=(proc, generation, exited),
             daemon=True,
         ).start()
-        return False
 
     def _tunnel_thread(self, proc, generation, exited):
         # try/finally around the whole body: if this thread dies without setting
@@ -1247,110 +1771,16 @@ class VpnTray:
             except OSError:
                 returncode = -1
         finally:
-            # Queued *before* the event is set, and the order matters. Teardown
-            # wakes on `exited` and queues _reconnect_now; if that beat this
-            # callback into the idle queue, _on_tunnel_exit would run after the
-            # reconnect had already begun, find reconnect_pending cleared and
-            # the state back at AUTHENTICATING, and report the perfectly healthy
-            # reconnect as a failure. Setting the event last closes the window.
-            GLib.idle_add(self._on_tunnel_exit, returncode, generation)
+            # Posted *before* the event is set, and the order matters. The
+            # teardown worker wakes on `exited` and posts teardown-finished;
+            # if that beat this message into the idle queue, the exit would be
+            # weighed after the reconnect had already begun and a perfectly
+            # healthy recovery would be reported as a failure. Setting the
+            # event last closes the window.
+            self.post(MSG_HELPER_EXITED, status=returncode, generation=generation)
             exited.set()
 
-    def _apply_state_event(self, payload):
-        """Authoritative state, straight from openconnect's script contract."""
-        state, fields = parse_state_payload(payload)
-        if state not in (CONNECTED, CONNECTING, DISCONNECTED):
-            return
-        self.state_events = True  # the log-matching fallback is now redundant
-        # Teardown has already decided how this ends. openconnect can be midway
-        # through a recovery when the disconnect lands, and the `reconnect`
-        # event that follows would otherwise flip the badge back to Connected,
-        # fire a "VPN connected" notification, and leave _on_tunnel_exit seeing
-        # CONNECTED rather than DISCONNECTING -- reporting a clean, requested
-        # disconnect as "connection dropped". The fallback path never had this
-        # hole: it is guarded on `self.state in (CONNECTING, CONNECTED)`.
-        if self.quitting or self.cancelled or self.state == DISCONNECTING:
-            return
-        if state == CONNECTED:
-            address = fields.get("addr", "")
-            self._adopt_tunnel(fields.get("dev") or self.tunnel_device, address,
-                               fields.get("dns", ""))
-            if self.health_demoted:
-                # A reconnect landed mid-demotion: the address and device are
-                # adopted above, but the promotion belongs to the source that
-                # demoted. Taking openconnect's word here flapped the badge
-                # every two minutes against a tunnel whose routes were gone.
-                return
-            if self.state != CONNECTED:
-                self._announce_connected(address)
-            elif address and self.detail != address:
-                self._set_state(CONNECTED, address)
-        elif state == CONNECTING and self.state == CONNECTED:
-            self._announce_link_lost("link lost, retrying")
-        # A disconnect event is left to _on_tunnel_exit, which already
-        # distinguishes a requested teardown from a dropped tunnel.
-
     # ------------------------------------------------------------- watchdog
-
-    def _adopt_tunnel(self, device, address, dns=""):
-        """Record what the watchdog should be watching, once it is up."""
-        self.tunnel_address = address
-        # The probe target, taken from what this tunnel says to resolve
-        # against. Nothing is hardcoded: a VPN that pushes no resolver simply
-        # gets the device checks, which need no target at all.
-        if dns:
-            self.tunnel_dns = dns
-        if not self.health_demoted:
-            # A fresh adoption starts with a clean slate. One arriving *during*
-            # a demotion is the reconnect a nudge produced, and openconnect
-            # asserting "connected" is exactly what it asserted before the
-            # watchdog found otherwise — so the slate stays dirty until the
-            # demoting source itself passes (_healthy does the promoting).
-            # Clearing it here let a reconnect that fixed nothing restart the
-            # incident every two minutes: badge flap, repeated notifications,
-            # and an escalation that could never be reached.
-            self.strikes = {"device": 0, "probe": 0}
-            self.demoted_by = None
-            self.nudge_spent = False
-            self.failure_notified = False
-            self.routes_seen = {"routes4": False, "routes6": False}
-        if not device or not C.INTERFACE_RE.match(device):
-            return
-        self.tunnel_device: str | None = device
-        # Taken now, while openconnect has just created it.
-        index = read_ifindex(device)
-        if index is not None and index != self.tunnel_ifindex:
-            # A different incarnation of the device. Which route families the
-            # old one carried says nothing about this one, and a stale latch
-            # here would hold a demotion forever against a working tunnel
-            # whose new session simply has no routes of that family.
-            self.routes_seen = {"routes4": False, "routes6": False}
-        self.tunnel_ifindex: int | None = index
-
-    def _reset_tunnel_state(self):
-        """Forget everything the watchdog knows about a tunnel.
-
-        One place, because this was open-coded in three and they had already
-        diverged: the copy in _start_tunnel omitted tunnel_dns, so a new tunnel
-        kept probing the *previous* one's resolver until an event replaced it —
-        and if no event ever arrived, indefinitely, against an address that need
-        not be reachable through the new tunnel at all.
-
-        The rate-limit timestamps are deliberately not reset here. Every
-        automatic recovery passes through this, so clearing them would clear the
-        limits that stop recovery becoming a loop.
-        """
-        self.tunnel_device = None
-        self.tunnel_ifindex = None
-        self.tunnel_address = ""
-        self.tunnel_dns = ""
-        self.tunnel_ever_connected = False
-        self.strikes = {"device": 0, "probe": 0}
-        self.health_demoted: bool = False
-        self.demoted_by = None
-        self.nudge_spent = False
-        self.failure_notified = False
-        self.routes_seen = {"routes4": False, "routes6": False}
 
     def autoreconnect_enabled(self):
         return SETTINGS["autoreconnect"]
@@ -1406,7 +1836,8 @@ class VpnTray:
             return False  # this timer is replaced by the one just armed
         if SETTINGS["health-interval"] <= 0:
             return True  # watchdog off: keep reading the config, check nothing
-        if self.state not in (CONNECTED, CONNECTING) or self.helper_proc is None:
+        if (self.state not in (CONNECTED, RECOVERING, DEMOTED)
+                or self.helper_proc is None):
             return True
 
         reason, facts = tunnel_health(self.tunnel_device, self.tunnel_ifindex,
@@ -1417,13 +1848,11 @@ class VpnTray:
         for family in ("routes4", "routes6"):
             if facts.get(family):
                 self.routes_seen[family] = True
-        if reason is None:
-            self._healthy("device", self._facts(facts))
-        elif self.state == CONNECTED or self.health_demoted:
-            # A CONNECTING we did not cause is openconnect's own reconnect and
-            # it owns that; one we caused still has to be counted, or nothing
-            # would ever escalate past the first demotion.
-            self._unhealthy("device", reason, self._facts(facts))
+        # The verdict is a message like any other; the table weighs it
+        # (RECOVERING stands aside — openconnect owns its own retry).
+        self.dispatch(MSG_CHECK, source="device", reason=reason,
+                      detail=self._facts(facts))
+        if reason is not None and self.state in (CONNECTED, DEMOTED):
             return True  # no point probing a device that is already broken
 
         self.probe_cycle += 1
@@ -1456,49 +1885,18 @@ class VpnTray:
 
     def _probe_result(self, alive, detail, generation):
         self.probe_in_flight = False
-        if self.quitting or self.cancelled or generation != self.helper_generation:
+        if self.quitting or generation != self.helper_generation:
             return False  # a reply for a tunnel that is no longer the live one
-        if self.state == DISCONNECTING:
-            # Teardown has already decided how this ends — the same guard the
-            # event path has. A strike landing here once stomped a user's
-            # Disconnect back to CONNECTING and handed a requested teardown
-            # to the escalation ladder, which read it as a broken tunnel.
-            return False
         if alive is None:
             return False  # unreachable or unconfigured; the device check owns it
-        if alive:
-            self._healthy("probe", detail)
-        elif self.state == CONNECTED or self.health_demoted:
-            self._unhealthy("probe", "nothing answers through the tunnel", detail)
+        # A verdict, not an action: the table decides what it means — and in
+        # DISCONNECTING it means nothing, which is exactly the guard a strike
+        # needed the day it stomped a user's Disconnect.
+        self.dispatch(MSG_CHECK, source="probe",
+                      reason=None if alive else
+                      "nothing answers through the tunnel",
+                      detail=detail)
         return False
-
-    def _healthy(self, source, detail):
-        """One source reports clear. Only undo a demotion this source caused.
-
-        Sources are tracked separately on purpose. A probe failure leaves the
-        device and its routes perfectly intact, so letting the device check
-        promote the badge back would flap it every twenty seconds against a
-        tunnel that is genuinely carrying nothing.
-        """
-        if self.strikes[source]:
-            self.log(f"[tray] tunnel {source} check clear again ({detail})")
-        self.strikes[source] = 0
-        if self.demoted_by == source and self.state == CONNECTING:
-            self.demoted_by = None
-            self.health_demoted = False
-            self.nudge_spent = False
-            self.failure_notified = False
-            self._set_state(CONNECTED, self.tunnel_address)
-            self.notify("VPN carrying traffic again", self.server)
-
-    def _unhealthy(self, source, reason, detail):
-        strikes = max(1, SETTINGS["health-strikes"])
-        self.strikes[source] += 1
-        self.log(f"[tray] tunnel {source} check {self.strikes[source]}"
-                 f"/{strikes}: {reason} ({detail})")
-        if self.strikes[source] >= strikes:
-            self.demoted_by = source
-            self._tunnel_unhealthy(reason)
 
     @staticmethod
     def _facts(facts):
@@ -1510,120 +1908,6 @@ class VpnTray:
         """
         return ", ".join(f"{k}={v}" for k, v in facts.items()) or "no detail"
 
-    def _tunnel_unhealthy(self, reason):
-        """Escalate, cheapest first.
-
-        The two recoveries cost wildly different amounts, so they are not
-        interchangeable. Asking openconnect to re-establish reuses the session
-        cookie: no sign-in, no Duo push, no polkit prompt, and the user need not
-        even be at the keyboard. A tray-level reconnect throws the session away
-        and starts again from the browser, which means a Duo approval and typing
-        a password into a polkit dialog. So the free one is always tried first,
-        and the expensive one only when it was asked for.
-        """
-        # Notified once per incident, not once per check: this is reached
-        # repeatedly while the tunnel stays broken, and a desktop notification
-        # every forty seconds is its own fault.
-        first = not self.health_demoted
-        self.log(f"[tray] the tunnel is not usable: {reason}")
-        self.health_demoted = True
-        self.strikes = {"device": 0, "probe": 0}
-        self._set_state(CONNECTING, f"not carrying traffic — {reason}")
-
-        now = time.monotonic()
-        # One nudge per incident. An incident no longer ends at the reconnect
-        # event the nudge produces (see _adopt_tunnel), so "already nudged and
-        # still demoted" is the evidence the nudge did not fix this — asking
-        # again looped at the rate limit forever against a routes-lost break,
-        # while the sign-in branch below was never reached. The timestamp still
-        # guards incidents arriving back to back.
-        if (not self.nudge_spent
-                and now - self.last_nudge >= SETTINGS["nudge-min-gap"]
-                and self._send_helper(C.CONTROL_RECONNECT)):
-            self.nudge_spent = True
-            self.last_nudge = now
-            self.log("[tray] asked openconnect to re-establish"
-                     " (same session, no sign-in needed)")
-            if first:
-                self.notify("VPN reconnecting", reason)
-            return
-
-        # The nudge was not sent. Said once per incident, at the moment that
-        # becomes true — which may be cycles after the demotion, when a nudge
-        # that looked promising did not stick.
-        if not self.failure_notified:
-            self.failure_notified = True
-            self.notify("VPN not carrying traffic", reason,
-                        icon="dialog-warning-symbolic")
-
-        # From here on, every path logs the decision it took and why. A log
-        # that shows verdicts but no decisions reads as a hang: on 2026-08-23
-        # the cycles after a spent nudge logged their strikes and then went
-        # quiet, and what the watchdog was waiting for was anyone's guess.
-        if self.nudge_spent:
-            self.log("[tray] the free re-establish was already tried for this"
-                     " incident and traffic did not return")
-        elif now - self.last_nudge < SETTINGS["nudge-min-gap"]:
-            # Held, not spent: the free option has not been tried for this
-            # incident. Falling through here once bought with a Duo push what
-            # waiting under two minutes would have gotten for free — so wait;
-            # a later cycle lands past the gap and nudges.
-            wait = int(SETTINGS["nudge-min-gap"] - (now - self.last_nudge))
-            self.log(f"[tray] holding the free re-establish for another {wait}s"
-                     " (nudge-min-gap)")
-            return
-        else:
-            self.log("[tray] could not ask openconnect to re-establish;"
-                     " the helper is not listening")
-
-        # The free option is spent, or there is no one to ask: only now may
-        # the expensive path be considered.
-        if not self.autoreconnect_enabled():
-            self.log("[tray] automatic sign-in is off; staying demoted until a"
-                     " check clears — Reconnect or Disconnect when ready")
-            return
-        remaining = SETTINGS["autoreconnect-min-gap"] - (now - self.last_autoreconnect)
-        if remaining > 0:
-            self.log(f"[tray] automatic sign-in allowed again in"
-                     f" {int(remaining)}s (autoreconnect-min-gap)")
-            return
-        self.last_autoreconnect = now
-        self.log("[tray] signing in again to rebuild the tunnel")
-        # Announced, because it is about to raise a Duo push and a password
-        # dialog and the user should know what asked for them.
-        self.notify("VPN signing in again",
-                    "the tunnel could not be recovered without it")
-        self.reconnect(force=True, keep_log=True)
-
-    def _announce_connected(self, address):
-        """The single place a tunnel becomes usable, whichever source said so.
-
-        Both the script contract and the log-matching fallback land here, so the
-        badge, the wording and the notification cannot drift apart between them
-        — which they had, each building its own message.
-        """
-        first = not self.tunnel_ever_connected
-        self.tunnel_ever_connected = True
-        # Reaching CONNECTED clears any earlier failure line; otherwise a blip
-        # openconnect recovered from would be reported as the cause when the
-        # tunnel eventually drops, hours later.
-        self.last_failure = None
-        self._set_state(CONNECTED, address)
-        where = f"{self.server} — {address}".strip(" —")
-        self.notify("VPN connected" if first else "VPN reconnected", where)
-
-    def _announce_link_lost(self, detail):
-        """openconnect has lost the link and is re-establishing it itself.
-
-        Worth saying out loud. Nothing else tells the user, a badge changing to
-        a spinner is easy to miss, and the reassuring half — that this costs no
-        sign-in and no password — is not something a spinner can convey.
-        """
-        self._set_state(CONNECTING, detail)
-        self.notify("VPN connection lost",
-                    f"{self.server} — reconnecting, no sign-in needed",
-                    icon="dialog-warning-symbolic")
-
     def _on_tunnel_output(self, line, generation):
         if generation != self.helper_generation:
             # Still log it. A superseded helper's last words are its teardown
@@ -1634,33 +1918,22 @@ class VpnTray:
         if message is not None:
             self.helper_spoke = True
             kind, payload = message
-            if kind == C.KIND_DEVICE:
-                # Validated on the way in as well as on the way out: this is
-                # about to be interpolated into a path under /sys, and "it was
-                # checked at the other end" is not a property this side can
-                # verify.
-                self.tunnel_device = payload if C.INTERFACE_RE.match(payload) else None
-                self.log(line)
-                return False
-            if kind == C.KIND_STATE:
-                self._apply_state_event(payload)
-                self.log(line)
-                return False
-            if kind == C.KIND_FATAL:
-                # The helper stopped before openconnect was started at all, so
-                # its own sentence explains the exit status far better than the
-                # number does.
-                self.last_failure = payload
             self.log(line)
-            if kind == C.KIND_WARNING:
-                # Anything suggesting the network did not come back.
-                self.notify("VPN teardown warning", payload,
-                            icon="dialog-warning-symbolic")
+            if kind == C.KIND_DEVICE:
+                self.dispatch(MSG_DEVICE, device=payload)
+            elif kind == C.KIND_STATE:
+                self._apply_state_event(payload)
+            elif kind == C.KIND_FATAL:
+                self.dispatch(MSG_FATAL, sentence=payload)
+            elif kind == C.KIND_WARNING:
+                self.dispatch(MSG_WARNING, sentence=payload)
             return False
         self.log(line)
-        # The script contract says which state we are in; it never says why a
-        # connection failed. Only the state machine below is redundant once
-        # events arrive -- the failure scan further down is not.
+        # The log patterns say which state we are in only as a fallback; they
+        # never say why a connection failed, so the failure scan below stays
+        # active even after events arrive. Scanning only in the fallback once
+        # meant a post-connect failure was reported as a bare "exited with
+        # status 1" while openconnect's own explanation sat in the log.
         if not self.state_events:
             if self.state == CONNECTED:
                 # openconnect retries internally without exiting. Left
@@ -1668,83 +1941,26 @@ class VpnTray:
                 # exiting 0 while traffic goes nowhere.
                 for pattern in RECONNECTING_PATTERNS:
                     if pattern.search(line):
-                        self._announce_link_lost("link lost, retrying")
+                        self.dispatch(MSG_LINK_LOST)
                         return False
-            if self.state in (CONNECTING, CONNECTED):
+            if self.state in (CONNECTING, RECOVERING):
                 for pattern in CONNECTED_PATTERNS:
                     match = pattern.search(line)
                     if match:
                         address = (match.groupdict().get("addr") or "").strip()
-                        # Same rule as the event path: a demotion is promoted
-                        # by the source that caused it, not by wording.
-                        if self.state != CONNECTED and not self.health_demoted:
-                            # And adopt like the event path does: the DEVICE
-                            # line supplied the name even without events, and
-                            # the watchdog needs the ifindex and the address.
-                            self._adopt_tunnel(self.tunnel_device, address)
-                            self._announce_connected(address)
+                        # The same message the event path sends, so the table
+                        # applies the same rules to both sources of truth.
+                        self.dispatch(MSG_TUNNEL_UP,
+                                      device=self.tunnel_device,
+                                      address=address, dns="")
                         return False
-        # Deliberately outside that guard. Scanning only in the fallback meant
-        # that after any successful connect -- i.e. as soon as one state event
-        # had arrived -- a later failure was reported as a bare "exited with
-        # status 1" while openconnect's own explanation sat in the log directly
-        # above it. That is the whole reason this scan exists.
         for pattern in FAILURE_PATTERNS:
             if pattern.search(line):
                 # "[vpn] " is how the helper stops openconnect's output forging
                 # helper messages; it is framing, not something to show anyone.
-                self.last_failure = C.strip_relay(line).strip()
+                self.dispatch(MSG_PROBLEM, sentence=C.strip_relay(line).strip())
                 self.log(f"[tray] openconnect reported a problem: {line}")
                 return False
-        return False
-
-    def _on_tunnel_exit(self, returncode, generation):
-        if generation != self.helper_generation:
-            # An older tunnel finished dying after a new one took over. Saying
-            # anything here would drop the tray's handle on the live one.
-            self.log(f"[tray] a previous tunnel closed (status {returncode})")
-            return False
-        self.helper_proc = None
-        # Read before the reset wipes it. A tunnel the watchdog demoted is no
-        # longer in CONNECTED, but it certainly was one, and "connection
-        # dropped" explains its death far better than a bare exit status.
-        was_connected = self.state == CONNECTED or self.tunnel_ever_connected
-        self._reset_tunnel_state()
-        if self.reconnect_pending:
-            # _reconnect_now takes it from here; stay busy until it does.
-            self.log("[tray] tunnel closed, signing in again")
-            return False
-        if self.cancelled:
-            self._set_state(DISCONNECTED)
-            return False
-        # DISCONNECTED too, not just DISCONNECTING: disconnect() moves straight
-        # there when it finds the helper already gone, and this callback can
-        # still be queued behind it. Treating that as a failure would report an
-        # error for a perfectly clean disconnect.
-        if self.state in (DISCONNECTING, DISCONNECTED):
-            self._set_state(DISCONNECTED)
-            self.log("[tray] disconnected")
-            self.notify("VPN disconnected", self.server)
-            return False
-
-        if returncode is None:
-            returncode = -1  # the reader thread died before it could reap
-        # 126/127 are pkexec's own codes for "dismissed" and "not permitted", but
-        # openconnect can return them too. Only read them that way if the helper
-        # never got far enough to say anything.
-        if returncode == 126 and not self.helper_spoke:
-            message = "authorization cancelled"
-        elif returncode == 127 and not self.helper_spoke:
-            message = "not authorized to run the helper"
-        elif self.last_failure:
-            message = self.last_failure
-        elif was_connected:
-            message = "connection dropped"
-        else:
-            message = f"openconnect exited with status {returncode}"
-        self._set_state(FAILED, message)
-        self.log(f"[tray] {message}")
-        self.notify("VPN disconnected", message)
         return False
 
     # ------------------------------------------------------------ teardown
@@ -1793,20 +2009,9 @@ class VpnTray:
             return False
         return True
 
-    def _teardown_failed(self):
-        """Leave DISCONNECTING when the helper never reported back."""
-        if self.state == DISCONNECTING:
-            self._set_state(FAILED, "helper did not exit — the tunnel may still be up")
-            self.notify(
-                "VPN teardown warning",
-                "The helper did not exit. Check 'asuvpn log'.",
-                icon="dialog-warning-symbolic",
-            )
-        return False
-
     def _disconnect_thread(self):
         if not self._teardown_helper():
-            GLib.idle_add(self._teardown_failed)
+            self.post(MSG_TEARDOWN_TIMEOUT, during="disconnect")
 
     @staticmethod
     def _kill_group(proc):

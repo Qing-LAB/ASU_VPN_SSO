@@ -1,5 +1,19 @@
 # The state-machine revision — consolidated plan
 
+> **Outcome (2026-08-23): executed.** The user's decisions: one flat list of
+> states; plain Python, no libraries; verified by the test suite and the
+> sandbox rather than a waiting period; and the background program untouched —
+> not as a preference but by logic: it already speaks in messages, had zero
+> found defects, and nothing it exchanges with the tray changed by one byte.
+> As built: `class StateMachine` in `asuvpn-tray` (the tray inherits it, the
+> selftest subclasses it with recorded side effects), the `TRANSITIONS` table
+> at the top of the file, eight states with RECOVERING and DEMOTED promoted
+> out of their hiding flag, and unlisted (state, message) pairs dropped with a
+> log line. Making DEMOTED a real state exposed and fixed a dead spot: the
+> menu's own Reconnect on a demoted tunnel had been silently refused. The
+> as-built table lives in DESIGN.md's state-machine section; this file remains
+> as the plan of record and the rationale.
+
 Requested by the user on 2026-08-23, during the full review: *define a real
 state machine, write it down with clear transitions and conditions, double-check
 the logic, then migrate the code to use it fully and solely — and make the
