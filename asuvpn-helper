@@ -84,6 +84,7 @@ IP_CANDIDATES = ("/usr/sbin/ip", "/sbin/ip", "/usr/bin/ip")
 TUNNEL_PREFIXES = ("tun", "tap", "vpn")
 HERE = os.path.dirname(os.path.abspath(__file__))
 NOTIFY = os.path.join(HERE, "asuvpn-notify")
+CONTRACT = os.path.join(HERE, "asuvpn_contract.py")
 # Only a last resort. openconnect knows its own compiled-in default and prints
 # it, so it is asked rather than guessed -- see default_vpnc_script().
 FALLBACK_VPNC_SCRIPT = "/usr/share/vpnc-scripts/vpnc-script"
@@ -689,7 +690,11 @@ def main():
     # This runs as root from a directory the unprivileged user owns. That is
     # inherent and documented, but group- or world-writable is not: it would let
     # a *second* account take root at the next connect. Enforced, not just noted.
-    for path in (HERE, os.path.abspath(__file__), NOTIFY):
+    # Every file this process executes or loads as root. The contract is on the
+    # list because it is executed too: the bootstrap checked it before loading,
+    # and stating it here as well keeps the whole set visible in one place
+    # rather than split between a loader and a main().
+    for path in (HERE, os.path.abspath(__file__), NOTIFY, CONTRACT):
         reason = C.unsafe_write_access(path)
         if reason:
             fatal(f"refusing to run: {path} is {reason}")
@@ -779,6 +784,13 @@ def main():
     # Says what was done, not what the server did: this runs before the server
     # has said anything, and asserting its behaviour here would be wrong for
     # every gateway that does negotiate DPD.
+    # Validated rather than trusted. The config parser refuses a negative, so
+    # one can only arrive from a caller invoking this directly -- which needs
+    # pkexec and is therefore no escalation -- but a privileged program has no
+    # business passing its caller's arithmetic through to a root subprocess.
+    if args.dpd < 0:
+        fatal(f"refusing a negative dead peer detection interval: {args.dpd}")
+        return 27
     if args.dpd and requested_dpd(extra) is None:
         extra = [*extra, "--force-dpd", str(args.dpd)]
         log(f"forcing dead peer detection every {args.dpd}s;"

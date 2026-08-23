@@ -34,8 +34,6 @@ import stat
 # mysterious.
 CONTRACT_VERSION = 1
 
-CONTRACT_MODULE = "asuvpn_contract.py"
-
 
 # --------------------------------------------------------------- permissions
 
@@ -201,7 +199,6 @@ REASON_STATES = {
     "attempt-reconnect": "connecting",
     "disconnect": "disconnected",
 }
-REASONS = ("pre-init", *REASON_STATES)
 
 # IFNAMSIZ is 16 including the NUL. Anything outside this cannot name a device,
 # and unchecked it would reach an `ip link delete` running as root, or be

@@ -78,6 +78,23 @@ principal before executing anything; the unprivileged ones do not, because
 loading a file you own as yourself crosses no boundary — and refusing there
 would break `--link` mode from an ordinary umask-002 checkout.
 
+### What is executed as root, and what checks it
+
+Four things run or are loaded with privilege: `asuvpn-helper`, its directory,
+`asuvpn-notify`, and `asuvpn_contract.py`. The contract joined that set when it
+was introduced and was missed by both the helper's runtime list and the
+self-test's — the loader checked it, so nothing broke, but a list that
+enumerates "the programs I know about" stops covering a new file that runs with
+the same privilege. Both lists name all four now.
+
+Verified by tampering rather than by reading: making the contract
+world-writable, making its directory world-writable, and replacing it with a
+symlink to a writable file are each refused, the last because `os.stat` follows
+the link and sees the target. A *shared group* is refused too, though that one
+is covered by the logic tier's truth table rather than end to end — a user
+namespace maps only one gid, so a second principal cannot be created inside the
+sandbox to test it with.
+
 ### Settings belong to the user side
 
 The helper runs as root, where `~` is root's home. It therefore never reads the
@@ -522,7 +539,8 @@ not an interface, here either.
 | `23` | the requested interface already exists; refusing to take over a device we did not create |
 | `24` | no free `asuvpnN` name |
 | `25` | an option was passed that would detach `openconnect` from the helper (`--background`, `--syslog`, `--pid-file`, or a bundled short option) |
-| `26` | the helper, its directory, or `asuvpn-notify` is writable by another principal |
+| `26` | the helper, its directory, `asuvpn-notify` or `asuvpn_contract.py` is writable by another principal |
+| `27` | a negative dead-peer interval reached the helper; the config parser cannot produce one, so it came from a direct caller |
 | other | `openconnect`'s own exit status; `128 + n` if it was killed by signal *n* |
 
 ### `asuvpn-selftest`
@@ -550,6 +568,7 @@ where it can be, checked by `asuvpn selftest`.
 | Recovery never costs a Duo push unless asked | `SIGUSR2` first, sign-in only on opt-in | sandbox scenario counts exactly one `SIGUSR2` and one sign-in over 100s |
 | openconnect cannot drive the control channel | it is spawned with its own `stdin` pipe | compared `/proc/<pid>/fd/0` of both: distinct pipes, child's is `O_RDONLY` |
 | A refusal is reported as a sentence, not a number | `[helper] FATAL ` marker, set by the helper | wiring tier, by running two refused connects |
+| Everything executed as root is unwritable by a second principal | bootstrap check before load, plus the helper's own list | environment tier, and by making each file writable in turn |
 | A device name never becomes a path unvalidated | checked at both ends, not just where it is produced | logic tier, with traversal and whitespace payloads |
 | `openconnect-sso` can still import `pkg_resources` | `setuptools<71` pinned with `pipx inject --force` | environment tier, by importing it |
 

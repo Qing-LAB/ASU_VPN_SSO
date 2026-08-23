@@ -648,8 +648,13 @@ def check_no_bytecode(r):
 def check_installed_permissions(C, r):
     """The helper's own refusal criteria, applied now instead of at first connect."""
     problems = []
+    # asuvpn_contract.py is on this list because the helper *executes* it as
+    # root. It was missed when the contract was introduced: the check listed the
+    # programs it knew about, and a new file that runs with the same privilege
+    # is exactly the kind of thing such a list stops covering.
     for path in (HERE, os.path.join(HERE, "asuvpn-helper"),
-                 os.path.join(HERE, "asuvpn-notify")):
+                 os.path.join(HERE, "asuvpn-notify"),
+                 os.path.join(HERE, "asuvpn_contract.py")):
         reason = C.unsafe_write_access(path)
         if reason:
             problems.append(f"{path} is {reason}")
@@ -926,6 +931,8 @@ def main():
 
     if "environment" in tiers:
         r.section("environment — our assumptions, put to the installed binaries")
+        r.ok(f"the contract is version {C.CONTRACT_VERSION}",
+             "every program loaded the same one, from beside itself")
         binary = check_openconnect(helper, tray, r)
         check_default_script(helper, C, binary, r)
         check_message_catalogue(tray, binary, r)

@@ -244,7 +244,8 @@ so this does not depend on how any of them happen to be worded:
 | `23` | that interface already exists, and it was not created by this session |
 | `24` | no free `asuvpnN` name (a hundred tunnels is not a real scenario) |
 | `25` | an option was passed that would detach `openconnect` from the helper |
-| `26` | the helper, its directory, or `asuvpn-notify` is writable by someone else |
+| `26` | the helper, its directory, `asuvpn-notify` or the contract is writable by someone else |
+| `27` | a negative dead-peer interval was passed |
 
 ```bash
 asuvpn status >/dev/null || asuvpn connect --wait
