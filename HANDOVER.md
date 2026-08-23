@@ -53,6 +53,10 @@ not, and each cost a round of rework.
   counted a probe strike during each break and correctly stood aside while
   openconnect ran its own recovery; a transient overnight probe strike (1/2)
   cleared on the next cycle without a demotion.
+- **The nudge fired live** (2026-08-23, routes flushed by hand): two probe
+  strikes → demotion → `SIGUSR2` → openconnect re-established the session in
+  one second, no sign-in. The mechanism works; what it exposed is recorded
+  under "what to do next".
 - The liveness probe target answers in ~17 ms; a refusal (RST) arrives in ~20 ms
   and correctly counts as alive.
 
@@ -228,14 +232,31 @@ because code cannot be shared before the sharing mechanism is loaded.
 
 ## What to do next, roughly in order
 
-1. **Live-exercise the escalation ladder.** The free-recovery half is done
-   (2026-08-23, WiFi loss and suspend/resume — see the proven list), but the
-   nudge and the opt-in sign-in still have not fired outside the sandbox,
-   because openconnect recovered first every time. Staging one live means a
-   break DPD cannot see: with a tunnel up,
-   `sudo ip route flush dev asuvpn0` wipes its routes, and the expected
-   sequence is two device-check strikes → demotion → `SIGUSR2` nudge →
-   openconnect re-establishes and vpnc-script reinstalls the routes.
+1. **Decide what a routes-lost break should escalate to.** Staged live on
+   2026-08-23 (`sudo ip route flush dev asuvpn0`) and the nudge fired — but
+   the break class defeats the ladder as designed, three ways at once:
+   - a same-address `reconnect` does **not** reinstall routes: the stock
+     vpnc-script only routes on `reason=connect`, so the nudge "succeeds"
+     while the break persists;
+   - the `reconnect` state event promotes the badge and clears the demotion
+     even though the *probe* caused it and has not passed since — so the
+     badge oscillates Connected↔Connecting every ~2 minutes, the
+     once-per-incident notification refires each cycle, and, because the
+     demote cadence (two probe strikes, 120 s) equals `nudge-min-gap`
+     (120 s), the nudge is always available and the sign-in branch is never
+     reached — even with autoreconnect on;
+   - `ip route flush` removes only IPv4, and the six surviving IPv6 routes
+     kept `route_count()` nonzero, so the route check never saw it — only
+     the probe did. The families are counted together.
+
+   The candidate fix consistent with the existing anti-flap rule: a demotion
+   is cleared only by the source that caused it (a reconnect event would no
+   longer reset `health_demoted` when the watchdog demoted — the probe's own
+   next pass, ≤60 s later, does the promoting). That also makes the sign-in
+   branch reachable, since a rate-limited nudge then falls through. Counting
+   route families separately (against what the tunnel had when adopted) would
+   let the cheap check see this break too. Both change sandbox scenario
+   expectations; neither has been written. The user decides.
 2. **Try `autoreconnect = on`** for a while, if the user wants unattended
    recovery, and see whether the 300 s floor is right.
 3. **Consider whether `probe-every = 3` is the right frequency** now that a real
