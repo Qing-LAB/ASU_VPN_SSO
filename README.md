@@ -661,13 +661,18 @@ traffic. Whether the service behind the probe is up is none of our business.
 
 The two sources are tracked separately, so a probe failure is only cleared by a
 successful probe. Letting the device check promote the badge back would flap it
-every twenty seconds against a tunnel that is genuinely carrying nothing.
+every twenty seconds against a tunnel that is genuinely carrying nothing. The
+same rule holds against openconnect's own word: the reconnect a nudge produces
+does not promote the badge either — the source that demoted has to pass again
+first, which takes at most one more check. Route families are counted
+separately too, because `ip route flush` removes only IPv4 and a summed count
+sat green through exactly that break on a live tunnel.
 
 The result is logged either way, so the next silent break leaves evidence
 instead of a mystery:
 
 ```
-[tray] tunnel device check 1/2: no routes point at the tunnel any more (dev=asuvpn0, routes=0)
+[tray] tunnel device check 1/2: the tunnel's IPv4 routes are gone (dev=asuvpn0, ifindex=6, flags=0x1091, routes4=0, routes6=6)
 [tray] tunnel probe check 2/2: nothing answers through the tunnel (10.0.0.53 did not answer in 5s)
 [tray] asked openconnect to re-establish (same session, no sign-in needed)
 ```
@@ -679,9 +684,11 @@ Cheapest first, because the two recoveries are not interchangeable:
 1. **Nudge.** Send `openconnect` a `SIGUSR2`, which it documents as forcing "an
    immediate disconnection and reconnection". The session is reused, so this
    costs no sign-in, no Duo push and no password — you need not even be at the
-   keyboard. Rate limited to once every two minutes.
+   keyboard. One nudge per incident: if the tunnel is demoted again after its
+   nudge, the nudge demonstrably did not fix it, and asking every two minutes
+   forever is what a routes-lost tunnel actually got before this rule.
 2. **Say so.** The badge leaves *Connected*, so `asuvpn status` stops exiting 0,
-   and a notification explains what was observed.
+   and one notification per incident explains what was observed.
 3. **Sign in again — only if you asked for it.** Off by default, because it
    means a Duo approval and typing your password into a polkit dialog.
 

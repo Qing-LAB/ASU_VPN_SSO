@@ -308,8 +308,21 @@ def check_tunnel_health(tray, r):
     r.check("a device name that could not name a device is never used as a path",
             not leaked, f"these were used unvalidated: {leaked}")
     r.check("routes are counted for a real device and not for a fake one",
-            tray.route_count("lo") > 0 and tray.route_count("asuvpn-nope") == 0,
+            tray.route_count("lo") != (0, 0)
+            and tray.route_count("asuvpn-nope") == (0, 0),
             f"lo={tray.route_count('lo')} fake={tray.route_count('asuvpn-nope')}")
+    # The rule, held against whatever lo actually has right now: a family this
+    # tunnel was seen to have, wholly gone, is a verdict even while the other
+    # family survives. `ip route flush dev X` removes only IPv4, and a summed
+    # count sat green through exactly that break on a live tunnel.
+    v4, v6 = tray.route_count("lo")
+    seen_all = {"routes4": True, "routes6": True}
+    reason, facts = tray.tunnel_health("lo", lo_index, seen_all)
+    should_flag = v4 == 0 or v6 == 0
+    r.check("a route family the tunnel had, wholly gone, is a verdict",
+            (reason is not None) == should_flag,
+            f"lo has v4={v4} v6={v6}, seen={seen_all}, verdict {reason!r} —"
+            " the per-family rule and the counts disagree")
 
 
 def check_notifications(tray, r):
@@ -364,6 +377,108 @@ def check_notifications(tray, r):
             stub.notes[-1] == "VPN reconnected",
             f"got {stub.notes[-1]!r} — the wording is how the user tells a"
             " recovery from a connection they asked for")
+
+
+def check_demotion_rules(tray, r):
+    """A demotion outlives openconnect's word, and a nudge is one per incident.
+
+    Learned live on 2026-08-23, from `ip route flush dev asuvpn0`: the nudge's
+    reconnect event promoted the badge and reset the incident even though the
+    probe had never passed again — so the badge flapped every two minutes, the
+    notification repeated, and because the demote cadence equalled the nudge
+    rate limit, the sign-in branch was unreachable even when opted in. The
+    rules under test: only the demoting source promotes, the incident keeps
+    its state across the reconnect event, one nudge per incident, and one
+    warning notification at the moment the free option is spent.
+
+    Exercised through a stand-in `self` borrowing the real methods, so no
+    display is needed and the real state machine is what runs.
+    """
+    if not hasattr(tray, "VpnTray"):
+        r.warn("a demotion is only undone by the source that caused it",
+               "GUI classes unavailable here")
+        return
+
+    class Stub:
+        _apply_state_event = tray.VpnTray._apply_state_event
+        _adopt_tunnel = tray.VpnTray._adopt_tunnel
+        _announce_connected = tray.VpnTray._announce_connected
+        _unhealthy = tray.VpnTray._unhealthy
+        _tunnel_unhealthy = tray.VpnTray._tunnel_unhealthy
+        _healthy = tray.VpnTray._healthy
+        server = "vpn.example.edu"
+
+        def __init__(self):
+            self.state = tray.CONNECTING
+            self.detail = ""
+            self.state_events = False
+            self.quitting = self.cancelled = False
+            self.health_demoted = False
+            self.demoted_by = None
+            self.strikes = {"device": 0, "probe": 0}
+            self.nudge_spent = self.failure_notified = False
+            self.routes_seen = {"routes4": False, "routes6": False}
+            self.tunnel_device = None
+            self.tunnel_ifindex = None
+            self.tunnel_address = self.tunnel_dns = ""
+            self.tunnel_ever_connected = False
+            self.last_failure = None
+            self.last_nudge = float("-inf")
+            self.last_autoreconnect = float("-inf")
+            self.notes, self.sent = [], []
+
+        def notify(self, summary, body="", icon=None):
+            self.notes.append(summary)
+
+        def log(self, line):
+            pass
+
+        def _set_state(self, state, detail=""):
+            self.state, self.detail = state, detail
+
+        def _send_helper(self, verb):
+            self.sent.append(verb)
+            return True
+
+        def autoreconnect_enabled(self):
+            return False
+
+    stub = Stub()
+    strikes = max(1, tray.SETTINGS["health-strikes"])
+    stub._apply_state_event("connected dev=asuvpn0 addr=10.0.0.1 dns=10.0.0.53")
+    for _ in range(strikes):
+        stub._unhealthy("probe", "nothing answers", "no reply")
+    r.check("a broken tunnel is demoted and nudged exactly once",
+            stub.state == tray.CONNECTING and stub.sent == ["reconnect"]
+            and stub.notes[-1] == "VPN reconnecting",
+            f"state={stub.state!r} sent={stub.sent} notes={stub.notes}")
+
+    stub._apply_state_event("connected dev=asuvpn0 addr=10.0.0.2 dns=10.0.0.53")
+    r.check("a reconnect event mid-demotion adopts the tunnel but not the badge",
+            stub.state == tray.CONNECTING and stub.health_demoted
+            and stub.tunnel_address == "10.0.0.2"
+            and "VPN reconnected" not in stub.notes,
+            f"state={stub.state!r} demoted={stub.health_demoted}"
+            f" addr={stub.tunnel_address!r} notes={stub.notes}")
+
+    # Wind the clock past the rate limit before the next round: the incident
+    # flag, not the timestamp, must be what refuses a second nudge — otherwise
+    # a reset flag hides behind the gap and this check proves nothing.
+    stub.last_nudge -= max(1, tray.SETTINGS["nudge-min-gap"]) + 1
+    for _ in range(strikes):
+        stub._unhealthy("probe", "nothing answers", "no reply")
+    r.check("an incident takes one nudge, then says the free option is spent",
+            stub.sent == ["reconnect"]
+            and stub.notes.count("VPN not carrying traffic") == 1,
+            f"sent={stub.sent} notes={stub.notes}")
+
+    stub._healthy("probe", "answered")
+    r.check("the demoting source is what promotes, and it resets the incident",
+            stub.state == tray.CONNECTED
+            and stub.notes[-1] == "VPN carrying traffic again"
+            and not stub.health_demoted and not stub.nudge_spent
+            and not stub.failure_notified,
+            f"state={stub.state!r} notes={stub.notes}")
 
 
 def check_liveness_probe(tray, r):
@@ -1014,6 +1129,7 @@ def main():
         check_state_payload(tray, r)
         check_log_scrubbing(tray, r)
         check_tunnel_health(tray, r)
+        check_demotion_rules(tray, r)
         check_liveness_probe(tray, r)
         check_notifications(tray, r)
         check_output_framing(helper, r)

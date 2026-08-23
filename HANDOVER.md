@@ -20,7 +20,7 @@ Everything is committed and pushed to `main` at
 | Programs | `asuvpn-tray` (you), `asuvpn-helper` (root, via pkexec), `asuvpn-notify` (root, run by openconnect), `asuvpn-selftest` (you) |
 | Shared | `asuvpn_contract.py` — loaded by explicit path, never imported |
 | Settings | `~/.config/asuvpn/asuvpn.conf`, generated from the contract's schema |
-| Checks | `asuvpn selftest` — 69, in three tiers; scenario suite in [tests/sandbox](tests/sandbox/README.md) |
+| Checks | `asuvpn selftest` — 74, in three tiers; scenario suite in [tests/sandbox](tests/sandbox/README.md) |
 | Analysers | ruff, pyflakes, pylint, mypy, bandit, vulture, shellcheck — all clean |
 | Tested against | openconnect v9.12-3.3, Ubuntu, GNOME, ASU's `sslvpn.asu.edu` |
 
@@ -232,31 +232,21 @@ because code cannot be shared before the sharing mechanism is loaded.
 
 ## What to do next, roughly in order
 
-1. **Decide what a routes-lost break should escalate to.** Staged live on
-   2026-08-23 (`sudo ip route flush dev asuvpn0`) and the nudge fired — but
-   the break class defeats the ladder as designed, three ways at once:
-   - a same-address `reconnect` does **not** reinstall routes: the stock
-     vpnc-script only routes on `reason=connect`, so the nudge "succeeds"
-     while the break persists;
-   - the `reconnect` state event promotes the badge and clears the demotion
-     even though the *probe* caused it and has not passed since — so the
-     badge oscillates Connected↔Connecting every ~2 minutes, the
-     once-per-incident notification refires each cycle, and, because the
-     demote cadence (two probe strikes, 120 s) equals `nudge-min-gap`
-     (120 s), the nudge is always available and the sign-in branch is never
-     reached — even with autoreconnect on;
-   - `ip route flush` removes only IPv4, and the six surviving IPv6 routes
-     kept `route_count()` nonzero, so the route check never saw it — only
-     the probe did. The families are counted together.
-
-   The candidate fix consistent with the existing anti-flap rule: a demotion
-   is cleared only by the source that caused it (a reconnect event would no
-   longer reset `health_demoted` when the watchdog demoted — the probe's own
-   next pass, ≤60 s later, does the promoting). That also makes the sign-in
-   branch reachable, since a rate-limited nudge then falls through. Counting
-   route families separately (against what the tunnel had when adopted) would
-   let the cheap check see this break too. Both change sandbox scenario
-   expectations; neither has been written. The user decides.
+1. **Live-verify the routes-lost fix.** The break was staged live on
+   2026-08-23 (`sudo ip route flush dev asuvpn0`) and defeated the ladder as
+   then designed, three ways at once: a same-address `reconnect` does not
+   reinstall routes (the stock vpnc-script only routes on `reason=connect`),
+   the reconnect event cleared a demotion the probe had never cleared (badge
+   flap every ~2 minutes, repeated notifications, sign-in branch unreachable
+   even opted in), and the surviving IPv6 routes hid an IPv4-only wipe from a
+   summed route count. All three are fixed the same day — demotions now
+   survive openconnect's word and are promoted only by the source that
+   demoted, the nudge is once per incident, and route families are counted
+   separately — with five selftest checks, four of them mutation-verified,
+   plus the sandbox scenarios. What remains is one live confirmation: with a
+   fresh applet, flush the routes again and expect two strikes → demotion →
+   one nudge → the badge *staying* demoted with one warning notification —
+   and with `autoreconnect on`, a sign-in within `autoreconnect-min-gap`.
 2. **Try `autoreconnect = on`** for a while, if the user wants unattended
    recovery, and see whether the 300 s floor is right.
 3. **Consider whether `probe-every = 3` is the right frequency** now that a real
@@ -268,7 +258,7 @@ because code cannot be shared before the sharing mechanism is loaded.
 ## How to work on it
 
 ```bash
-asuvpn selftest                 # 69 checks; run before and after any change
+asuvpn selftest                 # 74 checks; run before and after any change
 tests/sandbox/enter.sh sec.sh   # scenario tests, in a namespace of stand-ins
 ./install.sh                    # copies into ~/.local, runs the self-check
 asuvpn log -f                   # what it is actually doing

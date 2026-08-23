@@ -79,9 +79,9 @@ gitignored; nothing in here needs cleaning up by hand.
 | `fdcheck.sh` | openconnect's stdin is not the helper's control pipe, so it cannot inject control verbs | no |
 | `lifecycle.sh` | connect → reconnect → probes → disconnect → quit, all through the tray | yes |
 | `discon.sh` | a demoted tunnel still disconnects cleanly (`FAKE_DEAF=1` ignores nudges) | yes |
-| `escalate.sh` | the watchdog's ladder: nudge first, then—with autoreconnect on—one full sign-in, rate limits respected | yes |
-| `watchdog-test.sh` | a healthy tunnel is never demoted; the facts are logged either way | yes |
-| `blackhole.sh` | device and routes healthy, probe target silent → demote, nudge, honest badge | yes |
+| `escalate.sh` | the watchdog's ladder: one nudge, then—with autoreconnect on—one full sign-in | yes |
+| `watchdog-test.sh` | a gone device: strikes → demotion → one nudge; the reconnect event adopts the tunnel but the badge stays demoted while the device never returns | yes |
+| `blackhole.sh` | device and routes healthy, probe target silent → demote, one nudge, and a badge that stays honest because only the probe can promote it | yes |
 | `contract-test.sh` | the config file drives the helper (`--force-dpd`) and the watchdog cadence end to end | yes |
 
 "Display needed" scenarios start the real tray, which needs GTK and an X

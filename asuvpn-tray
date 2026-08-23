@@ -212,29 +212,33 @@ FAILURE_PATTERNS = tuple(
 
 
 def route_count(device):
-    """How many routes point at this device, IPv4 and IPv6.
+    """(IPv4, IPv6) routes pointing at this device; None for an unreadable family.
+
+    Counted per family, not summed: `ip route flush dev X` removes only IPv4,
+    and on 2026-08-23 the six surviving IPv6 routes kept a summed count nonzero
+    while every IPv4 path through the tunnel was gone — so the route check
+    watched a broken tunnel and saw nothing.
 
     Read straight out of /proc rather than shelled out to `ip`: this runs on the
     GLib main loop every few seconds, and two file reads cost microseconds where
     a subprocess would stall the UI.
     """
     if not device:
-        return 0
-    total = 0
+        return 0, 0
     try:
         with open("/proc/net/route") as fh:
             next(fh, None)  # header
-            total += sum(1 for line in fh
-                         if (f := line.split()) and f[0] == device)
+            v4 = sum(1 for line in fh
+                     if (f := line.split()) and f[0] == device)
     except OSError:
-        return None
+        v4 = None
     try:
         with open("/proc/net/ipv6_route") as fh:
-            total += sum(1 for line in fh
-                         if (f := line.split()) and f[-1] == device)
+            v6 = sum(1 for line in fh
+                     if (f := line.split()) and f[-1] == device)
     except OSError:
-        pass  # a kernel without IPv6; the v4 count still stands
-    return total
+        v6 = None  # a kernel without IPv6; the v4 count still stands
+    return v4, v6
 
 
 def probe_tunnel(address, port, timeout):
@@ -266,8 +270,14 @@ def probe_tunnel(address, port, timeout):
         return None, f"{address}: {exc.__class__.__name__}"
 
 
-def tunnel_health(device, ifindex):
+def tunnel_health(device, ifindex, routes_seen=None):
     """Why the tunnel cannot be carrying traffic, or None. Facts, not packets.
+
+    `routes_seen` says which route families this tunnel has been observed to
+    have ({"routes4": bool, "routes6": bool}); a family the tunnel had, wholly
+    gone, is a verdict even while the other survives — `ip route flush dev X`
+    removes only IPv4, and the summed count this replaced looked healthy
+    through exactly that break.
 
     Deliberately narrow, because three of the four checks that suggest
     themselves first are wrong here — each was tried against a live ASU tunnel
@@ -308,10 +318,15 @@ def tunnel_health(device, ifindex):
             return "the tunnel device is down", facts
     except (OSError, ValueError):
         pass  # unreadable flags are not evidence of a fault
-    routes = route_count(device)
-    facts["routes"] = routes
-    if routes == 0:
+    v4, v6 = route_count(device)
+    facts["routes4"], facts["routes6"] = v4, v6
+    if v4 == 0 and v6 == 0:
         return "no routes point at the tunnel any more", facts
+    seen = routes_seen or {}
+    if seen.get("routes4") and v4 == 0:
+        return "the tunnel's IPv4 routes are gone", facts
+    if seen.get("routes6") and v6 == 0:
+        return "the tunnel's IPv6 routes are gone", facts
     return None, facts
 
 
@@ -1177,6 +1192,12 @@ class VpnTray:
             address = fields.get("addr", "")
             self._adopt_tunnel(fields.get("dev") or self.tunnel_device, address,
                                fields.get("dns", ""))
+            if self.health_demoted:
+                # A reconnect landed mid-demotion: the address and device are
+                # adopted above, but the promotion belongs to the source that
+                # demoted. Taking openconnect's word here flapped the badge
+                # every two minutes against a tunnel whose routes were gone.
+                return
             if self.state != CONNECTED:
                 self._announce_connected(address)
             elif address and self.detail != address:
@@ -1196,9 +1217,20 @@ class VpnTray:
         # gets the device checks, which need no target at all.
         if dns:
             self.tunnel_dns = dns
-        self.strikes = {"device": 0, "probe": 0}
-        self.health_demoted = False
-        self.demoted_by = None
+        if not self.health_demoted:
+            # A fresh adoption starts with a clean slate. One arriving *during*
+            # a demotion is the reconnect a nudge produced, and openconnect
+            # asserting "connected" is exactly what it asserted before the
+            # watchdog found otherwise — so the slate stays dirty until the
+            # demoting source itself passes (_healthy does the promoting).
+            # Clearing it here let a reconnect that fixed nothing restart the
+            # incident every two minutes: badge flap, repeated notifications,
+            # and an escalation that could never be reached.
+            self.strikes = {"device": 0, "probe": 0}
+            self.demoted_by = None
+            self.nudge_spent = False
+            self.failure_notified = False
+            self.routes_seen = {"routes4": False, "routes6": False}
         if not device or not C.INTERFACE_RE.match(device):
             return
         self.tunnel_device = device
@@ -1232,6 +1264,9 @@ class VpnTray:
         self.strikes = {"device": 0, "probe": 0}
         self.health_demoted = False
         self.demoted_by = None
+        self.nudge_spent = False
+        self.failure_notified = False
+        self.routes_seen = {"routes4": False, "routes6": False}
 
     def autoreconnect_enabled(self):
         return SETTINGS["autoreconnect"]
@@ -1283,7 +1318,14 @@ class VpnTray:
         if self.state not in (CONNECTED, CONNECTING) or self.helper_proc is None:
             return True
 
-        reason, facts = tunnel_health(self.tunnel_device, self.tunnel_ifindex)
+        reason, facts = tunnel_health(self.tunnel_device, self.tunnel_ifindex,
+                                      self.routes_seen)
+        # Which families this tunnel has been observed to have. Latched from
+        # the checks rather than captured at adoption, because the state event
+        # arrives before vpnc-script has installed any routes at all.
+        for family in ("routes4", "routes6"):
+            if facts.get(family):
+                self.routes_seen[family] = True
         if reason is None:
             self._healthy("device", self._facts(facts))
         elif self.state == CONNECTED or self.health_demoted:
@@ -1341,6 +1383,8 @@ class VpnTray:
         if self.demoted_by == source and self.state == CONNECTING:
             self.demoted_by = None
             self.health_demoted = False
+            self.nudge_spent = False
+            self.failure_notified = False
             self._set_state(CONNECTED, self.tunnel_address)
             self.notify("VPN carrying traffic again", self.server)
 
@@ -1369,7 +1413,7 @@ class VpnTray:
         a password into a polkit dialog. So the free one is always tried first,
         and the expensive one only when it was asked for.
         """
-        # Notified once per incident, not once per check: this is now reached
+        # Notified once per incident, not once per check: this is reached
         # repeatedly while the tunnel stays broken, and a desktop notification
         # every forty seconds is its own fault.
         first = not self.health_demoted
@@ -1379,8 +1423,16 @@ class VpnTray:
         self._set_state(CONNECTING, f"not carrying traffic — {reason}")
 
         now = time.monotonic()
-        if (now - self.last_nudge >= SETTINGS["nudge-min-gap"]
+        # One nudge per incident. An incident no longer ends at the reconnect
+        # event the nudge produces (see _adopt_tunnel), so "already nudged and
+        # still demoted" is the evidence the nudge did not fix this — asking
+        # again looped at the rate limit forever against a routes-lost break,
+        # while the sign-in branch below was never reached. The timestamp still
+        # guards incidents arriving back to back.
+        if (not self.nudge_spent
+                and now - self.last_nudge >= SETTINGS["nudge-min-gap"]
                 and self._send_helper(C.CONTROL_RECONNECT)):
+            self.nudge_spent = True
             self.last_nudge = now
             self.log("[tray] asked openconnect to re-establish"
                      " (same session, no sign-in needed)")
@@ -1388,8 +1440,11 @@ class VpnTray:
                 self.notify("VPN reconnecting", reason)
             return
 
-        # The free option is spent, or there was no one to ask.
-        if first:
+        # The free option is spent, or there was no one to ask. Said once per
+        # incident, at the moment it becomes true — which may be cycles after
+        # the demotion, when a nudge that looked promising did not stick.
+        if not self.failure_notified:
+            self.failure_notified = True
             self.notify("VPN not carrying traffic", reason,
                         icon="dialog-warning-symbolic")
         if (self.autoreconnect_enabled()
@@ -1482,7 +1537,9 @@ class VpnTray:
                     match = pattern.search(line)
                     if match:
                         address = (match.groupdict().get("addr") or "").strip()
-                        if self.state != CONNECTED:
+                        # Same rule as the event path: a demotion is promoted
+                        # by the source that caused it, not by wording.
+                        if self.state != CONNECTED and not self.health_demoted:
                             self._announce_connected(address)
                         return False
         # Deliberately outside that guard. Scanning only in the fallback meant

@@ -384,6 +384,7 @@ What survives is true of every working tunnel and false of a broken one:
 | `the tunnel device was replaced by a different one` | the name is back but the `ifindex` is not the one this session created |
 | `the tunnel device is down` | `IFF_UP` clear |
 | `no routes point at the tunnel any more` | zero routes in `/proc/net/route` and `/proc/net/ipv6_route` — the case DPD cannot see |
+| `the tunnel's IPv4 routes are gone` / `…IPv6…` | a family the tunnel was observed to have, wholly gone — `ip route flush dev X` removes only IPv4, and a summed count sat green through exactly that break on a live tunnel (2026-08-23) |
 
 The facts behind each verdict are logged whether or not anything is wrong, so
 the next silent break arrives with evidence attached rather than as a mystery.
@@ -417,6 +418,15 @@ the source that caused it. Sharing one counter would let the device check —
 which still passes perfectly during a black hole — promote the badge back every
 twenty seconds and flap it indefinitely.
 
+That rule holds against openconnect's own word too. The `reconnect` event a
+nudge produces adopts the tunnel — address, device, ifindex — but does **not**
+promote the badge or reset the incident: openconnect asserting "connected" is
+exactly what it asserted before the demoting source found otherwise, and the
+source's own next pass (at most one probe cycle away) is what promotes.
+Taking the event's word flapped the badge every two minutes against a live
+tunnel whose routes were gone, refired the once-per-incident notification each
+cycle, and kept the sign-in branch permanently out of reach.
+
 ### Escalating, cheapest first
 
 The two recoveries differ by a Duo push and a typed password, so they are not
@@ -424,16 +434,19 @@ interchangeable:
 
 | Step | Cost | Rate limit |
 | --- | --- | --- |
-| `SIGUSR2` to `openconnect` via the control pipe | none — same session | `nudge-min-gap`, default 120s |
-| leave *Connected*, notify | none | — |
+| `SIGUSR2` to `openconnect` via the control pipe | none — same session | once per incident; `nudge-min-gap`, default 120s, between incidents |
+| stay demoted, say the free option is spent | none | once per incident |
 | full sign-in (`reconnect`) | Duo approval **and** polkit password | `autoreconnect-min-gap`, default 300s, and opt-in |
 
 The nudge travels down the **existing** control pipe, so it needs no new
-privileged call — the helper is already root and already listening. It is rate
-limited by a timestamp rather than a per-incident flag: each nudge produces a
-`reconnect` event, which looks like a fresh healthy start, so a flag would reset
-itself and a device that never returned would take a `SIGUSR2` every 40 seconds
-forever.
+privileged call — the helper is already root and already listening. It is
+spent once per incident, with the timestamp guarding incidents that arrive
+back to back. An earlier design used the timestamp alone, reasoning that a
+per-incident flag would reset itself on the `reconnect` event each nudge
+produces — which was true right up until the incident stopped resetting on
+that event (see above): now "already nudged and still demoted" is precisely
+the evidence the nudge cannot fix this break, and asking again every two
+minutes was the loop a routes-lost tunnel actually exhibited.
 
 Three details that are easy to get wrong, and were:
 
@@ -576,7 +589,7 @@ where it can be, checked by `asuvpn selftest`.
 
 ## How this is tested
 
-Three tiers in `asuvpn-selftest` (69 checks), plus the scenario sandbox in
+Three tiers in `asuvpn-selftest` (74 checks), plus the scenario sandbox in
 [tests/sandbox](tests/sandbox/README.md).
 
 The shaping constraint: **conventional unit tests would not have caught any of
@@ -628,6 +641,10 @@ breaking the code on purpose:
 | an `openconnect-sso` venv without `pkg_resources` | `openconnect-sso` can import `pkg_resources` |
 | teach the stand-in an invented line (`Connected as …`) | the stand-in only speaks lines from the installed catalogue |
 | weaken the log scrubber back to colour codes only | hostile control sequences never reach the log |
+| sum the route families again instead of counting each | a route family the tunnel had, wholly gone, is a verdict |
+| let the reconnect event promote a demoted badge | a reconnect event mid-demotion adopts the tunnel but not the badge |
+| let a mid-demotion adoption reset the incident flags | an incident takes one nudge, then says the free option is spent |
+| allow re-nudging within one incident | the same check — after winding the clock past the rate limit, so the flag and not the timestamp is what refuses |
 | neuter the contract's shared-group predicate | `sec.sh` (b2): the helper no longer exits 26 |
 | neuter the loader's inline check as well | `sec.sh` (b): a group-shared contract executes |
 
