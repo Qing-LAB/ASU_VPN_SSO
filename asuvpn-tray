@@ -1267,6 +1267,15 @@ class VpnTray:
             self._setting_problems = problems
             for problem in problems:
                 self.log(f"[config] {problem}")
+        # The CLI writes the same file, so the checkbox has to follow it or the
+        # menu shows the state from whenever it was built. Blocked while set, or
+        # the toggled handler would write the value straight back and log a
+        # change nobody made.
+        item = self.autoreconnect_item
+        if item.get_active() != SETTINGS["autoreconnect"]:
+            item.handler_block_by_func(self._on_autoreconnect_toggled)
+            item.set_active(SETTINGS["autoreconnect"])
+            item.handler_unblock_by_func(self._on_autoreconnect_toggled)
         if SETTINGS["health-interval"] != self._health_interval:
             self._health_interval = SETTINGS["health-interval"]
             self._schedule_health_check()
