@@ -905,6 +905,7 @@ asuvpn log -f
 | [`install.sh`](install.sh) | Copies the app into `~/.local` and registers it. No system changes. |
 | [`asuvpn.svg`](asuvpn.svg) | App icon. |
 | [`DESIGN.md`](DESIGN.md) | Internals: state machine, concurrency, invariants, how it is tested. |
+| [`HANDOVER.md`](HANDOVER.md) | What is proven and what is not, the lessons behind the design, and what to do next. |
 | [`ruff.toml`](ruff.toml) | Lint config. Its `ignore` list records which rules are off and why. |
 
 ### Checking it
