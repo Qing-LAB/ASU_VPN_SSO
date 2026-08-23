@@ -947,11 +947,11 @@ the default script somewhere that does not exist, matching on a message the
 binary no longer contains, and making the installed directory world-writable.
 All five are caught.
 
-The linters run separately. The three Python programs have no `.py` extension,
-so copy them under one first:
+The linters run separately. The four programs have no `.py` extension, so copy
+them under one first; the contract comes along so it is checked too:
 
 ```bash
-mkdir -p /tmp/asuvpn-lint && cp ruff.toml /tmp/asuvpn-lint/
+mkdir -p /tmp/asuvpn-lint && cp ruff.toml asuvpn_contract.py /tmp/asuvpn-lint/
 cp asuvpn-tray     /tmp/asuvpn-lint/asuvpn_tray.py
 cp asuvpn-helper   /tmp/asuvpn-lint/asuvpn_helper.py
 cp asuvpn-selftest /tmp/asuvpn-lint/asuvpn_selftest.py
@@ -962,12 +962,23 @@ pyflakes   /tmp/asuvpn-lint/*.py
 pylint --disable=all --enable=E --ignored-modules=gi,gi.repository /tmp/asuvpn-lint/*.py
 bandit -q -r /tmp/asuvpn-lint -ll
 vulture --min-confidence 70 /tmp/asuvpn-lint/*.py
+mypy --ignore-missing-imports /tmp/asuvpn-lint/*.py
 shellcheck -S style bootstrap.sh install.sh
 ```
 
-All of these are expected to be clean. `mypy --check-untyped-defs` still reports
-`Popen.stdin` as `IO | None`; that is a limitation of the stubs, not a defect —
-`stdin=PIPE` guarantees it, and every such write is exception-guarded anyway.
+All of these are expected to be clean. None of them need installing: `pipx run
+<tool>` runs each from pipx's own cache and touches nothing else (the last one
+as `pipx run --spec shellcheck-py shellcheck`). mypy's `--ignore-missing-imports`
+is for `gi`, which ships no stubs.
+
+The plain mypy run exits 0; the few `annotation-unchecked` notes it prints are
+pointers to the stricter mode, not findings. Stricter mypy
+(`--check-untyped-defs`) reports exactly two kinds of complaint,
+both typeshed limitations rather than defects: `Popen` pipe attributes typed
+`IO | None` (`PIPE` guarantees them, and every such write is exception-guarded
+anyway), and `spec_from_loader` typed as returning `ModuleSpec | None` in each
+program's contract loader (with an explicit `SourceFileLoader` it cannot).
+Anything outside those two kinds is new, and worth reading.
 
 ## Design notes
 
@@ -1044,11 +1055,19 @@ keyring probe reports correctly, and GNOME resolves the launcher and icon.
 > rather than from memory, and replayed against realistic v9.12 transcripts
 > for the DTLS, TLS-only, proxied, rehandshake and drop-then-recover cases.
 
-**Not yet exercised end to end:** a real `pkexec` prompt and a live tunnel, which
-need an actual Duo approval. The first real connect is therefore the one path
-still unproven — in particular, watch for the `default route restored:` line
-after your first disconnect. Run `asuvpn selftest` first: everything it checks
-is everything that can be checked without one.
+**Exercised end to end since:** a full connect through the real `pkexec`
+prompt, a real Duo approval and ASU's own gateway, watched over a working
+session and torn down cleanly — `openconnect exited with status 0`,
+`default route restored:` in the log, the device gone and nothing left running.
+The `--force-dpd 30` the helper passes was confirmed safe against ASU: the
+server declines DPD but answers forced probes, with zero reconnect events over
+the measured window.
+
+Still unproven: the watchdog's recovery ladder against a *real* failure
+(suspend/resume, WiFi loss — sandbox-proven only so far), the shared-group
+permission refusal end to end, and anything outside Ubuntu and GNOME.
+[HANDOVER.md](HANDOVER.md) keeps the ledger of what is proven against the real
+gateway versus only in the sandbox.
 
 ## License
 

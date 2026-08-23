@@ -825,7 +825,7 @@ def main():
 
     # Filled in once the device actually appears. Until then there is nothing
     # this session can claim to own, and teardown deletes nothing.
-    owned = {}
+    owned: dict[str, int] = {}
 
     # Handlers go up *before* the spawn. A signal landing between Popen and
     # signal.signal() would take the default action and kill this process,
@@ -833,7 +833,7 @@ def main():
     # installed first and reads the tunnel out of a holder once it exists.
     # Handlers run on the main thread, which is about to park in reap(), so
     # teardown is handed to a worker.
-    holder = {}
+    holder: dict[str, Tunnel] = {}
 
     def on_signal(_signum, _frame):
         tunnel = holder.get("tunnel")

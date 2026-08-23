@@ -574,7 +574,7 @@ where it can be, checked by `asuvpn selftest`.
 
 ## How this is tested
 
-Three tiers in `asuvpn-selftest` (66 checks), plus a scenario sandbox.
+Three tiers in `asuvpn-selftest` (67 checks), plus a scenario sandbox.
 
 The shaping constraint: **conventional unit tests would not have caught any of
 the bugs that actually hurt this project.** `Connected as`, the hardcoded script
@@ -634,10 +634,13 @@ dispatches on `$reason` but skips some, and **warn** when it cannot tell.
 
 ### Still unproven
 
-A real `pkexec` prompt and a live tunnel, which need an actual Duo approval.
-Everything that can be checked without one is checked; the first real connect is
-the remaining unknown, and the line to watch for after the first disconnect is
-`default route restored:`.
+The live path itself no longer is: a real connect through real `pkexec`, real
+Duo and the real gateway has been run, watched and torn down cleanly, with
+`default route restored:` observed on the way out. What remains sandbox-proven
+only (the watchdog's recovery ladder) or untested outright (the shared-group
+refusal end to end; anything outside Ubuntu/GNOME) is kept, with evidence, in
+[HANDOVER.md](HANDOVER.md) — update that ledger, not this section, as items
+close.
 
 ## Changing things
 

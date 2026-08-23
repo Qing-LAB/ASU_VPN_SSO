@@ -435,7 +435,7 @@ def check_output_framing(helper, r):
              for ln in chunk.replace("\r", "\n").splitlines(True)]
     FakeProc = type("FakeProc", (), {"stdout": iter(lines)})
 
-    emitted = []
+    emitted: list[str] = []
     original = helper.emit
     helper.emit = emitted.append
     try:
@@ -802,7 +802,7 @@ def check_event_translation(helper, tray, C, r):
     """
     token = "a" * 32
     expected_lines = 3
-    emitted = []
+    emitted: list[str] = []
     original = helper.emit
     helper.emit = emitted.append
     server = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
