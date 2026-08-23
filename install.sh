@@ -16,6 +16,8 @@ APPS_DIR="$HOME/.local/share/applications"
 ICON_DIR="$HOME/.local/share/icons/hicolor/scalable/apps"
 BIN_DIR="$HOME/.local/bin"
 DESKTOP_FILE="$APPS_DIR/asuvpn.desktop"
+# Kept in sync by hand with the contract's `server` default: bash cannot load
+# asuvpn_contract.py, and this value must exist before the tray is installed.
 SERVER="sslvpn.asu.edu"
 LINK_MODE=0
 REMOVE_STALE_COPY=0
@@ -71,9 +73,14 @@ else
   install -m 0755 "$SRC_DIR/asuvpn-tray" "$SRC_DIR/asuvpn-helper" \
                   "$SRC_DIR/asuvpn-notify" "$SRC_DIR/asuvpn-selftest" "$INSTALL_DIR/"
   # Not executable: it is loaded, not run. Every program reads it by explicit
-  # path, so it has to sit beside them.
+  # path, so it has to sit beside them. The icon is deliberately not copied
+  # here — every consumer resolves the theme name against the hicolor copy
+  # installed below, and a second copy beside the programs was read by nothing.
   install -m 0644 "$SRC_DIR/asuvpn_contract.py" "$INSTALL_DIR/"
-  install -m 0644 "$SRC_DIR/asuvpn.svg" "$INSTALL_DIR/"
+  # Earlier installs copied the icon here too. Nothing ever read that copy,
+  # so an upgrade removes it. Copy mode only: in --link mode this directory
+  # is the checkout, where asuvpn.svg is the real source file.
+  rm -f "$INSTALL_DIR/asuvpn.svg"
 fi
 
 TRAY="$INSTALL_DIR/asuvpn-tray"
@@ -84,8 +91,9 @@ chmod +x "$TRAY" "$INSTALL_DIR/asuvpn-helper" "$INSTALL_DIR/asuvpn-notify" \
 
 # The helper and the notify script are executed as root. The helper refuses to
 # run if either is group- or world-writable, so make sure they are not: a stray
-# umask or an unpacked archive can easily leave 0775 behind.
-chmod 0755 "$INSTALL_DIR" 2>/dev/null || true
+# umask or an unpacked archive can easily leave 0775 behind. go-w only — in
+# --link mode this directory is the user's own checkout, and an earlier
+# unconditional 0755 here silently widened a deliberately private 0700.
 chmod go-w "$INSTALL_DIR" "$TRAY" "$INSTALL_DIR/asuvpn-helper" \
            "$INSTALL_DIR/asuvpn-notify" "$INSTALL_DIR/asuvpn-selftest" \
            "$INSTALL_DIR/asuvpn_contract.py" 2>/dev/null || true
@@ -104,10 +112,16 @@ chmod 0700 "$CONFIG_DIR"
 if [ -f "$CONFIG_FILE" ]; then
   # awk with the value passed as data, never interpolated into an expression:
   # `--server 'x|w /etc/passwd'` was an arbitrary file write once already.
+  # END appends when no server line exists — a half-written file from an
+  # interrupted first install used to swallow --server silently, forever —
+  # and the mv is a separate command so set -e catches an awk failure
+  # instead of skipping the mv and reporting success.
   awk -v line="server = $SERVER" \
     '{ split($0, f, "#"); split(f[1], kv, "="); k=kv[1]; gsub(/^[ \t]+|[ \t]+$/, "", k)
-       if (k == "server") { print line } else { print } }' \
-    "$CONFIG_FILE" > "$CONFIG_FILE.tmp" && mv "$CONFIG_FILE.tmp" "$CONFIG_FILE"
+       if (k == "server") { print line; found=1 } else { print } }
+     END { if (!found) print line }' \
+    "$CONFIG_FILE" > "$CONFIG_FILE.tmp"
+  mv "$CONFIG_FILE.tmp" "$CONFIG_FILE"
 else
   "$INSTALL_DIR/asuvpn-tray" --write-config "$SERVER" > "$CONFIG_FILE"
 fi
@@ -164,10 +178,12 @@ fi
 # containing & or | corrupted the line silently for the same reason.
 AUTOSTART_FILE="$AUTOSTART_DIR/asuvpn-tray.desktop"
 if [ -f "$AUTOSTART_FILE" ]; then
+  # Two commands, not an && list: under set -e an awk failure in an && list
+  # is exempt, so the mv was skipped and the "repointed" line below lied.
   awk -v line="Exec=\"$TRAY\" --server $SERVER tray" \
     '/^Exec=/ { print line; next } { print }' \
-    "$AUTOSTART_FILE" > "$AUTOSTART_FILE.tmp" &&
-    mv "$AUTOSTART_FILE.tmp" "$AUTOSTART_FILE"
+    "$AUTOSTART_FILE" > "$AUTOSTART_FILE.tmp"
+  mv "$AUTOSTART_FILE.tmp" "$AUTOSTART_FILE"
   echo "  autostart entry repointed at $TRAY"
 fi
 
@@ -176,7 +192,7 @@ command -v gtk-update-icon-cache >/dev/null &&
   gtk-update-icon-cache -f -t "$HOME/.local/share/icons/hicolor" 2>/dev/null || true
 
 echo "Installed:"
-echo "  program   $INSTALL_DIR  (0755, not group-writable)"
+echo "  program   $INSTALL_DIR  (not group- or world-writable)"
 echo "  launcher  $DESKTOP_FILE"
 echo "  icon      $ICON_DIR/asuvpn.svg"
 echo "  command   $BIN_DIR/asuvpn"

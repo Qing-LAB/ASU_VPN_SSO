@@ -44,6 +44,10 @@ chmod 0755 "$SB/rbin/openconnect-sso"
 # beforehand.
 if [ -n "${XAUTHORITY:-}" ] && [ -r "$XAUTHORITY" ]; then
     install -m 0600 "$XAUTHORITY" "$SB/xauth"
+else
+    # Nothing to copy: remove any stale cookie too, or display scenarios
+    # would keep authenticating with a credential from a previous session.
+    rm -f "$SB/xauth"
 fi
 
 # A bare scenario name is resolved against this directory.
@@ -56,8 +60,10 @@ fi
 # our own exist inside. That second mapping is what lets sec.sh stage a file
 # owned by a *second* group and watch the real helper refuse it — a predicate
 # truth table cannot prove that end to end; only a second principal can.
+# 3<&0 duplicates the caller's real stdin before the heredoc replaces fd 0,
+# so the inner exec can hand it back to the command it runs.
 exec unshare -Urm --map-root-user --map-auto /bin/bash -s -- \
-    "$SB" "$REAL_SSO" "$@" <<'INNER'
+    "$SB" "$REAL_SSO" "$@" 3<&0 <<'INNER'
 set -euo pipefail
 SB="$1"; REAL_SSO="$2"; shift 2
 export PATH="$SB/rbin:$PATH"
@@ -71,6 +77,7 @@ mount --bind "$SB/rbin/vpnc-script" /usr/share/vpnc-scripts/vpnc-script
 fail=0
 check(){ grep -qa 'SANDBOX-MARKER' "$1" 2>/dev/null || { echo "GUARD FAIL: $2" >&2; fail=1; }; }
 check /usr/sbin/openconnect openconnect
+[ ! -e /usr/bin/openconnect ] || check /usr/bin/openconnect "openconnect (/usr/bin)"
 check /usr/bin/pkexec pkexec
 check "$REAL_SSO" openconnect-sso
 check /usr/share/vpnc-scripts/vpnc-script vpnc-script
@@ -80,5 +87,9 @@ for b in openconnect openconnect-sso pkexec; do
 done
 [ "$fail" -eq 0 ] || { echo "ABORTING: isolation incomplete" >&2; exit 90; }
 echo "guard: every binary a scenario could reach is a stand-in" >&2
-exec "$@"
+# The heredoc that carried this script consumed fd 0 and is at EOF; hand the
+# caller's real stdin (saved as fd 3 outside) to the command. Without this,
+# `enter.sh /bin/bash` printed the guard line and exited instantly — dropping
+# the user back into their REAL shell right after saying all is a stand-in.
+exec "$@" 0<&3 3<&-
 INNER

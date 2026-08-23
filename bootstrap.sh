@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # One-shot setup for the ASU VPN tray applet on a fresh Ubuntu system.
-# Safe to re-run; every step is skipped if it is already satisfied.
+# Safe to re-run; anything already satisfied is skipped, except the setuptools
+# pin and the PATH check, which run every time on purpose — their comments say
+# why.
 #
 #   ./bootstrap.sh                          # install everything, then register
 #   ./bootstrap.sh --server vpn.other.edu   # a different endpoint

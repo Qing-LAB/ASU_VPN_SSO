@@ -168,12 +168,13 @@ CONNECTED_MESSAGES = (
 CONNECTED_PATTERNS = tuple(re.compile(r) for _, r, _ in CONNECTED_MESSAGES)
 # openconnect-sso colours its logs (CSI sequences), and a hostile VPN banner
 # could carry OSC sequences or bare control characters, which would reach a
-# terminal through `asuvpn log`. Everything ESC-led and every C0 control except
-# tab is removed where the log line is built.
+# terminal through `asuvpn log`. Everything ESC-led, every C0 control except
+# tab, and the C1 controls (which arrive as well-formed UTF-8, so decoding
+# does not replace them) are removed where the log line is built.
 ANSI_ESCAPE = re.compile(
-    r"\x1b\[[0-9;]*[A-Za-z]"                 # CSI: colours, cursor movement
-    r"|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)?"   # OSC: titles, hyperlinks
-    r"|[\x00-\x08\x0b-\x1f\x7f]"             # bare C0 controls and DEL
+    r"\x1b\[[0-9:;<=>?]*[ -/]*[@-~]"           # CSI, private forms included
+    r"|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)?"     # OSC: titles, hyperlinks
+    r"|[\x00-\x08\x0b-\x1f\x7f\u0080-\u009f]"    # bare C0, DEL, C1 controls
 )
 
 # Deliberately narrow. A bare /Reconnect/ matched thirty message templates in
@@ -263,10 +264,29 @@ def probe_tunnel(address, port, timeout):
         return True, f"{address} refused the connection, which is still a reply"
     except (TimeoutError, socket.timeout):
         return False, f"{address} did not answer in {timeout}s"
-    except OSError as exc:
+    except (OSError, ValueError) as exc:
         # No route, network down: the passive checks own that diagnosis and
         # give a better one, so this declines to add a second opinion.
+        # ValueError covers getaddrinfo's UnicodeError on a name that cannot
+        # be resolved at all -- equally inconclusive, and letting it raise
+        # would kill the probe thread and wedge probing for good.
         return None, f"{address}: {exc.__class__.__name__}"
+
+
+def read_ifindex(device):
+    """The kernel's index for this device, or None if it has none right now.
+
+    An ifindex identifies one *incarnation* of a name, which is what tells
+    "our tunnel is still here" from "a device with the same name is here".
+    One implementation, because the tray needed this in two places and the
+    helper carries its own — three hand-copies of a /sys read is how a fix
+    to one of them gets lost.
+    """
+    try:
+        with open(f"/sys/class/net/{device}/ifindex") as fh:
+            return int(fh.read().strip())
+    except (OSError, ValueError):
+        return None
 
 
 def tunnel_health(device, ifindex, routes_seen=None):
@@ -301,10 +321,8 @@ def tunnel_health(device, ifindex, routes_seen=None):
     if not C.INTERFACE_RE.match(device):
         return None, {"dev": device, "ignored": "not a usable device name"}
     facts = {"dev": device}
-    try:
-        with open(f"/sys/class/net/{device}/ifindex") as fh:
-            current = int(fh.read().strip())
-    except (OSError, ValueError):
+    current = read_ifindex(device)
+    if current is None:
         return "the tunnel device is gone", facts
     facts["ifindex"] = current
     if ifindex is not None and current != ifindex:
@@ -511,6 +529,10 @@ class VpnTray:
             os.chmod(LOG_FILE.parent, 0o700)
             if LOG_FILE.exists():
                 os.chmod(LOG_FILE, 0o600)
+                # Count from the file's real size, not from zero: an applet
+                # restarted over a large inherited log would otherwise let it
+                # grow a whole extra cap before the first rotation.
+                self._log_bytes = LOG_FILE.stat().st_size
         except OSError:
             pass  # an unwritable cache dir costs the log, not the applet
 
@@ -652,7 +674,13 @@ class VpnTray:
                 # than growing it forever. The overflow survives as .1.
                 self._rotate_log_locked()
             try:
-                with LOG_FILE.open("a") as fh:
+                # O_CREAT with 0600, because a plain append would create a
+                # missing file with umask permissions — and the log holds the
+                # assigned address, the routes and the DNS. An existing file
+                # keeps its mode.
+                fd = os.open(LOG_FILE,
+                             os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+                with os.fdopen(fd, "a") as fh:
                     fh.write(line + "\n")
                 self._log_bytes += len(line) + 1
             except OSError:
@@ -685,7 +713,13 @@ class VpnTray:
             os.chmod(LOG_FILE, 0o600)
         except OSError:
             pass  # an unwritable cache dir costs the log, not the applet
-        self._log_bytes = 0
+        # Re-measured rather than assumed zero: a failed rotation leaves the
+        # old content in place, and a meter pretending otherwise would defer
+        # the next attempt by a whole extra cap.
+        try:
+            self._log_bytes = LOG_FILE.stat().st_size
+        except OSError:
+            self._log_bytes = 0
 
     def _append_to_log_window(self, line):
         if self.log_buffer is not None:
@@ -858,6 +892,13 @@ class VpnTray:
                 # Without this the escalation reaches here and silently does
                 # nothing — in the one case, a helper already dead, where
                 # signing in again is the only thing left that could work.
+                #
+                # The bump retires the dead helper's still-queued exit
+                # callback. The health timer can run before queued idles, so
+                # without it that callback lands mid-sign-in, finds a state it
+                # does not expect, and paints FAILED with a "disconnected"
+                # notification over a recovery that is going fine.
+                self.helper_generation += 1
                 self._reset_tunnel_state()
                 self._set_state(DISCONNECTED)
             self.connect(keep_log=keep_log)
@@ -1023,10 +1064,18 @@ class VpnTray:
         # Publish it only after a re-check, so a cancel that landed during the
         # spawn cannot leave an unkillable sign-in behind.
         with self._auth_lock:
-            if superseded():
-                self._kill_group(proc)
-                return
-            self.auth_proc = proc
+            doomed = superseded()
+            if not doomed:
+                self.auth_proc = proc
+        if doomed:
+            self._kill_group(proc)
+            # And reap it: nothing else ever wait()s on this generation, and
+            # a kill without a wait keeps a zombie for the applet's lifetime.
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+            return
 
         stderr_thread = threading.Thread(
             target=self._pump, args=(proc.stderr, "[sso] "), daemon=True
@@ -1268,14 +1317,15 @@ class VpnTray:
         if not device or not C.INTERFACE_RE.match(device):
             return
         self.tunnel_device: str | None = device
-        # Taken now, while openconnect has just created it. Comparing it later
-        # is what tells "our tunnel is still here" from "a device with the same
-        # name is here", which is not the same claim.
-        try:
-            with open(f"/sys/class/net/{device}/ifindex") as fh:
-                self.tunnel_ifindex: int | None = int(fh.read().strip())
-        except (OSError, ValueError):
-            self.tunnel_ifindex = None
+        # Taken now, while openconnect has just created it.
+        index = read_ifindex(device)
+        if index is not None and index != self.tunnel_ifindex:
+            # A different incarnation of the device. Which route families the
+            # old one carried says nothing about this one, and a stale latch
+            # here would hold a demotion forever against a working tunnel
+            # whose new session simply has no routes of that family.
+            self.routes_seen = {"routes4": False, "routes6": False}
+        self.tunnel_ifindex: int | None = index
 
     def _reset_tunnel_state(self):
         """Forget everything the watchdog knows about a tunnel.
@@ -1311,11 +1361,16 @@ class VpnTray:
         Rescheduled each time rather than installed once, so changing
         health-interval in the config takes effect without a restart — and
         setting it to 0 stops the watchdog entirely, which is the only honest
-        way to offer an off switch for something that runs on a timer.
+        way to offer an off switch for something that runs on a timer. The
+        tick itself survives even then, at the schema's default cadence,
+        because it is also the only thing that re-reads the config: without
+        it, no setting change — including turning the watchdog back on —
+        would ever be noticed again until a restart.
         """
         interval = SETTINGS["health-interval"]
-        if interval > 0:
-            GLib.timeout_add_seconds(interval, self._health_check)
+        if interval <= 0:
+            interval = C.SETTINGS_BY_NAME["health-interval"].default
+        GLib.timeout_add_seconds(interval, self._health_check)
 
     def _health_check(self):
         """Ask the kernel, and occasionally the network, whether this still works.
@@ -1349,6 +1404,8 @@ class VpnTray:
             self._health_interval = SETTINGS["health-interval"]
             self._schedule_health_check()
             return False  # this timer is replaced by the one just armed
+        if SETTINGS["health-interval"] <= 0:
+            return True  # watchdog off: keep reading the config, check nothing
         if self.state not in (CONNECTED, CONNECTING) or self.helper_proc is None:
             return True
 
@@ -1386,15 +1443,27 @@ class VpnTray:
         port, timeout = SETTINGS["probe-port"], SETTINGS["probe-timeout"]
 
         def work():
-            alive, detail = probe_tunnel(target, port, timeout)
+            try:
+                alive, detail = probe_tunnel(target, port, timeout)
+            except Exception as exc:
+                # Whatever went wrong, the reply must arrive: probe_in_flight
+                # is cleared only in _probe_result, and a dead thread here
+                # would silently disable probing for the applet's lifetime.
+                alive, detail = None, f"probe error: {exc.__class__.__name__}"
             GLib.idle_add(self._probe_result, alive, detail, generation)
 
         threading.Thread(target=work, daemon=True).start()
 
     def _probe_result(self, alive, detail, generation):
         self.probe_in_flight = False
-        if self.quitting or generation != self.helper_generation:
+        if self.quitting or self.cancelled or generation != self.helper_generation:
             return False  # a reply for a tunnel that is no longer the live one
+        if self.state == DISCONNECTING:
+            # Teardown has already decided how this ends — the same guard the
+            # event path has. A strike landing here once stomped a user's
+            # Disconnect back to CONNECTING and handed a requested teardown
+            # to the escalation ladder, which read it as a broken tunnel.
+            return False
         if alive is None:
             return False  # unreachable or unconfigured; the device check owns it
         if alive:
@@ -1433,7 +1502,12 @@ class VpnTray:
 
     @staticmethod
     def _facts(facts):
-        """Always logged, healthy or not, so the next silent break has evidence."""
+        """Formatted for the strike and recovery lines, as evidence.
+
+        A quietly healthy check logs nothing — every twenty seconds forever
+        would drown the log — so the facts appear on every failing check and
+        on the recovery line, which is where the next silent break needs them.
+        """
         return ", ".join(f"{k}={v}" for k, v in facts.items()) or "no detail"
 
     def _tunnel_unhealthy(self, reason):
@@ -1474,6 +1548,14 @@ class VpnTray:
                 self.notify("VPN reconnecting", reason)
             return
 
+        # The nudge was not sent. Said once per incident, at the moment that
+        # becomes true — which may be cycles after the demotion, when a nudge
+        # that looked promising did not stick.
+        if not self.failure_notified:
+            self.failure_notified = True
+            self.notify("VPN not carrying traffic", reason,
+                        icon="dialog-warning-symbolic")
+
         # From here on, every path logs the decision it took and why. A log
         # that shows verdicts but no decisions reads as a hang: on 2026-08-23
         # the cycles after a spent nudge logged their strikes and then went
@@ -1482,20 +1564,20 @@ class VpnTray:
             self.log("[tray] the free re-establish was already tried for this"
                      " incident and traffic did not return")
         elif now - self.last_nudge < SETTINGS["nudge-min-gap"]:
+            # Held, not spent: the free option has not been tried for this
+            # incident. Falling through here once bought with a Duo push what
+            # waiting under two minutes would have gotten for free — so wait;
+            # a later cycle lands past the gap and nudges.
             wait = int(SETTINGS["nudge-min-gap"] - (now - self.last_nudge))
             self.log(f"[tray] holding the free re-establish for another {wait}s"
                      " (nudge-min-gap)")
+            return
         else:
             self.log("[tray] could not ask openconnect to re-establish;"
                      " the helper is not listening")
 
-        # The free option is spent, or there was no one to ask. Said once per
-        # incident, at the moment it becomes true — which may be cycles after
-        # the demotion, when a nudge that looked promising did not stick.
-        if not self.failure_notified:
-            self.failure_notified = True
-            self.notify("VPN not carrying traffic", reason,
-                        icon="dialog-warning-symbolic")
+        # The free option is spent, or there is no one to ask: only now may
+        # the expensive path be considered.
         if not self.autoreconnect_enabled():
             self.log("[tray] automatic sign-in is off; staying demoted until a"
                      " check clears — Reconnect or Disconnect when ready")
@@ -1596,6 +1678,10 @@ class VpnTray:
                         # Same rule as the event path: a demotion is promoted
                         # by the source that caused it, not by wording.
                         if self.state != CONNECTED and not self.health_demoted:
+                            # And adopt like the event path does: the DEVICE
+                            # line supplied the name even without events, and
+                            # the watchdog needs the ifindex and the address.
+                            self._adopt_tunnel(self.tunnel_device, address)
                             self._announce_connected(address)
                         return False
         # Deliberately outside that guard. Scanning only in the fallback meant
@@ -1944,7 +2030,7 @@ exit codes:
   0  the request was carried out; for status and --wait, connected
   1  status/--wait: not connected. disconnect: the tunnel did not close
   2  a bad command line (argparse's own code)
-  3  status: the applet is not running
+  3  status, or a --wait the applet vanished under: it is not running
   4  a different server was asked for than the running applet is using
 """
 
@@ -1961,7 +2047,11 @@ def run_selftest(argv):
         print(f"{selftest} is missing or not executable", file=sys.stderr)
         return 1
     try:
-        return subprocess.run([sys.executable, str(selftest), *argv]).returncode
+        # -I mirrors the helper's isolation. Run privileged (sudo asuvpn
+        # selftest), the script's user-owned directory must not be importable,
+        # or a stdlib-named file dropped beside it executes as root.
+        return subprocess.run(
+            [sys.executable, "-I", str(selftest), *argv]).returncode
     except OSError as exc:
         print(f"could not run {selftest}: {exc}", file=sys.stderr)
         return 1

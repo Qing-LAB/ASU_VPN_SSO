@@ -1,4 +1,4 @@
-#!/usr/bin/python3
+#!/usr/bin/python3 -I
 """Checks the ASU VPN applet against the machine it is installed on.
 
 Ordinary unit tests would not have caught a single one of the bugs that hurt
@@ -14,8 +14,12 @@ So the checks come in three tiers, and the middle one is the point:
   environment  our assumptions put to the installed binaries themselves
   wiring       asuvpn-notify actually executed, end to end
 
-Nothing here connects to a network, asks for privileges, or touches the real
-openconnect. Run it after installing, or whenever something behaves oddly:
+Nothing here needs privileges or talks to the VPN. The real openconnect is
+run only as `openconnect --version`, to ask it for its own script path, and
+the network is touched only by two probe exercises that cannot leave anything
+behind: a loopback connect and a SYN to RFC 5737 documentation space, which
+must never answer. Run it after installing, or whenever something behaves
+oddly:
 
     asuvpn selftest
     asuvpn selftest --tier environment
@@ -37,6 +41,7 @@ import importlib.util  # noqa: E402
 import os  # noqa: E402
 import re  # noqa: E402
 import socket  # noqa: E402
+import stat  # noqa: E402
 import subprocess  # noqa: E402
 import tempfile  # noqa: E402
 import threading  # noqa: E402
@@ -145,16 +150,30 @@ def check_contract(C, r):
             f"got {values!r}")
     r.check("unknown keys and out-of-range values are reported, not raised",
             len(problems) == 3, f"got {problems!r}")
-    rendered, _ = C.parse_settings(C.render_settings())
-    r.check("the generated config file parses back to the defaults",
-            rendered == C.defaults(),
-            "render_settings and parse_settings disagree, so the file install.sh"
-            " writes does not mean what the schema says")
+    rendered, round_trip_problems = C.parse_settings(C.render_settings())
+    r.check("the generated config file parses back to the defaults, cleanly",
+            rendered == C.defaults() and not round_trip_problems,
+            f"problems={round_trip_problems!r} — render_settings and"
+            " parse_settings disagree, so the file install.sh writes does"
+            " not mean what the schema says")
 
 
 def load(name, filename):
-    """Import a sibling program. They have no .py extension, hence the loader."""
+    """Import a sibling program. They have no .py extension, hence the loader.
+
+    With the same refusal the programs' own loaders apply: run privileged,
+    nothing is executed out of a directory a second principal can write.
+    Every load goes through here — the contract and the sibling sources
+    alike — so a tampered file is refused before it runs, not after. This
+    was the one loader in the project that skipped the check.
+    """
     path = os.path.join(HERE, filename)
+    if os.geteuid() == 0:
+        for target in (HERE, path):
+            info = os.stat(target)
+            if info.st_mode & stat.S_IWOTH or (
+                    info.st_mode & stat.S_IWGRP and info.st_gid != info.st_uid):
+                raise SystemExit(f"refusing to load {target}: writable by others")
     loader = importlib.machinery.SourceFileLoader(name, path)
     spec = importlib.util.spec_from_loader(name, loader)
     module = importlib.util.module_from_spec(spec)
@@ -233,12 +252,23 @@ def check_permission_rules(C, r):
         d = os.path.join(base, "app")
         os.mkdir(d)
         os.chown(d, -1, os.getgid())
-        for mode, expected, label in (
+        modes = [
             (0o755, None, "0755"),
-            (0o775, None, "0775 with a user-private group (umask 002 checkout)"),
             (0o777, "world-writable", "0777"),
             (0o757, "world-writable", "0757"),
-        ):
+        ]
+        if os.getuid() == os.getgid():
+            modes.insert(1, (0o775, None,
+                             "0775 with a user-private group (umask 002"
+                             " checkout)"))
+        else:
+            # The rule under test exempts gid == uid; on an account whose
+            # primary group is shared, this fixture cannot stage a
+            # user-private group, and failing would be crying wolf.
+            r.warn("0775 with a user-private group is allowed",
+                   "this account's primary gid differs from its uid, so the"
+                   " user-private-group case cannot be staged here")
+        for mode, expected, label in modes:
             os.chmod(d, mode)
             got = C.unsafe_write_access(d)
             r.check(f"{label} is {'allowed' if expected is None else 'refused'}",
@@ -307,10 +337,10 @@ def check_tunnel_health(tray, r):
             leaked.append(name)
     r.check("a device name that could not name a device is never used as a path",
             not leaked, f"these were used unvalidated: {leaked}")
+    fake = tray.route_count("asuvpn-nope")
     r.check("routes are counted for a real device and not for a fake one",
-            tray.route_count("lo") != (0, 0)
-            and tray.route_count("asuvpn-nope") == (0, 0),
-            f"lo={tray.route_count('lo')} fake={tray.route_count('asuvpn-nope')}")
+            tray.route_count("lo") != (0, 0) and fake[0] == 0 and not fake[1],
+            f"lo={tray.route_count('lo')} fake={fake}")
     # The rule, held against whatever lo actually has right now: a family this
     # tunnel was seen to have, wholly gone, is a verdict even while the other
     # family survives. `ip route flush dev X` removes only IPv4, and a summed
@@ -333,9 +363,6 @@ def check_notifications(tray, r):
     miss, and the reassuring half — that openconnect recovers this one on its
     own, with no sign-in — is not something a spinner can convey.
     """
-    if not hasattr(tray, "VpnTray"):
-        r.warn("a dropped tunnel is announced", "GUI classes unavailable here")
-        return
 
     class Stub:
         server = "vpn.example.edu"
@@ -394,10 +421,6 @@ def check_demotion_rules(tray, r):
     Exercised through a stand-in `self` borrowing the real methods, so no
     display is needed and the real state machine is what runs.
     """
-    if not hasattr(tray, "VpnTray"):
-        r.warn("a demotion is only undone by the source that caused it",
-               "GUI classes unavailable here")
-        return
 
     class Stub:
         _apply_state_event = tray.VpnTray._apply_state_event
@@ -406,6 +429,7 @@ def check_demotion_rules(tray, r):
         _unhealthy = tray.VpnTray._unhealthy
         _tunnel_unhealthy = tray.VpnTray._tunnel_unhealthy
         _healthy = tray.VpnTray._healthy
+        _probe_result = tray.VpnTray._probe_result
         server = "vpn.example.edu"
 
         def __init__(self):
@@ -425,6 +449,9 @@ def check_demotion_rules(tray, r):
             self.last_failure = None
             self.last_nudge = float("-inf")
             self.last_autoreconnect = float("-inf")
+            self.helper_generation = 0
+            self.probe_in_flight = False
+            self.autoreconnect = False
             self.notes, self.sent, self.logged = [], [], []
             self.reconnects = []
 
@@ -445,7 +472,7 @@ def check_demotion_rules(tray, r):
             return True
 
         def autoreconnect_enabled(self):
-            return False
+            return self.autoreconnect
 
     stub = Stub()
     strikes = max(1, tray.SETTINGS["health-strikes"])
@@ -467,9 +494,11 @@ def check_demotion_rules(tray, r):
 
     # Wind the clock past the rate limit before the next round: the incident
     # flag, not the timestamp, must be what refuses a second nudge — otherwise
-    # a reset flag hides behind the gap and this check proves nothing.
+    # a reset flag hides behind the gap and this check proves nothing. A third
+    # round follows so the warning's once-per-incident guard is what holds the
+    # count at one, not the fixture stopping early.
     stub.last_nudge -= max(1, tray.SETTINGS["nudge-min-gap"]) + 1
-    for _ in range(strikes):
+    for _ in range(2 * strikes):
         stub._unhealthy("probe", "nothing answers", "no reply")
     r.check("an incident takes one nudge, then says the free option is spent",
             stub.sent == ["reconnect"]
@@ -483,6 +512,23 @@ def check_demotion_rules(tray, r):
             and any("sign-in is off" in line for line in stub.logged),
             f"logged={stub.logged}")
 
+    stub._healthy("device", "the device checks still pass")
+    r.check("a source that did not demote cannot promote",
+            stub.state == tray.CONNECTING and stub.health_demoted,
+            f"state={stub.state!r} demoted={stub.health_demoted} — the device"
+            " check cleared a probe demotion, which flaps the badge against"
+            " a tunnel that is genuinely carrying nothing")
+
+    # A verdict landing after teardown began must change nothing: this once
+    # stomped a user's Disconnect back to CONNECTING and handed a requested
+    # teardown to the escalation ladder.
+    stub.state = tray.DISCONNECTING
+    stub._probe_result(False, "no reply", stub.helper_generation)
+    r.check("a probe verdict arriving mid-teardown changes nothing",
+            stub.state == tray.DISCONNECTING and stub.strikes["probe"] == 0,
+            f"state={stub.state!r} strikes={stub.strikes}")
+    stub.state = tray.CONNECTING
+
     stub._healthy("probe", "answered")
     r.check("the demoting source is what promotes, and it resets the incident",
             stub.state == tray.CONNECTED
@@ -490,6 +536,43 @@ def check_demotion_rules(tray, r):
             and not stub.health_demoted and not stub.nudge_spent
             and not stub.failure_notified,
             f"state={stub.state!r} notes={stub.notes}")
+
+    # A nudge that is merely held (rate-limited) is not spent: escalating past
+    # it would buy with a Duo push what waiting under the gap gets for free.
+    original_gap = tray.SETTINGS["nudge-min-gap"]
+    tray.SETTINGS["nudge-min-gap"] = 120
+    try:
+        held = Stub()
+        held.autoreconnect = True
+        held.last_nudge = time.monotonic() - 1
+        for _ in range(strikes):
+            held._unhealthy("probe", "nothing answers", "no reply")
+    finally:
+        tray.SETTINGS["nudge-min-gap"] = original_gap
+    r.check("a held nudge is waited out, never escalated past",
+            held.reconnects == [] and held.sent == []
+            and any("holding the free re-establish" in line
+                    for line in held.logged),
+            f"reconnects={held.reconnects} sent={held.sent}"
+            f" logged={held.logged}")
+
+    # A reconnect that lands on a *different* device incarnation must not
+    # inherit the old one's route-family observations: a stale IPv6 latch
+    # held a demotion forever against a working v4-only session.
+    if tray.read_ifindex("lo") is None:
+        r.warn("a replaced device forgets the old one's route families",
+               "no lo to stage the adoption with")
+    else:
+        fresh = Stub()
+        fresh.health_demoted = True
+        fresh.routes_seen = {"routes4": True, "routes6": True}
+        fresh.tunnel_ifindex = -1  # provably not lo's real index
+        fresh._adopt_tunnel("lo", "10.0.0.9", "")
+        r.check("a replaced device forgets the old one's route families",
+                fresh.routes_seen == {"routes4": False, "routes6": False}
+                and fresh.tunnel_ifindex not in (None, -1),
+                f"routes_seen={fresh.routes_seen}"
+                f" ifindex={fresh.tunnel_ifindex}")
 
     # The verb a user reaches for. A demoted tunnel is established, so the
     # menu offers Reconnect — and `connect` has to mean the same intent there,
@@ -577,8 +660,14 @@ def check_liveness_probe(tray, r):
             f"got alive={alive!r} ({detail}) — a RST is a reply, and treating"
             " it as death would condemn a working tunnel")
     alive, detail = tray.probe_tunnel("", 53, 3)
-    r.check("no probe target is inconclusive, not a failure", alive is None,
-            f"got alive={alive!r} ({detail})")
+    # A name getaddrinfo cannot even encode raises UnicodeError, which is not
+    # an OSError; unhandled it killed the probe thread, and probe_in_flight
+    # then wedged True and disabled probing for the applet's lifetime.
+    bad_alive, bad_detail = tray.probe_tunnel("x" * 300, 53, 3)
+    r.check("an unusable probe target is inconclusive, not a failure or a crash",
+            alive is None and bad_alive is None,
+            f"empty: alive={alive!r} ({detail});"
+            f" unresolvable: alive={bad_alive!r} ({bad_detail})")
     # RFC 5737 documentation space: it either black-holes or is unreachable.
     # Either way the one answer it must never give is "alive".
     alive, detail = tray.probe_tunnel("198.51.100.1", 53, 2)
@@ -620,24 +709,76 @@ def check_log_scrubbing(tray, r):
     """
     hostile = [
         "\x1b[31mred\x1b[0m text",
+        "\x1b[?25lhidden cursor",
         "\x1b]0;you have been hacked\x07banner",
         "\x1b]8;;https://evil.example\x1b\\link\x1b]8;;\x1b\\",
         "bell\x07 and \x08backspace and \x7fdelete",
+        # C1 controls built with chr(): decoded from well-formed UTF-8
+        # they survive errors="replace", so only the scrubber stops them.
+        "C1 via UTF-8: " + chr(0x9B) + "hostile and " + chr(0x9D) + "more",
         "lone escape \x1b at the end",
     ]
+
+    def residue(text):
+        return [ch for ch in text
+                if (ord(ch) < 0x20 and ch != "\t") or 0x7f <= ord(ch) <= 0x9f]
+
     leaked = []
     for line in hostile:
         cleaned = tray.ANSI_ESCAPE.sub("", line)
-        if any(ord(ch) < 0x20 and ch != "\t" for ch in cleaned) or "\x7f" in cleaned:
+        if residue(cleaned):
             leaked.append(f"{line!r} -> {cleaned!r}")
-    kept = tray.ANSI_ESCAPE.sub("", "keeps\ttabs intact")
+    kept = tray.ANSI_ESCAPE.sub("", "keeps\ttabs and-hyphens intact")
     if leaked:
         r.fail("hostile control sequences never reach the log", "; ".join(leaked))
-    elif kept != "keeps\ttabs intact":
+    elif kept != "keeps\ttabs and-hyphens intact":
         r.fail("hostile control sequences never reach the log",
                f"plain text was mangled by the scrubber: {kept!r}")
     else:
         r.ok("hostile control sequences never reach the log")
+
+
+def check_log_write_path(tray, r):
+    """The scrubber must be wired where the log is written, not merely exist.
+
+    The regex check above proves the pattern; this proves the binding. A
+    hostile line pushed through the real VpnTray.log must land clean in the
+    file, and a file the logger creates must be born 0600 — a plain append
+    would create it with umask permissions, and the log holds the assigned
+    address, the routes and the DNS.
+    """
+    name = "the log file receives scrubbed lines only, and is born 0600"
+    if tray.GUI_ERROR is not None:
+        r.warn(name, "GTK bindings unavailable, so VpnTray.log cannot run here")
+        return
+
+    class Holder:
+        def __init__(self):
+            self._log_lock = threading.Lock()
+            self._log_bytes = 0
+            self.log_lines = []
+
+        def _append_to_log_window(self, line):
+            return False
+
+    original_log = tray.LOG_FILE
+    with tempfile.TemporaryDirectory() as base:
+        tray.LOG_FILE = type(original_log)(base) / "session.log"
+        try:
+            tray.VpnTray.log(
+                Holder(), "\x1b]0;evil\x07x " + chr(0x9B) + "gone \x1b[31mred")
+            text = tray.LOG_FILE.read_text()
+            mode = os.stat(tray.LOG_FILE).st_mode & 0o777
+        finally:
+            tray.LOG_FILE = original_log
+    problems = []
+    bad = [ch for ch in text
+           if (ord(ch) < 0x20 and ch not in "\t\n") or 0x7f <= ord(ch) <= 0x9f]
+    if bad or "red" not in text:
+        problems.append(f"the written line was not scrubbed: {text!r}")
+    if mode != 0o600:
+        problems.append(f"a file created by the logger is {oct(mode)}, not 0600")
+    r.check(name, not problems, "; ".join(problems))
 
 
 def check_output_framing(helper, r):
@@ -672,9 +813,13 @@ def check_output_framing(helper, r):
     forged = [ln for ln in emitted if not ln.startswith("[vpn] ")]
     r.check("openconnect's output cannot forge a helper message", not forged,
             f"un-prefixed lines escaped the relay: {forged}")
-    r.check("every relayed line is exactly one line",
-            all(ln.count("\n") == 1 and ln.endswith("\n") for ln in emitted),
-            f"got {emitted}")
+    # The count is what stops this passing vacuously: a relay mutated into a
+    # no-op emits nothing, and "no forged lines" plus all() over an empty
+    # list would both wave that through.
+    r.check("every relayed line is exactly one line, and none was dropped",
+            len(emitted) == len(lines)
+            and all(ln.count("\n") == 1 and ln.endswith("\n") for ln in emitted),
+            f"fed {len(lines)} lines, got {len(emitted)}: {emitted}")
 
 
 # --------------------------------------------------------------- environment
@@ -705,7 +850,7 @@ def read_catalogue(binary):
     return b"".join(blobs), libs
 
 
-def check_openconnect(helper, tray, r):
+def check_openconnect(helper, r):
     binary = helper.find_openconnect()
     if not binary:
         r.fail("openconnect is installed",
@@ -828,6 +973,10 @@ def check_standin_catalogue(binary, r):
             source = fh.read()
     except OSError as exc:
         r.fail(name, f"cannot read {fake}: {exc}")
+        return
+    if re.search(r"\b(?:say|print)\(f?'", source):
+        r.fail(name, "the stand-in prints through single quotes, which this"
+               " check cannot read; keep its output double-quoted")
         return
     literals = re.findall(r'(?:\bsay|\bprint)\(f?"([^"]*)"', source)
     if not literals:
@@ -956,12 +1105,16 @@ def check_installed_permissions(C, r):
 # -------------------------------------------------------------------- wiring
 
 
-def check_notify_roundtrip(r):
+def check_notify_roundtrip(C, r):
     """Run asuvpn-notify for real: does the event arrive, and does chaining work?
 
     This is the whole state framework in miniature, and it needs no privileges
     and no network — so there is no excuse for not checking it on the machine
     that will run it.
+
+    The wire shape below is asserted as literal bytes on purpose — a golden
+    reading of the datagram, so a format change fails here loudly — while the
+    variable names come from the contract, so a rename follows through.
     """
     notify = os.path.join(HERE, "asuvpn-notify")
     if not os.access(notify, os.X_OK):
@@ -974,7 +1127,7 @@ def check_notify_roundtrip(r):
         marker = os.path.join(d, "chained")
         chained = os.path.join(d, "real-script")
         with open(chained, "w", encoding="utf-8") as fh:
-            token_var = "${ASUVPN_EVENT_TOKEN:-scrubbed}"
+            token_var = "${" + C.EVENT_TOKEN_VAR + ":-scrubbed}"
             fh.write("#!/bin/sh\n"
                      f'printf "%s\\n%s\\n" "$reason" "{token_var}" > {marker}\n')
         os.chmod(chained, 0o700)
@@ -984,9 +1137,9 @@ def check_notify_roundtrip(r):
         server.settimeout(10)
         env = dict(os.environ)
         env.update({
-            "ASUVPN_EVENT_SOCKET": sock_path,
-            "ASUVPN_EVENT_TOKEN": "0123456789abcdef",
-            "ASUVPN_REAL_SCRIPT": chained,
+            C.EVENT_SOCKET_VAR: sock_path,
+            C.EVENT_TOKEN_VAR: "0123456789abcdef",
+            C.REAL_SCRIPT_VAR: chained,
             "reason": "connect",
             "TUNDEV": "asuvpn0",
             "INTERNAL_IP4_ADDRESS": "10.242.7.31",
@@ -1104,6 +1257,13 @@ def check_event_translation(helper, tray, C, r):
                     b"only\ttwo",
                     C.encode_event(token, {"reason": "pre-init",
                                            "TUNDEV": "asuvpn0"}),
+                    # a token that decodes to non-ASCII text: discarded, not
+                    # a crash. compare_digest raises TypeError on non-ASCII
+                    # str input, and one hostile datagram killing the reader
+                    # thread would freeze the badge for the tunnel's life —
+                    # every event after this one would then go unseen.
+                    C.encode_event("töken", {"reason": "connect",
+                                             "TUNDEV": "asuvpn0"}),
                     # accepted
                     C.encode_event(token, {"reason": "connect",
                                            "TUNDEV": "asuvpn0",
@@ -1197,40 +1357,57 @@ def main():
               file=sys.stderr)
         return 1
 
+    def guarded(check, *args):
+        """One broken check must not hide every result after it.
+
+        A check that raises is itself a failure, recorded as one; the
+        remaining checks still run and the summary still prints, so the
+        accounting survives a bug in the suite.
+        """
+        try:
+            return check(*args)
+        except Exception as exc:
+            r.fail(f"{check.__name__} did not finish",
+                   f"{exc.__class__.__name__}: {exc} — the check itself"
+                   " broke, so everything it would have verified is"
+                   " unverified")
+            return None
+
     if "logic" in tiers:
         r.section("logic — pure functions, nothing outside this repository")
-        check_contract(C, r)
-        check_option_blocklist(helper, r)
-        check_interface_names(C, r)
-        check_option_parsing(helper, r)
-        check_reason_contract(C, r)
-        check_permission_rules(C, r)
-        check_state_payload(tray, r)
-        check_log_scrubbing(tray, r)
-        check_tunnel_health(tray, r)
-        check_demotion_rules(tray, r)
-        check_log_rotation(tray, r)
-        check_liveness_probe(tray, r)
-        check_notifications(tray, r)
-        check_output_framing(helper, r)
+        guarded(check_contract, C, r)
+        guarded(check_option_blocklist, helper, r)
+        guarded(check_interface_names, C, r)
+        guarded(check_option_parsing, helper, r)
+        guarded(check_reason_contract, C, r)
+        guarded(check_permission_rules, C, r)
+        guarded(check_state_payload, tray, r)
+        guarded(check_log_scrubbing, tray, r)
+        guarded(check_log_write_path, tray, r)
+        guarded(check_tunnel_health, tray, r)
+        guarded(check_demotion_rules, tray, r)
+        guarded(check_log_rotation, tray, r)
+        guarded(check_liveness_probe, tray, r)
+        guarded(check_notifications, tray, r)
+        guarded(check_output_framing, helper, r)
 
     if "environment" in tiers:
         r.section("environment — our assumptions, put to the installed binaries")
         r.ok(f"the contract is version {C.CONTRACT_VERSION}",
              "every program loaded the same one, from beside itself")
-        binary = check_openconnect(helper, tray, r)
-        check_default_script(helper, C, binary, r)
-        check_message_catalogue(tray, binary, r)
-        check_standin_catalogue(binary, r)
-        check_desktop_stack(tray, r)
-        check_installed_permissions(C, r)
-        check_no_bytecode(r)
+        binary = guarded(check_openconnect, helper, r)
+        guarded(check_default_script, helper, C, binary, r)
+        guarded(check_message_catalogue, tray, binary, r)
+        guarded(check_standin_catalogue, binary, r)
+        guarded(check_desktop_stack, tray, r)
+        guarded(check_installed_permissions, C, r)
+        guarded(check_no_bytecode, r)
 
     if "wiring" in tiers:
         r.section("wiring — asuvpn-notify executed end to end")
-        check_notify_roundtrip(r)
-        check_event_translation(helper, tray, C, r)
-        check_fatal_reporting(r)
+        guarded(check_notify_roundtrip, C, r)
+        guarded(check_event_translation, helper, tray, C, r)
+        guarded(check_fatal_reporting, r)
 
     counts = r.counts
     print(f"\n{counts[PASS]} passed, {counts[FAIL]} failed, {counts[WARN]} warnings")

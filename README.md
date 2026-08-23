@@ -53,6 +53,7 @@ configuration:
 - [Quick start](#quick-start)
 - [Using it](#using-it)
 - [Settings](#settings)
+- [The command line](#the-command-line)
 - [What gets installed, and where](#what-gets-installed-and-where)
 - [Removing it](#removing-it)
 - [Security](#security)
@@ -138,7 +139,7 @@ matters raises a desktop notification:
 | **VPN connected** | the tunnel came up for the first time | — |
 | **VPN connection lost** | `openconnect` lost the link and is re-establishing it | nothing — same session, no sign-in |
 | **VPN reconnected** | it came back, possibly on a new address | — |
-| **VPN not carrying traffic** | the watchdog found the device, its routes or the far end gone | — |
+| **VPN not carrying traffic** | the watchdog's free re-establish did not help, or could not be tried | — |
 | **VPN reconnecting** | `openconnect` was nudged to rebuild the tunnel | nothing — same session |
 | **VPN carrying traffic again** | the tunnel recovered | — |
 | **VPN signing in again** | the nudge did not help and automatic reconnection is on | **a Duo push and a password** |
@@ -176,7 +177,7 @@ connect.
 | `server` | `sslvpn.asu.edu` | The endpoint. Set by `install.sh --server`. |
 | `autoreconnect` | `off` | Sign in again unattended when a stall cannot be fixed for free. Costs a Duo push and a password. |
 | `dpd` | `30` | Dead-peer probe interval, forced on. **`0` leaves the server's choice alone** — the escape hatch if forcing it ever misbehaves. |
-| `health-interval` | `20` | Seconds between checks. **`0` turns the watchdog off.** |
+| `health-interval` | `20` | Seconds between checks. **`0` turns the watchdog off** — the config file is still re-read at the default cadence, so turning it back on needs no restart. |
 | `health-strikes` | `2` | Consecutive bad checks before the badge stops claiming Connected. |
 | `probe` | `on` | Ask the network whether traffic still flows. The only check that catches a tunnel that looks perfect and delivers nothing. |
 | `probe-target` | *(empty)* | Address to probe. Empty means the resolver the VPN itself pushed. |
@@ -184,6 +185,8 @@ connect.
 | `nudge-min-gap` | `120` | Seconds between free re-establish requests. |
 | `autoreconnect-min-gap` | `300` | Seconds between unattended sign-ins. |
 | `teardown-timeout` | `75` | Seconds to wait for the helper. Must outlast its signal escalation. |
+| `log-max-kb` | `4096` | Size the session log may reach before it is rotated. **`0` never rotates on size.** |
+| `log-keep` | `3` | Rotated logs kept as `session.log.1`, `.2`, … Connecting rotates too, so this is also how many past sessions survive. `0` keeps none. |
 
 `asuvpn autoreconnect on` edits the file in place, changing that one line and
 leaving everything else as you left it.
@@ -223,7 +226,7 @@ Exit codes are meant for scripting:
 | `0` | The request was carried out — and for `status` or `--wait`, connected |
 | `1` | `status` or `--wait`: not connected. `disconnect`: the tunnel did not close |
 | `2` | A bad command line (argparse's own code) |
-| `3` | `status`: the applet is not running |
+| `3` | `status` — or a `--wait` the applet vanished under: it is not running |
 | `4` | A different server was asked for than the running applet is using |
 
 Actions report whether the action worked, so a successful `disconnect` exits 0.
@@ -281,7 +284,7 @@ files are touched, and no part of the installation needs root. The program is
 
 | Path | What it is |
 | --- | --- |
-| `~/.local/share/asuvpn/` | `asuvpn-tray`, `asuvpn-helper`, `asuvpn-notify`, `asuvpn-selftest`, `asuvpn_contract.py` and the icon (`0755`, never group-writable) |
+| `~/.local/share/asuvpn/` | `asuvpn-tray`, `asuvpn-helper`, `asuvpn-notify`, `asuvpn-selftest` (`0755`) and `asuvpn_contract.py` (`0644`) — nothing group-writable |
 | `~/.local/share/applications/asuvpn.desktop` | Launcher, with Disconnect/Reconnect actions |
 | `~/.local/share/icons/hicolor/scalable/apps/asuvpn.svg` | The app-grid icon |
 | `~/.local/bin/asuvpn` | Symlink to the installed `asuvpn-tray` |
@@ -347,16 +350,20 @@ normal user, with no elevation:
   Abstract sockets carry no filesystem permissions, so every connection's peer
   uid is checked with `SO_PEERCRED` and anything else is refused — otherwise
   another local user could drop your tunnel, read your assigned VPN address,
-  or call `connect` to raise an admin password prompt on your desktop at will
+  or call `connect` to raise an admin password prompt on your desktop at will.
+  A squatter binding the name first can only stop the applet starting (it
+  reports "already running"); it cannot impersonate the applet, because the
+  CLI checks the server's uid the same way the applet checks its clients
 
 ### What runs as root
 
 Only `asuvpn-helper`, only via `pkexec`, and only after you approve the polkit
-dialog. Once elevated it does exactly three things:
+dialog. Once elevated, its whole job is supervision:
 
 1. runs `openconnect` with the session cookie fed on stdin, and stays alive as
    its supervisor for the life of the tunnel — it does not exec and step aside,
-2. signals `openconnect` to shut down when the control pipe closes,
+2. signals `openconnect` when asked — the free `SIGUSR2` re-establish nudge
+   over the already-open control pipe, and shutdown when that pipe closes,
 3. after exit, deletes a tunnel interface that outlived `openconnect` and reads
    the default route back, to confirm your network was restored.
 
@@ -365,8 +372,9 @@ lives in a `0700` directory under `/run` owned by root, so no other account can
 reach it — and every message carries a per-session token, so two concurrent
 sessions cannot be confused for one another.
 
-Before doing any of that, the helper **refuses to run** if itself, its directory
-or `asuvpn-notify` is world-writable or writable by a shared group. That turns
+Before doing any of that, the helper **refuses to run** if itself, its
+directory, `asuvpn-notify` or `asuvpn_contract.py` is world-writable or
+writable by a shared group. That turns
 the caveat below from something you have to remember into something enforced. A
 user-private group is not treated as a finding: Debian and Ubuntu default to
 umask 002, so an ordinary checkout is `0775` with `gid == uid` and the "group"
@@ -377,8 +385,10 @@ is one person.
 - **Never sees your password.** `openconnect-sso` reads it from the login
   keyring, and the polkit password goes to GNOME's authentication agent. Neither
   passes through this app. The pre-flight check asks the keyring only whether a
-  password exists and receives back one of four literal strings — `ready`,
-  `no-password`, `no-credentials` or `unknown` — never the password itself.
+  password exists and receives back one of three literal strings — `ready`,
+  `no-password` or `no-credentials` — never the password itself. Anything else
+  is treated as unknown, and a probe that hangs is treated as a locked keyring
+  and fails closed rather than let a blank answer become the saved password.
 - **Never writes to the keyring.**
 - **Never logs the session cookie**, and never puts it on a command line where
   `ps` could show it. It is written to the helper's stdin and nowhere else.
@@ -664,16 +674,20 @@ successful probe. Letting the device check promote the badge back would flap it
 every twenty seconds against a tunnel that is genuinely carrying nothing. The
 same rule holds against openconnect's own word: the reconnect a nudge produces
 does not promote the badge either — the source that demoted has to pass again
-first, which takes at most one more check. Route families are counted
-separately too, because `ip route flush` removes only IPv4 and a summed count
-sat green through exactly that break on a live tunnel.
+first, which for the device checks is the very next check and for the probe is
+at most one probe cycle (`probe-every` × `health-interval` seconds). Route
+families are counted separately too, because `ip route flush` removes only
+IPv4 and a summed count sat green through exactly that break on a live tunnel.
 
-The result is logged either way, so the next silent break leaves evidence
-instead of a mystery:
+Every failing check and every recovery is logged with the facts attached, so
+the next silent break leaves evidence instead of a mystery (a quietly healthy
+tunnel logs nothing — a line every twenty seconds forever would bury the log).
+A routes-lost incident reads like this:
 
 ```
 [tray] tunnel device check 1/2: the tunnel's IPv4 routes are gone (dev=asuvpn0, ifindex=6, flags=0x1091, routes4=0, routes6=6)
-[tray] tunnel probe check 2/2: nothing answers through the tunnel (10.0.0.53 did not answer in 5s)
+[tray] tunnel device check 2/2: the tunnel's IPv4 routes are gone (dev=asuvpn0, ifindex=6, flags=0x1091, routes4=0, routes6=6)
+[tray] the tunnel is not usable: the tunnel's IPv4 routes are gone
 [tray] asked openconnect to re-establish (same session, no sign-in needed)
 ```
 
@@ -788,11 +802,12 @@ the name, and teardown then tracks that one instead.
 A healthy disconnect ends with a line like:
 
 ```
-18:32:14  [helper] default route restored: default via 198.51.100.1 dev wlan0 proto dhcp metric 600
+18:32:14  [helper] NOTE default route restored: default via 198.51.100.1 dev wlan0 proto dhcp metric 600
 ```
 
-If instead you see `[helper] WARNING: no default route after teardown — network
-is likely broken`, the recovery is:
+If instead you see `[helper] WARNING no default route after teardown — network
+is likely broken` (the kind word carries no colon in the session log), the
+recovery is:
 
 ```bash
 nmcli networking off && nmcli networking on
@@ -880,19 +895,38 @@ Start with the log, either from the menu's **Show log…** or:
 asuvpn log -f
 ```
 
+Every line has the same shape — a timestamp, a source tag, and (for helper
+lines) a kind word. Knowing the tags makes the log greppable:
+
+```
+HH:MM:SS  [tray] …            the applet: decisions, checks, state changes
+HH:MM:SS  [config] …          a problem in asuvpn.conf, reported once
+HH:MM:SS  [sso] …             openconnect-sso's own output during sign-in
+HH:MM:SS  [helper] NOTE …     the root helper, informational
+HH:MM:SS  [helper] WARNING …  the network may not have been restored
+HH:MM:SS  [helper] FATAL …    refused before openconnect ever started
+HH:MM:SS  [helper] STATE …    a transition from openconnect's script contract
+HH:MM:SS  [vpn] …             one line of openconnect's own output, relayed
+HH:MM:SS  [old tunnel] …      a superseded helper's last words
+```
+
+The kind word is part of the line — grep for `WARNING` (no colon), not
+`WARNING:`.
+
 | Symptom | Cause and fix |
 | --- | --- |
 | `no saved password` | The keyring has no password and the applet will not guess a blank one. Run `openconnect-sso --server sslvpn.asu.edu --authenticate=shell` once in a terminal. |
+| `keyring did not answer` | The login keyring is locked, so the probe timed out rather than risk a blank answer being saved as your password. Unlock the keyring and connect again. |
 | `authorization cancelled` | The polkit dialog was dismissed, or the password was wrong. Run `asuvpn connect` again. |
 | No icon in the panel | `gnome-extensions enable ubuntu-appindicators@ubuntu.com` |
 | `asuvpn: command not found` | `~/.local/bin` is not on your `PATH`. Add it, or run `pipx ensurepath` and open a new terminal. |
 | The sign-in window never appears | That is `openconnect-sso`, not this applet. Run `openconnect-sso --server sslvpn.asu.edu --authenticate=shell` to see the real error. |
 | `could not load the Qt platform plugin "xcb"` | Missing `libxcb-cursor0`. Re-run `./bootstrap.sh`. |
 | Log stops at `signed in, starting openconnect` | The polkit dialog never appeared. Check that a polkit agent is running, and that you are in the `sudo` group. |
-| `WARNING: no default route after teardown` | Teardown could not restore routing. `nmcli networking off && nmcli networking on`. |
-| `refusing to run: … is world-writable` | Anything writable by another account runs as root at your next connect, so the helper stops. `chmod go-w ~/.local/share/asuvpn` and re-run. |
+| `[helper] WARNING no default route after teardown` | Teardown could not restore routing. `nmcli networking off && nmcli networking on`. |
+| `[helper] FATAL refusing to run: … is world-writable` | Anything writable by another account runs as root at your next connect, so the helper stops. `chmod go-w ~/.local/share/asuvpn` and re-run. |
 | `refusing --background` / `refusing -bv` | That option would detach `openconnect` from the helper, leaving a root process nothing can stop. Drop it; write bundled short options separately (`-i lo`, not `-ilo`). |
-| `WARNING: … is not executable, so openconnect's own default script is left in place` | The `vpnc-script` this system uses could not be found, so state falls back to reading `openconnect`'s output. Routing is unaffected. Install `vpnc-scripts`. |
+| `[helper] WARNING … is not executable, so openconnect's own default script is left in place` | The `vpnc-script` this system uses could not be found, so state falls back to reading `openconnect`'s output. Routing is unaffected. Install `vpnc-scripts`. |
 | `Script … returned error 127` | The `vpnc-script` failed, so routes and DNS were never configured. Install `vpnc-scripts`, then `asuvpn selftest`. |
 | `ModuleNotFoundError: No module named 'pkg_resources'` | The `setuptools<71` pin did not take. `pipx inject openconnect-sso 'setuptools<71' --force` — the `--force` is what makes it apply. |
 | Badge says **not carrying traffic** | The watchdog found the tunnel device or its routes gone. It has already nudged `openconnect` once; `asuvpn log` says what it saw. If it does not recover, `asuvpn reconnect`. |
@@ -926,8 +960,11 @@ asuvpn selftest --tier environment
 asuvpn selftest --quiet          # only failures and warnings
 ```
 
-It exits 0 if nothing failed, 1 otherwise. Nothing in it connects to a network,
-asks for privileges, or touches the real `openconnect`.
+It exits 0 if nothing failed, 1 otherwise. Nothing in it needs privileges or
+talks to the VPN: the real `openconnect` is run only as `openconnect
+--version` (asking it for its own script path), and the network is touched
+only by two probe exercises that cannot leave anything behind — a loopback
+connect, and a SYN to RFC 5737 documentation space, which must never answer.
 
 The reason it is shaped the way it is: **ordinary unit tests would not have
 caught a single one of the bugs that hurt this project.** Matching on
@@ -948,11 +985,10 @@ The environment tier reads the installed `libopenconnect`'s own strings, so
 `asuvpn selftest` is what tells you the fallback patterns have gone stale on
 some future release, instead of finding out during an outage.
 
-The suite is checked by breaking the code on purpose and confirming it notices:
-reverting the bundled-option fix, making the field sanitiser a no-op, pointing
-the default script somewhere that does not exist, matching on a message the
-binary no longer contains, and making the installed directory world-writable.
-All five are caught.
+The suite is itself checked by breaking the code on purpose and confirming it
+notices — from reverting the bundled-option fix to un-wiring the log scrubber
+from the write path. The full table of verified mutations, every row run and
+caught, lives in [DESIGN.md](DESIGN.md#mutation-testing).
 
 The linters run separately. The four programs have no `.py` extension, so copy
 them under one first; the contract comes along so it is checked too:
@@ -1080,11 +1116,17 @@ The `--force-dpd 30` the helper passes was confirmed safe against ASU: the
 server declines DPD but answers forced probes, with zero reconnect events over
 the measured window.
 
-Still unproven: the watchdog's recovery ladder against a *real* failure
-(suspend/resume, WiFi loss — sandbox-proven only so far), the shared-group
-permission refusal end to end, and anything outside Ubuntu and GNOME.
-[HANDOVER.md](HANDOVER.md) keeps the ledger of what is proven against the real
-gateway versus only in the sandbox.
+The stand-in exercises earlier in this section — the launch races, the exit
+code sweep, the arbitrary-directory installs — predate the committed suite
+and were run with the same fakes before the harness moved into the
+repository; the ten committed scenarios are the ones tabulated in
+[tests/sandbox](tests/sandbox/README.md).
+
+What is proven live against the real gateway (full connects and teardowns,
+forced-DPD safety, free recovery through WiFi loss and suspend, the nudge)
+versus only in the sandbox (the full escalation ladder including the opt-in
+sign-in, the shared-group refusal) is kept, with dates and evidence, in
+[HANDOVER.md](HANDOVER.md) — that ledger, not this paragraph, is current.
 
 ## License
 

@@ -71,15 +71,21 @@ absolute path on this machine — the tray reads that shebang to find the venv
 python). `app/`, `rbin/`, `home/` and the other runtime artifacts are
 gitignored; nothing in here needs cleaning up by hand.
 
+Every scenario also **refuses to run outside the namespace** (exit 90, with a
+pointer to `enter.sh`). The staged `app/` and `rbin/` persist between runs, so
+tab-completing a scenario directly used to run the real tray against the real
+`pkexec`, `openconnect-sso` and `openconnect` — the exact accident the guard
+exists to prevent, now structural at both ends of the door.
+
 | Scenario | What it proves | Display needed |
 | --- | --- | --- |
-| `sec.sh` | the permission refusals, on the real helper: world-writable, **group-shared (asserts, exit 1 on the wrong outcome)**, directory, symlink swap, negative `--dpd` | no |
-| `sec2.sh` | staging positive-control: the `chgrp` to a second group really takes | no |
-| `sec3.sh` | negative dpd refused with its documented exit code; 0 means "leave the server alone"; the runtime check names the contract | no |
-| `fdcheck.sh` | openconnect's stdin is not the helper's control pipe, so it cannot inject control verbs | no |
+| `sec.sh` | the permission refusals, on the real helper: world-writable, **group-shared (asserts)**, directory, symlink swap | no |
+| `sec2.sh` | staging positive-control: the `chgrp` to a second group really takes (**asserts**) | no |
+| `sec3.sh` | negative dpd refused with its documented exit code; 0 means "leave the server alone"; a world-writable contract refused at the loader | no |
+| `fdcheck.sh` | openconnect's stdin is not the helper's control pipe, so it cannot inject control verbs (**asserts**, and fails if it finds no subject to inspect) | no |
 | `lifecycle.sh` | connect → reconnect → probes → disconnect → quit, all through the tray | yes |
 | `discon.sh` | a demoted tunnel still disconnects cleanly (`FAKE_DEAF=1` ignores nudges) | yes |
-| `escalate.sh` | the watchdog's ladder: one nudge, then—with autoreconnect on—one full sign-in | yes |
+| `escalate.sh` | the watchdog's ladder: one nudge, then—with autoreconnect on—one full sign-in (**asserts: exactly one of each**) | yes |
 | `watchdog-test.sh` | a gone device: strikes → demotion → one nudge; the reconnect event adopts the tunnel but the badge stays demoted while the device never returns | yes |
 | `blackhole.sh` | device and routes healthy, probe target silent → demote, one nudge, and a badge that stays honest because only the probe can promote it | yes |
 | `contract-test.sh` | the config file drives the helper (`--force-dpd`) and the watchdog cadence end to end | yes |
@@ -89,11 +95,12 @@ display (`:0` is assumed; on Wayland that is XWayland). `enter.sh` copies the
 session's X cookie to `xauth` when `XAUTHORITY` is set. The scenarios that
 drive the helper directly run anywhere, headless included.
 
-Scenarios print what happened for a reader, and the two cases in `sec.sh` that
-close a "not proven" item also **assert** — they exit 1 if the refusal does
-not happen. Both assertions have been verified by mutation: neutering the
-contract's group predicate makes (b2) fail, and neutering the loader's inline
-check as well makes (b) fail.
+Scenarios print what happened for a reader, and the load-bearing outcomes
+**assert** — `sec.sh` (b)/(b2), `sec2.sh`'s staging control, `fdcheck.sh`'s
+distinct-stdin verdict, and `escalate.sh`'s one-nudge-one-sign-in count all
+exit 1 on the wrong outcome. The `sec.sh` assertions are mutation-verified:
+neutering the contract's group predicate makes (b2) fail, and neutering the
+loader's inline check as well makes (b) fail.
 
 ## What a pass here does and does not claim
 

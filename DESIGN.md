@@ -49,7 +49,8 @@ reasons `openconnect` reports, and the settings schema.
 It exists because each of those had been restated wherever it was needed, and
 most had drifted. Five message prefixes, each parsed by its own string test in
 the tray — and one of them keyed on the *wording* "refusing", which four of the
-seven refusals did not use, so those reached the user as a bare exit number. Two
+seven refusals it then had did not use, so those reached the user as a bare
+exit number. Two
 unrelated config mechanisms, a line of text and the presence of a file. Nine
 tunables split across two programs with no way for anyone to change them.
 
@@ -70,13 +71,17 @@ a symlink in `~/.local/bin`, so its `sys.path[0]` is that directory rather than
 the one its siblings live in. An explicit path built from the resolved location
 is the only form correct for all three.
 
-Each program therefore carries an eight-line loader, and that duplication is
-irreducible: code cannot be shared before the mechanism that shares it has been
-loaded. It is the only thing in this project stated more than once on purpose.
-The privileged programs verify the directory for write access by a second
-principal before executing anything; the unprivileged ones do not, because
-loading a file you own as yourself crosses no boundary — and refusing there
-would break `--link` mode from an ordinary umask-002 checkout.
+Each program therefore carries a small loader (a dozen lines), and that
+duplication is irreducible: code cannot be shared before the mechanism that
+shares it has been loaded. It is the only thing in this project stated more
+than once on purpose, and one line legitimately differs per program — the tray
+resolves with `realpath` because of its symlink, the others use `abspath`; the
+reference copy at the foot of `asuvpn_contract.py` says which is which. Every
+loader (the selftest's generic sibling loader included) verifies the directory
+and the file for write access by a second principal before executing anything
+as root; unprivileged runs skip the check, because loading a file you own as
+yourself crosses no boundary — and refusing there would break `--link` mode
+from an ordinary umask-002 checkout.
 
 ### What is executed as root, and what checks it
 
@@ -117,6 +122,20 @@ Four programs, two privilege levels.
 
 `openconnect-sso` and the Qt browser it opens run **as you**. The only thing
 that crosses the privilege boundary is the session cookie, on stdin.
+
+Five channels connect the pieces; everything else in this document rides on
+one of them:
+
+```mermaid
+flowchart LR
+    CLI["asuvpn<br/>(CLI verbs)"] <-->|"abstract socket asuvpn-tray-$UID<br/>SO_PEERCRED checked both ways"| TRAY["asuvpn-tray<br/>(you)"]
+    TRAY -->|"stdin: cookie, then quit / reconnect;<br/>closing the pipe IS the disconnect"| HELPER["asuvpn-helper<br/>(root)"]
+    HELPER -->|"stdout: [helper] KIND … / [vpn] …"| TRAY
+    HELPER -->|"argv + cookie on stdin;<br/>SIGUSR2 nudge, SIGINT ladder, PDEATHSIG"| OC["openconnect<br/>(root)"]
+    OC -->|"runs with reason= in env,<br/>at every transition"| NOTIFY["asuvpn-notify<br/>(root)"]
+    NOTIFY -->|"one datagram: token, reason,<br/>dev, addr, dns → /run/asuvpn/…/events"| HELPER
+    NOTIFY -->|"exec, env intact"| VPNC["real vpnc-script<br/>(routes and DNS)"]
+```
 
 The helper does not `exec` and step aside. It stays as `openconnect`'s parent
 for the whole tunnel, because being the parent is what makes the control pipe
@@ -173,9 +192,19 @@ stateDiagram-v2
     connecting --> disconnecting: cancel
     disconnecting --> disconnected: helper exited
     disconnecting --> failed: helper did not exit in time
+    connected --> connecting: watchdog demotes (not carrying traffic)
+    connecting --> connected: the demoting source passes again
     connecting --> failed: openconnect exited
     connected --> failed: tunnel dropped
 ```
+
+One state wears a disguise: a tunnel the watchdog has **demoted** shows as
+`connecting` plus a flag (`health_demoted`) rather than as a seventh state.
+It is an established session that is not carrying traffic — so the menu
+offers Disconnect and Reconnect rather than Cancel, `disconnect` tears it
+down, and `connect` delegates to `reconnect`. Every rule that keys on that
+flag is a reminder that it wants to be a real state; the planned revision in
+[STATE-MACHINE-PLAN.md](STATE-MACHINE-PLAN.md) makes it one.
 
 Both state sources — the script contract and the log-matching fallback — reach
 `CONNECTED` and `CONNECTING` through `_announce_connected` and
@@ -300,6 +329,21 @@ The GLib main loop owns all state and all GTK. Everything else posts to it.
 | `helper_exited` (Event) | how teardown waits, instead of a second `wait()` |
 | `_status` (tuple) | state and detail published as one object, so the IPC thread cannot read a new state beside an old detail |
 
+`asuvpn-tray` is one file; its section markers are a working map:
+
+| Marker in the file | Owns |
+| --- | --- |
+| `menu` | menu construction and the visibility rules per state |
+| `log` | the scrubber, the in-memory tail, the file writer, rotation, the log window |
+| `actions` | connect / disconnect / reconnect / cancel / quit |
+| `phase 1: auth` | `openconnect-sso`, the keyring probe, the blank TOTP answer |
+| `phase 2: tunnel` | the pkexec spawn, the reader thread, state events |
+| `watchdog` | adoption, health checks, the probe, the demotion ladder |
+| `teardown` | closing the control pipe, waiting, failure reporting |
+| `autostart` | the login `.desktop` entry |
+| `single instance IPC` | the abstract socket, peer checks, verb dispatch |
+| `command line` | argparse, the verbs, the exit codes |
+
 **Generation counters.** `helper_generation` and `auth_generation` are bumped on
 every new tunnel and every new sign-in. A helper that is still dying must not be
 able to report its exit over the top of its replacement — that would drop the
@@ -386,8 +430,18 @@ What survives is true of every working tunnel and false of a broken one:
 | `no routes point at the tunnel any more` | zero routes in `/proc/net/route` and `/proc/net/ipv6_route` — the case DPD cannot see |
 | `the tunnel's IPv4 routes are gone` / `…IPv6…` | a family the tunnel was observed to have, wholly gone — `ip route flush dev X` removes only IPv4, and a summed count sat green through exactly that break on a live tunnel (2026-08-23) |
 
-The facts behind each verdict are logged whether or not anything is wrong, so
-the next silent break arrives with evidence attached rather than as a mystery.
+Every failing check and every recovery carries its facts into the log — a
+quietly healthy check logs nothing, because a line every twenty seconds
+forever would bury the log — so the next silent break arrives with evidence
+attached rather than as a mystery.
+
+Five words this section leans on: a **source** is one of the two independent
+judges, `device` (kernel facts) or `probe` (a packet); a **strike** is one
+failing check from one source; a **demotion** takes the badge out of Connected
+after `health-strikes` consecutive strikes from a single source; an
+**incident** is one demotion, lasting until the *demoting* source passes
+again; the **nudge** is the free `SIGUSR2` re-establish, spent once per
+incident.
 
 ### The probe, for the blind spot they share
 
@@ -438,6 +492,23 @@ interchangeable:
 | stay demoted, say the free option is spent | none | once per incident |
 | full sign-in (`reconnect`) | Duo approval **and** polkit password | `autoreconnect-min-gap`, default 300s, and opt-in |
 
+```mermaid
+stateDiagram-v2
+    direction LR
+    Healthy --> Demoted: strikes(one source) ≥ health-strikes
+    Demoted --> Demoted: reconnect event — adopt dev and addr, keep the incident
+    Demoted --> Nudged: one SIGUSR2, if the last nudge is ≥ nudge-min-gap ago
+    Demoted --> Healthy: the demoting source passes
+    Nudged --> Healthy: the demoting source passes
+    Nudged --> SignIn: still demoted, autoreconnect on, its gap elapsed
+    SignIn --> Healthy: fresh session up and the source passes
+```
+
+A nudge merely *held* by its gap keeps the incident in Demoted — the ladder
+waits it out rather than escalating past it, because jumping to a sign-in
+while the log says "holding the free re-establish" would buy with a Duo push
+what a sub-two-minute wait gets for free.
+
 The nudge travels down the **existing** control pipe, so it needs no new
 privileged call — the helper is already root and already listening. It is
 spent once per incident, with the timestamp guarding incidents that arrive
@@ -476,9 +547,11 @@ as a hang, which is how the first live routes-lost break read.
 outranks the watchdog.
 
 Automatic sign-in is off unless asked for, via the menu or
-`asuvpn autoreconnect on`. The setting is the presence of a file, so there is
-nothing to parse and a running applet picks up a change on its next check
-without any message passing.
+`asuvpn autoreconnect on` — both edit the `autoreconnect` line of
+`asuvpn.conf` in place. The watchdog re-reads that file on every check, so a
+running applet picks up the change without any message passing, and the menu
+checkbox follows the file rather than its own memory. (An earlier mechanism
+used the presence of a marker file; `install.sh` still deletes the leftover.)
 
 ### Two orderings that are load-bearing
 
@@ -542,7 +615,7 @@ Only *our* device is ever deleted, identified by the ifindex captured when
 | `0` | the request was carried out; for `status` and `--wait`, connected |
 | `1` | `status`/`--wait`: not connected. `disconnect`: the tunnel did not close. `log`: no log yet |
 | `2` | bad command line (argparse's own code) |
-| `3` | `status`: the applet is not running |
+| `3` | `status` — or a `--wait` the applet vanished under: it is not running |
 | `4` | a different server was asked for than the running applet is using |
 
 ### `asuvpn-helper`
@@ -550,9 +623,9 @@ Only *our* device is ever deleted, identified by the ifindex captured when
 These reach you as the tunnel's exit status. The helper emits each with a
 `[helper] FATAL ` marker and the tray shows that sentence as the failure detail
 instead of the number. The marker replaced a test for lines beginning with
-"refusing", which four of the seven refusals did not — so those reached the user
-as a bare status code with the explanation sitting unread in the log. Wording is
-not an interface, here either.
+"refusing", which four of the seven refusals it then had did not — so those
+reached the user as a bare status code with the explanation sitting unread in
+the log. Wording is not an interface, here either.
 
 | Code | Meaning |
 | --- | --- |
@@ -580,24 +653,22 @@ where it can be, checked by `asuvpn selftest`.
 | `openconnect` always gets to run `vpnc-script` on the way out | escalation ladder, output relay, `PR_SET_PDEATHSIG` | teardown scenarios in the sandbox |
 | No root process outlives the tray | control pipe, `PR_SET_PDEATHSIG`, no `--background` | `SIGKILL` the tray and look for survivors |
 | Only a device this session created is ever deleted | ifindex ownership, free-name selection | `--interface <existing>` is refused |
-| A device name never reaches the filesystem or `ip` unvalidated | `INTERFACE_RE`, checked in two places | logic + wiring tiers |
+| A device name never reaches the filesystem or `ip` unvalidated | `INTERFACE_RE`, checked at both ends — where produced and where consumed | logic + wiring tiers, with traversal and whitespace payloads |
 | `openconnect` cannot forge a helper message | `[vpn] ` prefix on every relayed line | wiring tier, with `\r` and `\n` payloads |
 | A state event cannot inject a line or a field | reject impossible device names; collapse every field to one token | wiring tier, with space-and-`=` payloads |
 | Only this user can drive the applet, and only this user's applet answers | `SO_PEERCRED` at both ends, failing closed | invert the check and confirm refusal |
-| Nothing run as root is writable by a second principal | helper refuses with 26 | environment tier, and `install.sh` |
 | The cookie never reaches a command line or the log | `--cookie-on-stdin` only | grep the log and the journal |
 | Interposing never costs routing | derive the script, step aside if unusable | environment tier |
 | A stalled tunnel is noticed rather than shown as connected | `--force-dpd`, plus a watchdog for what DPD cannot see | logic tier, and a sandbox scenario where the device never appears |
-| Recovery never costs a Duo push unless asked | `SIGUSR2` first, sign-in only on opt-in | sandbox scenario counts exactly one `SIGUSR2` and one sign-in over 100s |
+| Recovery never costs a Duo push unless asked | `SIGUSR2` first — waited for if rate-limited, never skipped — sign-in only on opt-in | `escalate.sh` **asserts** exactly one nudge and one sign-in over 100s; the held-nudge rule in the logic tier |
 | openconnect cannot drive the control channel | it is spawned with its own `stdin` pipe | compared `/proc/<pid>/fd/0` of both: distinct pipes, child's is `O_RDONLY` |
 | A refusal is reported as a sentence, not a number | `[helper] FATAL ` marker, set by the helper | wiring tier, by running two refused connects |
-| Everything executed as root is unwritable by a second principal | bootstrap check before load, plus the helper's own list | environment tier, by making each file writable in turn, and end to end for a shared group in the sandbox (`sec.sh` b/b2) |
-| A device name never becomes a path unvalidated | checked at both ends, not just where it is produced | logic tier, with traversal and whitespace payloads |
+| Everything executed as root is unwritable by a second principal | every loader's bootstrap check, the helper's runtime list (exit 26), `install.sh`'s `go-w` sweep | environment tier, by making each file writable in turn, and end to end for a shared group in the sandbox (`sec.sh` b/b2) |
 | `openconnect-sso` can still import `pkg_resources` | `setuptools<71` pinned with `pipx inject --force` | environment tier, by importing it |
 
 ## How this is tested
 
-Three tiers in `asuvpn-selftest` (78 checks), plus the scenario sandbox in
+Three tiers in `asuvpn-selftest` (83 checks), plus the scenario sandbox in
 [tests/sandbox](tests/sandbox/README.md).
 
 The shaping constraint: **conventional unit tests would not have caught any of
@@ -658,6 +729,18 @@ breaking the code on purpose:
 | drop the rotation shift so `.1` is clobbered | the log rotates, keeps log-keep files, and starts fresh |
 | neuter the contract's shared-group predicate | `sec.sh` (b2): the helper no longer exits 26 |
 | neuter the loader's inline check as well | `sec.sh` (b): a group-shared contract executes |
+| compare the event token as text again (crashes on non-ASCII) | unauthenticated and malformed events are discarded |
+| make the output relay a no-op | every relayed line is exactly one line, and none was dropped |
+| stop stripping comments from config lines | the generated config file parses back to the defaults, cleanly |
+| un-wire the scrubber from the log's write path | the log file receives scrubbed lines only, and is born 0600 |
+| create the log file with umask permissions | the same check, its 0600 half |
+| let the scrubber pass C1 controls again | hostile control sequences never reach the log |
+| let any source promote another source's demotion | a source that did not demote cannot promote |
+| let the once-per-incident warning repeat | an incident takes one nudge, then says the free option is spent |
+| escalate past a nudge that was only rate-limited | a held nudge is waited out, never escalated past |
+| keep the old device's route families across a replacement | a replaced device forgets the old one's route families |
+| let a probe verdict act during teardown | a probe verdict arriving mid-teardown changes nothing |
+| let a probe exception escape its thread | an unusable probe target is inconclusive — and the harness records a crashed check as its own failure |
 
 The fallback-patterns row is the one that matters most: it is the check that
 would have caught the original `Connected as` failure, and the stand-in row
@@ -676,13 +759,10 @@ dispatches on `$reason` but skips some, and **warn** when it cannot tell.
 
 ### Still unproven
 
-The live path itself no longer is: a real connect through real `pkexec`, real
-Duo and the real gateway has been run, watched and torn down cleanly, with
-`default route restored:` observed on the way out. What remains sandbox-proven
-only (the watchdog's recovery ladder) or untested outright (the shared-group
-refusal end to end; anything outside Ubuntu/GNOME) is kept, with evidence, in
-[HANDOVER.md](HANDOVER.md) — update that ledger, not this section, as items
-close.
+The ledger of what is proven live, what is proven only in the sandbox, and
+what is untested is [HANDOVER.md](HANDOVER.md) — update that file as items
+close. (This section used to restate the list, went stale against the ledger
+twice, and no longer tries.)
 
 ## Changing things
 

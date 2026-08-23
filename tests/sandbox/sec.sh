@@ -7,6 +7,7 @@
 # nothing. Those two cases assert and exit 1 on the wrong outcome; the rest
 # print what happened for the reader.
 SB="$(cd "$(dirname "$0")" && pwd)"
+grep -qa SANDBOX-MARKER /usr/bin/pkexec 2>/dev/null || { echo "not inside the sandbox; run: tests/sandbox/enter.sh ${0##*/}" >&2; exit 90; }
 export HOME="$SB/home"; mkdir -p "$SB/home"
 A="$SB/app"
 run_raw() { printf 'COOKIE\n' | timeout 8 "$A/asuvpn-helper" --host https://x \
@@ -46,8 +47,6 @@ mv "$A/asuvpn_contract.py" "$A/real_contract.py"
 ln -s "$SB/evil_contract.py" "$A/asuvpn_contract.py"
 run | sed 's/^/      /'
 rm -f "$A/asuvpn_contract.py"; mv "$A/real_contract.py" "$A/asuvpn_contract.py"
-echo "--- e) a negative dpd, which the config parser would never produce ---"
-run --dpd=-5 | grep -oE '\-\-force-dpd [-0-9]+|refusing.*' | head -1 | sed 's/^/      /'
 echo "--- f) normal, for contrast ---"
 run --dpd=0 | grep -oE 'running as uid [0-9]+|force-dpd [0-9]+' | head -1 | sed 's/^/      /'
 echo

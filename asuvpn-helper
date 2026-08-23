@@ -229,7 +229,10 @@ def serve_events(server, token, ifname, owned):
     """
     while True:
         try:
-            data, _ = server.recvfrom(4096)
+            # The contract's size, not a literal: a receive buffer smaller than
+            # the datagram silently truncates it, and the cut would land in the
+            # last field -- the resolver the probe targets.
+            data, _ = server.recvfrom(C.EVENT_MAX_BYTES)
         except OSError as exc:
             if not closing.is_set():
                 log(f"WARNING: the state event channel stopped ({exc});"
@@ -239,8 +242,11 @@ def serve_events(server, token, ifname, owned):
         # Shape and token both checked: a short or unrecognised datagram is
         # discarded rather than indexed into. compare_digest is applied here
         # rather than in the contract, which has no business holding an opinion
-        # about how a secret is compared.
-        if event is None or not secrets.compare_digest(event["token"], token):
+        # about how a secret is compared. Compared as bytes, because the str
+        # form raises TypeError on non-ASCII input -- and one hostile datagram
+        # killing this thread would freeze the badge for the tunnel's life.
+        if event is None or not secrets.compare_digest(
+                event["token"].encode("utf-8", "replace"), token.encode()):
             continue
         reason = event["reason"]
         device = event["TUNDEV"]

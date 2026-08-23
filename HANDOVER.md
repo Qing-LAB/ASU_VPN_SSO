@@ -20,7 +20,7 @@ Everything is committed and pushed to `main` at
 | Programs | `asuvpn-tray` (you), `asuvpn-helper` (root, via pkexec), `asuvpn-notify` (root, run by openconnect), `asuvpn-selftest` (you) |
 | Shared | `asuvpn_contract.py` — loaded by explicit path, never imported |
 | Settings | `~/.config/asuvpn/asuvpn.conf`, generated from the contract's schema |
-| Checks | `asuvpn selftest` — 78, in three tiers; scenario suite in [tests/sandbox](tests/sandbox/README.md) |
+| Checks | `asuvpn selftest` — 83, in three tiers; scenario suite in [tests/sandbox](tests/sandbox/README.md) |
 | Analysers | ruff, pyflakes, pylint, mypy, bandit, vulture, shellcheck — all clean |
 | Tested against | openconnect v9.12-3.3, Ubuntu, GNOME, ASU's `sslvpn.asu.edu` |
 
@@ -57,15 +57,16 @@ not, and each cost a round of rework.
   strikes → demotion → `SIGUSR2` → openconnect re-established the session in
   one second, no sign-in. The mechanism works; what it exposed is recorded
   under "what to do next".
-- The liveness probe target answers in ~17 ms; a refusal (RST) arrives in ~20 ms
-  and correctly counts as alive.
+- The liveness probe target answers in ~17 ms (an earlier session measured
+  29 ms); a refusal (RST) arrives in ~20 ms and correctly counts as alive.
 
 ### Proven only in the sandbox
 
-- The watchdog's escalation ladder — the nudge and the opt-in sign-in. The
-  2026-08-23 live breaks never reached it, because openconnect recovered first
-  every time, which is the designed order; the ladder only fires for breaks
-  openconnect cannot see or cannot fix (routes wiped, a black-holed tunnel).
+- The escalation ladder *beyond its first rung*. The WiFi and suspend breaks
+  never reached the ladder at all — openconnect recovered first, which is the
+  designed order — and the live routes-flush did fire the nudge (see above).
+  What has run only in the sandbox is the post-fix remainder: staying demoted
+  after a spent nudge, and the opt-in sign-in.
 - The nudge rate limits, notification wording, every failure path, and the
   config driving behaviour end to end.
 - The **shared-group** permission refusal, end to end since 2026-08-22: the
@@ -203,8 +204,10 @@ each quietly diverged. One `_start_tunnel` reset omitted `tunnel_dns` and a new
 tunnel probed the previous one's resolver.
 
 `asuvpn_contract.py` now holds anything more than one program needs to know. The
-eight-line loader in each program is the *only* thing duplicated on purpose,
-because code cannot be shared before the sharing mechanism is loaded.
+small loader in each program is the *only* thing duplicated on purpose, because
+code cannot be shared before the sharing mechanism is loaded — and the copies
+are not quite identical: the tray resolves its symlink with `realpath`, the
+others use `abspath`, and the reference copy in the contract says which.
 
 ---
 
@@ -232,7 +235,17 @@ because code cannot be shared before the sharing mechanism is loaded.
 
 ## What to do next, roughly in order
 
-1. **Live-verify the routes-lost fix.** The break was staged live on
+1. **The state-machine revision** — the user-directed core work. The
+   2026-08-23 review traced its worst findings (a probe verdict stomping a
+   user's Disconnect, a timer racing an exit callback into a false FAILED, the
+   ladder skipping an untried nudge) to one cause: state changed by scattered
+   hand-written conditionals instead of one authority processing messages.
+   [STATE-MACHINE-PLAN.md](STATE-MACHINE-PLAN.md) is the consolidated plan —
+   the inventory of today's state, the proposed machine, the migration steps,
+   and the decisions that are the user's. **Migration starts only after the
+   user approves that plan.** The guards added by the review are point fixes;
+   the machine is the structural fix that makes them unnecessary.
+2. **Live-verify the routes-lost fix.** The break was staged live on
    2026-08-23 (`sudo ip route flush dev asuvpn0`) and defeated the ladder as
    then designed, three ways at once: a same-address `reconnect` does not
    reinstall routes (the stock vpnc-script only routes on `reason=connect`),
@@ -247,18 +260,18 @@ because code cannot be shared before the sharing mechanism is loaded.
    fresh applet, flush the routes again and expect two strikes → demotion →
    one nudge → the badge *staying* demoted with one warning notification —
    and with `autoreconnect on`, a sign-in within `autoreconnect-min-gap`.
-2. **Try `autoreconnect = on`** for a while, if the user wants unattended
+3. **Try `autoreconnect = on`** for a while, if the user wants unattended
    recovery, and see whether the 300 s floor is right.
-3. **Consider whether `probe-every = 3` is the right frequency** now that a real
+4. **Consider whether `probe-every = 3` is the right frequency** now that a real
    probe costs ~17 ms and one TCP handshake a minute.
-4. Leave the polkit prompt alone unless the user reopens it.
+5. Leave the polkit prompt alone unless the user reopens it.
 
 ---
 
 ## How to work on it
 
 ```bash
-asuvpn selftest                 # 78 checks; run before and after any change
+asuvpn selftest                 # 83 checks; run before and after any change
 tests/sandbox/enter.sh sec.sh   # scenario tests, in a namespace of stand-ins
 ./install.sh                    # copies into ~/.local, runs the self-check
 asuvpn log -f                   # what it is actually doing

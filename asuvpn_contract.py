@@ -30,8 +30,10 @@ import re
 import stat
 
 # Bumped when the wire format changes in a way the programs must agree on.
-# `asuvpn selftest` reports it, so a half-updated install is visible rather than
-# mysterious.
+# `asuvpn selftest` reports it, and the header of a generated config file
+# records the version that wrote it. It cannot catch a half-updated install by
+# itself — every program loads the one copy beside it, so within one install
+# there is nothing to disagree with.
 CONTRACT_VERSION = 1
 
 
@@ -68,7 +70,7 @@ def unsafe_write_access(path):
 MESSAGE_PREFIX = "[helper]"
 RELAY_PREFIX = "[vpn]"
 
-KIND_NOTE = "NOTE"        # informational; shown to the user without the kind
+KIND_NOTE = "NOTE"        # informational; logged as-is, raises no notification
 KIND_WARNING = "WARNING"  # the network may not have been restored
 KIND_FATAL = "FATAL"      # refused before openconnect ever started
 KIND_STATE = "STATE"      # a transition from openconnect's script contract
@@ -284,7 +286,8 @@ SETTINGS = (
             " 0 turns the watchdog off entirely."),
     Setting("health-strikes", "int", 2,
             "Consecutive bad checks before the badge stops claiming Connected."
-            " Two, because routes are briefly absent during a real reconnect."),
+            " Two, because routes are briefly absent during a real reconnect."
+            " 0 behaves as 1."),
     Setting("probe", "bool", True,
             "Ask the network whether the tunnel still carries traffic. This is"
             " the only check that catches a tunnel whose device and routes are"
@@ -298,7 +301,8 @@ SETTINGS = (
             maximum=65535),
     Setting("probe-every", "int", 3,
             "Run the probe on every Nth health check, so it costs a packet a"
-            " minute rather than one every twenty seconds."),
+            " minute rather than one every twenty seconds. 0 behaves as 1,"
+            " probing on every check."),
     Setting("probe-timeout", "int", 5,
             "Seconds to wait for an answer. A healthy tunnel replies in"
             " milliseconds, so this is generous by two orders of magnitude."),
@@ -424,16 +428,22 @@ def config_path():
 # Each program carries its own copy of the loader below, and that duplication is
 # irreducible: code cannot be shared before the mechanism that shares it has
 # been loaded. It is the only thing in this project stated more than once on
-# purpose, and it is eight lines that never change.
+# purpose. One line legitimately differs per program: the tray resolves
+# `os.path.realpath(__file__)` because it is reached through the ~/.local/bin
+# symlink, while the helper and asuvpn-notify use `os.path.abspath(__file__)` —
+# copying the abspath form into a symlink-reachable program would look for the
+# contract in the symlink's own directory and fail. asuvpn-selftest applies the
+# same refusal inside its generic sibling loader (`load()`), which also covers
+# the helper and tray sources it executes.
 #
 #     def _contract():
-#         here = os.path.dirname(os.path.abspath(__file__))
+#         here = os.path.dirname(os.path.abspath(__file__))   # the tray: realpath
 #         path = os.path.join(here, "asuvpn_contract.py")
 #         if os.geteuid() == 0:          # running privileged: verify before exec
 #             for target in (here, path):
-#                 st = os.stat(target)
-#                 if st.st_mode & stat.S_IWOTH or (
-#                         st.st_mode & stat.S_IWGRP and st.st_gid != st.st_uid):
+#                 info = os.stat(target)
+#                 if info.st_mode & stat.S_IWOTH or (
+#                         info.st_mode & stat.S_IWGRP and info.st_gid != info.st_uid):
 #                     raise SystemExit(f"refusing to load {target}: writable by others")
 #         loader = importlib.machinery.SourceFileLoader("asuvpn_contract", path)
 #         spec = importlib.util.spec_from_loader("asuvpn_contract", loader)
