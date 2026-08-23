@@ -310,6 +310,13 @@ SETTINGS = (
     Setting("teardown-timeout", "int", 75,
             "Seconds to wait for the helper to finish. Must outlast its own"
             " signal escalation of 15 + 10 + 5 plus the routing check after."),
+    Setting("log-max-kb", "int", 4096,
+            "Size the session log may reach before it is rotated, in KiB."
+            " 0 means never rotate on size."),
+    Setting("log-keep", "int", 3,
+            "Rotated logs kept beside the current one; session.log.1 is the"
+            " newest. Connecting rotates too, so this is also how many past"
+            " sessions survive. 0 keeps none, and rotation just truncates."),
 )
 SETTINGS_BY_NAME = {s.name: s for s in SETTINGS}
 CONFIG_BASENAME = "asuvpn.conf"

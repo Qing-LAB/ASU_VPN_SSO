@@ -106,8 +106,7 @@ LOG_FILE = _xdg_dir("XDG_CACHE_HOME", ".cache") / "asuvpn" / "session.log"
 AUTOSTART_FILE = (
     _xdg_dir("XDG_CONFIG_HOME", ".config") / "autostart" / "asuvpn-tray.desktop"
 )
-MAX_LOG_LINES = 4000
-MAX_LOG_BYTES = 4 * 1024 * 1024
+MAX_LOG_LINES = 4000  # the in-memory tail; the file's cap is the log-max-kb setting
 IFF_UP = 0x1
 
 # Not 2: argparse already exits 2 for any bad command line, so a script could
@@ -647,20 +646,46 @@ class VpnTray:
         with self._log_lock:
             self.log_lines.append(line)
             del self.log_lines[:-MAX_LOG_LINES]
+            limit = SETTINGS["log-max-kb"]
+            if limit and self._log_bytes > limit * 1024:
+                # A session can stay up for weeks; roll the file over rather
+                # than growing it forever. The overflow survives as .1.
+                self._rotate_log_locked()
             try:
-                if self._log_bytes > MAX_LOG_BYTES:
-                    # A session can stay up for weeks; rewrite from the capped
-                    # in-memory tail rather than growing the file forever.
-                    LOG_FILE.write_text("\n".join(self.log_lines) + "\n")
-                    self._log_bytes = LOG_FILE.stat().st_size
-                else:
-                    with LOG_FILE.open("a") as fh:
-                        fh.write(line + "\n")
-                    self._log_bytes += len(line) + 1
+                with LOG_FILE.open("a") as fh:
+                    fh.write(line + "\n")
+                self._log_bytes += len(line) + 1
             except OSError:
                 pass
         # The window is GTK, so it may only be touched from the main loop.
         GLib.idle_add(self._append_to_log_window, line)
+
+    def _rotate_log_locked(self):
+        """Rotate session.log → .1 → .2 …; the caller holds _log_lock.
+
+        `log-keep` rotated files survive, the newest as .1. Files numbered
+        beyond the current setting are pruned first, so lowering it takes
+        effect at the next rotation; 0 keeps none, and rotation degenerates to
+        the truncation it replaced.
+        """
+        keep = SETTINGS["log-keep"]
+        try:
+            for old in LOG_FILE.parent.glob(LOG_FILE.name + ".*"):
+                suffix = old.name[len(LOG_FILE.name) + 1:]
+                if suffix.isdigit() and int(suffix) > keep:
+                    old.unlink(missing_ok=True)
+            if keep > 0 and LOG_FILE.exists():
+                for index in range(keep - 1, 0, -1):
+                    older = LOG_FILE.with_name(f"{LOG_FILE.name}.{index}")
+                    if older.exists():
+                        older.replace(
+                            LOG_FILE.with_name(f"{LOG_FILE.name}.{index + 1}"))
+                LOG_FILE.replace(LOG_FILE.with_name(f"{LOG_FILE.name}.1"))
+            LOG_FILE.write_text("")
+            os.chmod(LOG_FILE, 0o600)
+        except OSError:
+            pass  # an unwritable cache dir costs the log, not the applet
+        self._log_bytes = 0
 
     def _append_to_log_window(self, line):
         if self.log_buffer is not None:
@@ -751,6 +776,17 @@ class VpnTray:
         wiping them leaves the user with a mystery and a fresh log saying
         nothing happened.
         """
+        if self.health_demoted and self.state == CONNECTING:
+            # An established tunnel the watchdog demoted. The menu offers
+            # Reconnect here instead of Connect, and the CLI verb means the
+            # same intent — "get me connected" — which for a tunnel that is up
+            # but carrying nothing is a teardown and a fresh sign-in. Refusing
+            # silently, as a plain busy state does below, read as "cannot
+            # connect" against exactly this state on 2026-08-23.
+            self.log("[tray] connect asked for while the tunnel is demoted;"
+                     " reconnecting instead")
+            self.reconnect(force=True)
+            return
         if self.state in BUSY_STATES or self.state == CONNECTED:
             return
         sso = find_openconnect_sso()
@@ -767,13 +803,11 @@ class VpnTray:
         self.cancelled = False
         if not keep_log:
             with self._log_lock:
-                try:
-                    LOG_FILE.write_text("")
-                    os.chmod(LOG_FILE, 0o600)
-                except OSError:
-                    pass
+                # A fresh session starts a fresh log, but the previous
+                # session's survives the turnover as session.log.1 — wiping it
+                # here threw away the only record of whatever ended it.
+                self._rotate_log_locked()
                 self.log_lines.clear()
-                self._log_bytes = 0
             if self.log_buffer is not None:
                 self.log_buffer.set_text("")
         else:
@@ -1233,7 +1267,7 @@ class VpnTray:
             self.routes_seen = {"routes4": False, "routes6": False}
         if not device or not C.INTERFACE_RE.match(device):
             return
-        self.tunnel_device = device
+        self.tunnel_device: str | None = device
         # Taken now, while openconnect has just created it. Comparing it later
         # is what tells "our tunnel is still here" from "a device with the same
         # name is here", which is not the same claim.
@@ -1262,7 +1296,7 @@ class VpnTray:
         self.tunnel_dns = ""
         self.tunnel_ever_connected = False
         self.strikes = {"device": 0, "probe": 0}
-        self.health_demoted = False
+        self.health_demoted: bool = False
         self.demoted_by = None
         self.nudge_spent = False
         self.failure_notified = False
@@ -1440,6 +1474,21 @@ class VpnTray:
                 self.notify("VPN reconnecting", reason)
             return
 
+        # From here on, every path logs the decision it took and why. A log
+        # that shows verdicts but no decisions reads as a hang: on 2026-08-23
+        # the cycles after a spent nudge logged their strikes and then went
+        # quiet, and what the watchdog was waiting for was anyone's guess.
+        if self.nudge_spent:
+            self.log("[tray] the free re-establish was already tried for this"
+                     " incident and traffic did not return")
+        elif now - self.last_nudge < SETTINGS["nudge-min-gap"]:
+            wait = int(SETTINGS["nudge-min-gap"] - (now - self.last_nudge))
+            self.log(f"[tray] holding the free re-establish for another {wait}s"
+                     " (nudge-min-gap)")
+        else:
+            self.log("[tray] could not ask openconnect to re-establish;"
+                     " the helper is not listening")
+
         # The free option is spent, or there was no one to ask. Said once per
         # incident, at the moment it becomes true — which may be cycles after
         # the demotion, when a nudge that looked promising did not stick.
@@ -1447,15 +1496,22 @@ class VpnTray:
             self.failure_notified = True
             self.notify("VPN not carrying traffic", reason,
                         icon="dialog-warning-symbolic")
-        if (self.autoreconnect_enabled()
-                and now - self.last_autoreconnect >= SETTINGS["autoreconnect-min-gap"]):
-            self.last_autoreconnect = now
-            self.log("[tray] signing in again to rebuild the tunnel")
-            # Announced, because it is about to raise a Duo push and a password
-            # dialog and the user should know what asked for them.
-            self.notify("VPN signing in again",
-                        "the tunnel could not be recovered without it")
-            self.reconnect(force=True, keep_log=True)
+        if not self.autoreconnect_enabled():
+            self.log("[tray] automatic sign-in is off; staying demoted until a"
+                     " check clears — Reconnect or Disconnect when ready")
+            return
+        remaining = SETTINGS["autoreconnect-min-gap"] - (now - self.last_autoreconnect)
+        if remaining > 0:
+            self.log(f"[tray] automatic sign-in allowed again in"
+                     f" {int(remaining)}s (autoreconnect-min-gap)")
+            return
+        self.last_autoreconnect = now
+        self.log("[tray] signing in again to rebuild the tunnel")
+        # Announced, because it is about to raise a Duo push and a password
+        # dialog and the user should know what asked for them.
+        self.notify("VPN signing in again",
+                    "the tunnel could not be recovered without it")
+        self.reconnect(force=True, keep_log=True)
 
     def _announce_connected(self, address):
         """The single place a tunnel becomes usable, whichever source said so.
@@ -1873,7 +1929,8 @@ COMMANDS = ("connect", "disconnect", "reconnect", "status", "log", "tray", "quit
 
 COMMAND_HELP = """
 commands:
-  connect       sign in and bring the tunnel up (the default)
+  connect       sign in and bring the tunnel up (the default); a tunnel that
+                is up but not carrying traffic is reconnected instead
   disconnect    close the tunnel, leaving the applet running
   reconnect     sign in again and replace the current tunnel
   status        print the current state
@@ -1933,7 +1990,8 @@ def show_log(follow):
     if send_to_running_instance("ping") is None:
         print(f"# {APP_NAME} is not running; this is the last session's log\n")
     try:
-        with LOG_FILE.open() as fh:
+        fh = LOG_FILE.open()
+        try:
             sys.stdout.write(fh.read())
             sys.stdout.flush()
             while follow:
@@ -1942,10 +2000,23 @@ def show_log(follow):
                     sys.stdout.write(line)
                     sys.stdout.flush()
                     continue
-                # Connecting truncates the log, so follow it back to the top.
-                if fh.tell() > LOG_FILE.stat().st_size:
-                    fh.seek(0)
+                try:
+                    on_disk = os.stat(LOG_FILE)
+                except OSError:
+                    time.sleep(0.3)  # mid-rotation; the new file is imminent
+                    continue
+                # Connecting and the size cap both rotate the file, which
+                # renames the inode this handle follows — switch to the new
+                # one, or -f would silently tail yesterday's session.log.1.
+                if os.fstat(fh.fileno()).st_ino != on_disk.st_ino:
+                    fh.close()
+                    fh = LOG_FILE.open()
+                    continue
+                if fh.tell() > on_disk.st_size:
+                    fh.seek(0)  # truncated in place (log-keep = 0)
                 time.sleep(0.3)
+        finally:
+            fh.close()
     except KeyboardInterrupt:
         pass
     except OSError as exc:

@@ -425,13 +425,17 @@ def check_demotion_rules(tray, r):
             self.last_failure = None
             self.last_nudge = float("-inf")
             self.last_autoreconnect = float("-inf")
-            self.notes, self.sent = [], []
+            self.notes, self.sent, self.logged = [], [], []
+            self.reconnects = []
+
+        def reconnect(self, force=False, keep_log=False):
+            self.reconnects.append(force)
 
         def notify(self, summary, body="", icon=None):
             self.notes.append(summary)
 
         def log(self, line):
-            pass
+            self.logged.append(line)
 
         def _set_state(self, state, detail=""):
             self.state, self.detail = state, detail
@@ -471,6 +475,13 @@ def check_demotion_rules(tray, r):
             stub.sent == ["reconnect"]
             and stub.notes.count("VPN not carrying traffic") == 1,
             f"sent={stub.sent} notes={stub.notes}")
+    # The decision trail: a cycle that declines to act has to say what it
+    # declined and what it is waiting for, or the log reads as a hang — which
+    # is exactly how the 2026-08-23 live break read.
+    r.check("a cycle that declines to act logs its decision and its reason",
+            any("already tried" in line for line in stub.logged)
+            and any("sign-in is off" in line for line in stub.logged),
+            f"logged={stub.logged}")
 
     stub._healthy("probe", "answered")
     r.check("the demoting source is what promotes, and it resets the incident",
@@ -479,6 +490,74 @@ def check_demotion_rules(tray, r):
             and not stub.health_demoted and not stub.nudge_spent
             and not stub.failure_notified,
             f"state={stub.state!r} notes={stub.notes}")
+
+    # The verb a user reaches for. A demoted tunnel is established, so the
+    # menu offers Reconnect — and `connect` has to mean the same intent there,
+    # not a silent refusal that reads as "cannot connect". A plain CONNECTED
+    # still refuses quietly, as ever.
+    demoted = Stub()
+    demoted.health_demoted, demoted.state = True, tray.CONNECTING
+    tray.VpnTray.connect(demoted)
+    connected = Stub()
+    connected.state = tray.CONNECTED
+    tray.VpnTray.connect(connected)
+    r.check("connect on a demoted tunnel means reconnect, and only there",
+            demoted.reconnects == [True] and connected.reconnects == [],
+            f"demoted={demoted.reconnects} connected={connected.reconnects}")
+
+
+def check_log_rotation(tray, r):
+    """The session log is capped and rotated, and log-keep bounds the pile.
+
+    Asked for after a live session: the log used to be wiped on every connect
+    (destroying the record of whatever ended the last session) and rewritten
+    in place at a hardcoded size. Now it rotates — connect and the size cap
+    both shift session.log → .1 → .2 … — and `log-keep` bounds how many
+    survive, 0 meaning none.
+    """
+    original_log = tray.LOG_FILE
+    original_keep = tray.SETTINGS["log-keep"]
+    holder = type("Holder", (), {"_log_bytes": 999})()
+    with tempfile.TemporaryDirectory() as base:
+        tray.LOG_FILE = type(original_log)(base) / "session.log"
+        try:
+            tray.SETTINGS["log-keep"] = 2
+            problems = []
+            for generation in ("one", "two", "three"):
+                tray.LOG_FILE.write_text(generation)
+                tray.VpnTray._rotate_log_locked(holder)
+            def generation_text(name):
+                try:
+                    return (tray.LOG_FILE.parent / name).read_text()
+                except OSError:
+                    return "<missing>"
+
+            gen1 = generation_text("session.log.1")
+            gen2 = generation_text("session.log.2")
+            mode = os.stat(tray.LOG_FILE).st_mode & 0o777
+            if gen1 != "three" or gen2 != "two":
+                problems.append(f"expected three/two, got {gen1!r}/{gen2!r}")
+            if (tray.LOG_FILE.parent / "session.log.3").exists():
+                problems.append("a fourth generation survived log-keep = 2")
+            if tray.LOG_FILE.read_text() != "":
+                problems.append("the fresh log is not empty")
+            if mode != 0o600:
+                problems.append(f"fresh log mode is {oct(mode)}, not 0600")
+            if holder._log_bytes != 0:
+                problems.append("the byte counter was not reset")
+            r.check("the log rotates, keeps log-keep files, and starts fresh",
+                    not problems, "; ".join(problems))
+            tray.SETTINGS["log-keep"] = 0
+            tray.LOG_FILE.write_text("gone")
+            tray.VpnTray._rotate_log_locked(holder)
+            leftovers = sorted(p.name for p in
+                               tray.LOG_FILE.parent.glob("session.log.*"))
+            r.check("log-keep 0 truncates and keeps no rotated files",
+                    tray.LOG_FILE.read_text() == "" and not leftovers,
+                    f"left behind: {leftovers}")
+        finally:
+            tray.LOG_FILE = original_log
+            tray.SETTINGS["log-keep"] = original_keep
 
 
 def check_liveness_probe(tray, r):
@@ -1130,6 +1209,7 @@ def main():
         check_log_scrubbing(tray, r)
         check_tunnel_health(tray, r)
         check_demotion_rules(tray, r)
+        check_log_rotation(tray, r)
         check_liveness_probe(tray, r)
         check_notifications(tray, r)
         check_output_framing(helper, r)

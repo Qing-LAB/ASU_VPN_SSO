@@ -462,7 +462,15 @@ Three details that are easy to get wrong, and were:
 - **A demoted tunnel is still an established one.** It has a helper and a
   device, so the menu offers Disconnect and Reconnect rather than Cancel, and
   `disconnect` tears it down instead of taking the abandon-the-attempt path.
-  Keying any of this purely on `CONNECTED` gets it wrong.
+  The CLI's `connect` delegates to `reconnect` there for the same reason —
+  refusing silently, as a plain busy state does, read as "cannot connect"
+  against a live demoted tunnel. Keying any of this purely on `CONNECTED`
+  gets it wrong.
+
+Every pass through the ladder logs the decision it took and the reason — the
+nudge held and for how long, the free option already spent, sign-in off, or
+sign-in waiting out its gap. A log that shows verdicts but not decisions reads
+as a hang, which is how the first live routes-lost break read.
 
 `force` never overrides teardown: a disconnect or quit already under way
 outranks the watchdog.
@@ -589,7 +597,7 @@ where it can be, checked by `asuvpn selftest`.
 
 ## How this is tested
 
-Three tiers in `asuvpn-selftest` (74 checks), plus the scenario sandbox in
+Three tiers in `asuvpn-selftest` (78 checks), plus the scenario sandbox in
 [tests/sandbox](tests/sandbox/README.md).
 
 The shaping constraint: **conventional unit tests would not have caught any of
@@ -645,6 +653,9 @@ breaking the code on purpose:
 | let the reconnect event promote a demoted badge | a reconnect event mid-demotion adopts the tunnel but not the badge |
 | let a mid-demotion adoption reset the incident flags | an incident takes one nudge, then says the free option is spent |
 | allow re-nudging within one incident | the same check — after winding the clock past the rate limit, so the flag and not the timestamp is what refuses |
+| remove the demoted-tunnel delegation from `connect` | connect on a demoted tunnel means reconnect, and only there |
+| reword the declined-action log line | a cycle that declines to act logs its decision and its reason |
+| drop the rotation shift so `.1` is clobbered | the log rotates, keeps log-keep files, and starts fresh |
 | neuter the contract's shared-group predicate | `sec.sh` (b2): the helper no longer exits 26 |
 | neuter the loader's inline check as well | `sec.sh` (b): a group-shared contract executes |
 

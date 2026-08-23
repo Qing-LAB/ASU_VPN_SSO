@@ -295,7 +295,7 @@ Runtime state lives elsewhere, and is created on demand:
 
 | Path | What it is |
 | --- | --- |
-| `~/.cache/asuvpn/session.log` | Session log, truncated on each connect (`0600` in a `0700` directory) |
+| `~/.cache/asuvpn/session.log` | Session log (`0600` in a `0700` directory). Rotated — not wiped — on each connect and at `log-max-kb`; `log-keep` past logs survive as `session.log.1`, `.2`, … |
 | `~/.config/autostart/asuvpn-tray.desktop` | Written only when you tick "Start on login (applet only)" |
 | abstract socket `asuvpn-tray-$UID` | Single-instance guard and CLI channel; peer uid is checked, and it vanishes with the process |
 

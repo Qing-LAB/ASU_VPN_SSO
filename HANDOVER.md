@@ -20,7 +20,7 @@ Everything is committed and pushed to `main` at
 | Programs | `asuvpn-tray` (you), `asuvpn-helper` (root, via pkexec), `asuvpn-notify` (root, run by openconnect), `asuvpn-selftest` (you) |
 | Shared | `asuvpn_contract.py` — loaded by explicit path, never imported |
 | Settings | `~/.config/asuvpn/asuvpn.conf`, generated from the contract's schema |
-| Checks | `asuvpn selftest` — 74, in three tiers; scenario suite in [tests/sandbox](tests/sandbox/README.md) |
+| Checks | `asuvpn selftest` — 78, in three tiers; scenario suite in [tests/sandbox](tests/sandbox/README.md) |
 | Analysers | ruff, pyflakes, pylint, mypy, bandit, vulture, shellcheck — all clean |
 | Tested against | openconnect v9.12-3.3, Ubuntu, GNOME, ASU's `sslvpn.asu.edu` |
 
@@ -258,7 +258,7 @@ because code cannot be shared before the sharing mechanism is loaded.
 ## How to work on it
 
 ```bash
-asuvpn selftest                 # 74 checks; run before and after any change
+asuvpn selftest                 # 78 checks; run before and after any change
 tests/sandbox/enter.sh sec.sh   # scenario tests, in a namespace of stand-ins
 ./install.sh                    # copies into ~/.local, runs the self-check
 asuvpn log -f                   # what it is actually doing
