@@ -44,13 +44,26 @@ not, and each cost a round of rework.
 - `--force-dpd 30` is **safe on ASU**. The server negotiates `DPD 0` but *does*
   answer forced probes: 90 seconds with DPD active, zero reconnect events. This
   was the last open risk and it is closed.
+- **Free recovery works on the real gateway** (exercised 2026-08-23, twice).
+  WiFi loss and suspend/resume both played out the designed sequence live:
+  forced DPD detected the dead peer, `attempt-reconnect` → `reconnect` came
+  through the script contract, the badge honestly showed "link lost, retrying"
+  throughout, and the session resumed with the same cookie and address — no
+  Duo, no password. Wake-to-recovered after suspend: 18 seconds. The watchdog
+  counted a probe strike during each break and correctly stood aside while
+  openconnect ran its own recovery; a transient overnight probe strike (1/2)
+  cleared on the next cycle without a demotion.
 - The liveness probe target answers in ~17 ms; a refusal (RST) arrives in ~20 ms
   and correctly counts as alive.
 
 ### Proven only in the sandbox
 
-- The watchdog's escalation ladder, the nudge rate limits, notification wording,
-  every failure path, and the config driving behaviour end to end.
+- The watchdog's escalation ladder — the nudge and the opt-in sign-in. The
+  2026-08-23 live breaks never reached it, because openconnect recovered first
+  every time, which is the designed order; the ladder only fires for breaks
+  openconnect cannot see or cannot fix (routes wiped, a black-holed tunnel).
+- The nudge rate limits, notification wording, every failure path, and the
+  config driving behaviour end to end.
 - The **shared-group** permission refusal, end to end since 2026-08-22: the
   sandbox now maps this user's `/etc/subgid` block (`--map-auto`), so
   `tests/sandbox/sec.sh` stages a file owned by a second group and watches the
@@ -215,10 +228,14 @@ because code cannot be shared before the sharing mechanism is loaded.
 
 ## What to do next, roughly in order
 
-1. **Live-exercise the watchdog.** Everything about it is sandbox-proven only.
-   Suspend/resume, or toggle WiFi, on a real tunnel and watch `asuvpn log -f`.
-   Expected: `attempt-reconnect` → `reconnect` with no sign-in, or the probe
-   reporting if routes are lost.
+1. **Live-exercise the escalation ladder.** The free-recovery half is done
+   (2026-08-23, WiFi loss and suspend/resume — see the proven list), but the
+   nudge and the opt-in sign-in still have not fired outside the sandbox,
+   because openconnect recovered first every time. Staging one live means a
+   break DPD cannot see: with a tunnel up,
+   `sudo ip route flush dev asuvpn0` wipes its routes, and the expected
+   sequence is two device-check strikes → demotion → `SIGUSR2` nudge →
+   openconnect re-establishes and vpnc-script reinstalls the routes.
 2. **Try `autoreconnect = on`** for a while, if the user wants unattended
    recovery, and see whether the 300 s floor is right.
 3. **Consider whether `probe-every = 3` is the right frequency** now that a real
