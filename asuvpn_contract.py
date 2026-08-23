@@ -119,12 +119,14 @@ def strip_relay(line):
 
 
 # The pipe is the disconnect signal, so the verbs are few and each is a whole
-# line. Anything unrecognised is ignored rather than guessed at.
+# line. Anything unrecognised is ignored rather than guessed at. A "disconnect"
+# verb was defined here once, accepted by the helper and sent by nothing —
+# closing the pipe *is* the disconnect — and a verb with no sender is drift
+# waiting to happen, so it is gone.
 CONTROL_QUIT = "quit"
-CONTROL_DISCONNECT = "disconnect"
 CONTROL_RECONNECT = "reconnect"
-CONTROL_STOP = (CONTROL_QUIT, CONTROL_DISCONNECT)
-CONTROL_VERBS = (CONTROL_QUIT, CONTROL_DISCONNECT, CONTROL_RECONNECT)
+CONTROL_STOP = (CONTROL_QUIT,)
+CONTROL_VERBS = (CONTROL_QUIT, CONTROL_RECONNECT)
 
 
 def encode_control(verb):
@@ -206,6 +208,16 @@ REASON_STATES = {
 INTERFACE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,14}$")
 INTERFACE_PREFIX = "asuvpn"
 
+# What we present to the gateway. Both the tray (which passes it) and the
+# helper (which needs a default for a direct caller) must say the same one; it
+# was stated in each and could drift.
+AC_VERSION = "4.7.00136"
+
+# Only a last resort, shared by the helper (when the binary will not name its
+# own default) and asuvpn-notify (when run as a vpnc-script by hand). The real
+# path is asked of `openconnect --version`; it differs between distributions.
+FALLBACK_VPNC_SCRIPT = "/usr/share/vpnc-scripts/vpnc-script"
+
 
 def one_token(value):
     """Collapse a value to a single whitespace-free token."""
@@ -223,13 +235,14 @@ def one_line(value):
 class Setting:
     """One knob: how it is spelled, what it means, and what it is when unset."""
 
-    __slots__ = ("default", "kind", "name", "summary")
+    __slots__ = ("default", "kind", "maximum", "name", "summary")
 
-    def __init__(self, name, kind, default, summary):
+    def __init__(self, name, kind, default, summary, maximum=None):
         self.name = name
         self.kind = kind
         self.default = default
         self.summary = summary
+        self.maximum = maximum
 
     def parse(self, text):
         """The value this text denotes. ValueError if it denotes nothing."""
@@ -244,6 +257,8 @@ class Setting:
             value = int(text.strip())
             if value < 0:
                 raise ValueError("cannot be negative")
+            if self.maximum is not None and value > self.maximum:
+                raise ValueError(f"cannot exceed {self.maximum}")
             return value
         return text.strip()
 
@@ -279,7 +294,8 @@ SETTINGS = (
             " pushed, which is the right answer on every network it is used on."),
     Setting("probe-port", "int", 53,
             "Port for the probe. Nothing is sent; a refusal counts as alive,"
-            " because a RST proves a packet crossed in each direction."),
+            " because a RST proves a packet crossed in each direction.",
+            maximum=65535),
     Setting("probe-every", "int", 3,
             "Run the probe on every Nth health check, so it costs a packet a"
             " minute rather than one every twenty seconds."),

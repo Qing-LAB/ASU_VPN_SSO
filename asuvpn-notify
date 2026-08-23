@@ -52,11 +52,6 @@ def _contract():
 
 C = _contract()
 
-# Only reached if this is run as a vpnc-script by hand. In normal use the helper
-# always sets the real script, and it derives that from `openconnect --version`
-# rather than assuming -- the path differs between distributions.
-DEFAULT_SCRIPT = "/usr/share/vpnc-scripts/vpnc-script"
-
 
 def report():
     import socket
@@ -83,8 +78,10 @@ def main():
 
     # Hand over with the environment intact; the real script needs every var
     # openconnect set. --script is a shell command line, not a path, so this
-    # goes through sh exactly as openconnect would have run it.
-    script = os.environ.get(C.REAL_SCRIPT_VAR) or DEFAULT_SCRIPT
+    # goes through sh exactly as openconnect would have run it. The fallback is
+    # only reached when this is run as a vpnc-script by hand: in normal use the
+    # helper always sets the real script, derived from `openconnect --version`.
+    script = os.environ.get(C.REAL_SCRIPT_VAR) or C.FALLBACK_VPNC_SCRIPT
     for var in C.EVENT_VARS:
         os.environ.pop(var, None)
     os.execv("/bin/sh", ["/bin/sh", "-c", script])  # noqa: S606

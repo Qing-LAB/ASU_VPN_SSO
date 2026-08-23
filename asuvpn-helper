@@ -85,9 +85,6 @@ TUNNEL_PREFIXES = ("tun", "tap", "vpn")
 HERE = os.path.dirname(os.path.abspath(__file__))
 NOTIFY = os.path.join(HERE, "asuvpn-notify")
 CONTRACT = os.path.join(HERE, "asuvpn_contract.py")
-# Only a last resort. openconnect knows its own compiled-in default and prints
-# it, so it is asked rather than guessed -- see default_vpnc_script().
-FALLBACK_VPNC_SCRIPT = "/usr/share/vpnc-scripts/vpnc-script"
 # Root-only, so that nothing else on the machine can inject state events. The
 # directory bit is the whole access control: 0700 root:root denies traversal to
 # every other uid, and only root could reach the socket inside it anyway.
@@ -138,26 +135,6 @@ def unsupported_option(option):
     return None
 
 
-def unsafe_write_access(path):
-    """Why `path` is writable by a principal other than its owner, or None.
-
-    Group-writable is not automatically a finding. Debian and Ubuntu default to
-    umask 002 with user-private groups, so a plain git checkout is 0775 with
-    gid == uid — the "group" is one person, and refusing there would break
-    --link mode for no gain. A *shared* group is a second principal, and
-    world-writable always is.
-    """
-    try:
-        st = os.stat(path)
-    except OSError:
-        return None
-    if st.st_mode & stat.S_IWOTH:
-        return "world-writable"
-    if st.st_mode & stat.S_IWGRP and st.st_gid != st.st_uid:
-        return f"writable by group {st.st_gid}"
-    return None
-
-
 def vpnc_script_from_binary(openconnect):
     """What openconnect reports as its default script, or None if it did not.
 
@@ -194,7 +171,7 @@ def default_vpnc_script(openconnect):
     with no routes and no DNS, restores nothing on the way out, and the tray
     reports "Connected" throughout.
     """
-    return vpnc_script_from_binary(openconnect) or FALLBACK_VPNC_SCRIPT
+    return vpnc_script_from_binary(openconnect) or C.FALLBACK_VPNC_SCRIPT
 
 
 def prune_stale_channels():
@@ -675,7 +652,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--host", required=True, help="VPN URL from openconnect-sso")
     parser.add_argument("--fingerprint", required=True, help="server certificate hash")
-    parser.add_argument("--ac-version", default="4.7.00136")
+    parser.add_argument("--ac-version", default=C.AC_VERSION)
     # Passed in rather than read from a file. Settings belong to the user and
     # this runs as root, where ~ is root's home -- so the side that owns the
     # config resolves it and hands over a value, and the privileged side never

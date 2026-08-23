@@ -156,6 +156,9 @@ install_openconnect_sso() {
   else
     warn "openconnect-sso is not managed by pipx; make sure its environment has $SETUPTOOLS_PIN"
   fi
+  # Said out loud because it edits a shell rc file the user owns; hiding a
+  # write to someone's dotfiles behind /dev/null is how surprises are made.
+  say "pipx ensurepath (may add ~/.local/bin to your shell's PATH setup)"
   pipx ensurepath >/dev/null 2>&1 || true
 }
 

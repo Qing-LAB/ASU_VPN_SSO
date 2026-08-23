@@ -74,7 +74,7 @@ gitignored; nothing in here needs cleaning up by hand.
 | Scenario | What it proves | Display needed |
 | --- | --- | --- |
 | `sec.sh` | the permission refusals, on the real helper: world-writable, **group-shared (asserts, exit 1 on the wrong outcome)**, directory, symlink swap, negative `--dpd` | no |
-| `sec2.sh` | staging positive-controls (the `chgrp` really takes), dpd edge cases | no |
+| `sec2.sh` | staging positive-control: the `chgrp` to a second group really takes | no |
 | `sec3.sh` | negative dpd refused with its documented exit code; 0 means "leave the server alone"; the runtime check names the contract | no |
 | `fdcheck.sh` | openconnect's stdin is not the helper's control pipe, so it cannot inject control verbs | no |
 | `lifecycle.sh` | connect → reconnect → probes → disconnect → quit, all through the tray | yes |

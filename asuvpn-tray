@@ -99,8 +99,7 @@ def reload_settings():
 
 APP_ID = "asuvpn-tray"
 APP_NAME = "ASU VPN"
-DEFAULT_SERVER = "sslvpn.asu.edu"
-AC_VERSION = "4.7.00136"
+DEFAULT_SERVER = C.SETTINGS_BY_NAME["server"].default
 HERE = Path(__file__).resolve().parent
 HELPER = HERE / "asuvpn-helper"
 LOG_FILE = _xdg_dir("XDG_CACHE_HOME", ".cache") / "asuvpn" / "session.log"
@@ -168,7 +167,15 @@ CONNECTED_MESSAGES = (
     ("Connected as", r"Connected as (?P<addr>[0-9a-fA-F.:]+)", False),
 )
 CONNECTED_PATTERNS = tuple(re.compile(r) for _, r, _ in CONNECTED_MESSAGES)
-ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+# openconnect-sso colours its logs (CSI sequences), and a hostile VPN banner
+# could carry OSC sequences or bare control characters, which would reach a
+# terminal through `asuvpn log`. Everything ESC-led and every C0 control except
+# tab is removed where the log line is built.
+ANSI_ESCAPE = re.compile(
+    r"\x1b\[[0-9;]*[A-Za-z]"                 # CSI: colours, cursor movement
+    r"|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)?"   # OSC: titles, hyperlinks
+    r"|[\x00-\x08\x0b-\x1f\x7f]"             # bare C0 controls and DEL
+)
 
 # Deliberately narrow. A bare /Reconnect/ matched thirty message templates in
 # v9.12, two of which openconnect prints while the tunnel is perfectly healthy
@@ -1065,7 +1072,7 @@ class VpnTray:
             "--fingerprint",
             fingerprint,
             "--ac-version",
-            AC_VERSION,
+            C.AC_VERSION,
         ]
         command += ["--dpd", str(SETTINGS["dpd"])]
         if self.extra_args:
@@ -1682,6 +1689,14 @@ def send_to_running_instance(command, timeout=5.0):
     try:
         client.connect(ipc_address())
     except OSError:
+        return None
+    # The name is an abstract socket, which any local user could have bound
+    # first. The applet already refuses foreign clients via SO_PEERCRED; this
+    # is the same check pointed the other way, so a squatter cannot feed this
+    # command a fabricated state either. If a foreign process holds the name,
+    # our applet is not running, and None is the honest answer.
+    if peer_uid(client) != os.getuid():
+        client.close()
         return None
     try:
         client.sendall(command.encode())

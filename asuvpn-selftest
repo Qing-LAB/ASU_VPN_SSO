@@ -135,14 +135,16 @@ def check_contract(C, r):
             C.decode_event(b"only\ttwo") is None)
 
     values, problems = C.parse_settings(
-        "server = x.edu\nprobe = off\ndpd = 0\nnope = 1\nprobe-every = -3\n")
+        "server = x.edu\nprobe = off\ndpd = 0\nnope = 1\nprobe-every = -3\n"
+        "probe-port = 70000\n")
     r.check("settings parse by type, and every default survives a bad file",
             values["server"] == "x.edu" and values["probe"] is False
             and values["dpd"] == 0
-            and values["probe-every"] == C.SETTINGS_BY_NAME["probe-every"].default,
+            and values["probe-every"] == C.SETTINGS_BY_NAME["probe-every"].default
+            and values["probe-port"] == C.SETTINGS_BY_NAME["probe-port"].default,
             f"got {values!r}")
-    r.check("an unknown key and a bad value are reported, not raised",
-            len(problems) == 2, f"got {problems!r}")
+    r.check("unknown keys and out-of-range values are reported, not raised",
+            len(problems) == 3, f"got {problems!r}")
     rendered, _ = C.parse_settings(C.render_settings())
     r.check("the generated config file parses back to the defaults",
             rendered == C.defaults(),
@@ -413,6 +415,37 @@ def check_state_payload(tray, r):
     r.ok("malformed payloads do not raise")
 
 
+def check_log_scrubbing(tray, r):
+    """Nothing a server says can drive the reader's terminal.
+
+    openconnect's output — a VPN banner included — ends up in the session log,
+    and `asuvpn log` prints that to a terminal. Colour codes are stripped for
+    tidiness, but the rule is really about control: an OSC sequence can retitle
+    the window or plant a fake hyperlink, and stray control characters can
+    redraw a line into saying something it does not say.
+    """
+    hostile = [
+        "\x1b[31mred\x1b[0m text",
+        "\x1b]0;you have been hacked\x07banner",
+        "\x1b]8;;https://evil.example\x1b\\link\x1b]8;;\x1b\\",
+        "bell\x07 and \x08backspace and \x7fdelete",
+        "lone escape \x1b at the end",
+    ]
+    leaked = []
+    for line in hostile:
+        cleaned = tray.ANSI_ESCAPE.sub("", line)
+        if any(ord(ch) < 0x20 and ch != "\t" for ch in cleaned) or "\x7f" in cleaned:
+            leaked.append(f"{line!r} -> {cleaned!r}")
+    kept = tray.ANSI_ESCAPE.sub("", "keeps\ttabs intact")
+    if leaked:
+        r.fail("hostile control sequences never reach the log", "; ".join(leaked))
+    elif kept != "keeps\ttabs intact":
+        r.fail("hostile control sequences never reach the log",
+               f"plain text was mangled by the scrubber: {kept!r}")
+    else:
+        r.ok("hostile control sequences never reach the log")
+
+
 def check_output_framing(helper, r):
     """openconnect must not be able to forge a helper message.
 
@@ -498,7 +531,7 @@ def check_default_script(helper, C, binary, r):
     if not binary:
         return
     reported = helper.vpnc_script_from_binary(binary)
-    script = reported or helper.FALLBACK_VPNC_SCRIPT
+    script = reported or C.FALLBACK_VPNC_SCRIPT
     derived = reported is not None
     if not os.access(script, os.X_OK):
         r.fail("openconnect's default vpnc-script is executable",
@@ -979,6 +1012,7 @@ def main():
         check_reason_contract(C, r)
         check_permission_rules(C, r)
         check_state_payload(tray, r)
+        check_log_scrubbing(tray, r)
         check_tunnel_health(tray, r)
         check_liveness_probe(tray, r)
         check_notifications(tray, r)

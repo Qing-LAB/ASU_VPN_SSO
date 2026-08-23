@@ -562,7 +562,7 @@ where it can be, checked by `asuvpn selftest`.
 | A device name never reaches the filesystem or `ip` unvalidated | `INTERFACE_RE`, checked in two places | logic + wiring tiers |
 | `openconnect` cannot forge a helper message | `[vpn] ` prefix on every relayed line | wiring tier, with `\r` and `\n` payloads |
 | A state event cannot inject a line or a field | reject impossible device names; collapse every field to one token | wiring tier, with space-and-`=` payloads |
-| Only this user can drive the applet | `SO_PEERCRED`, failing closed | invert the check and confirm refusal |
+| Only this user can drive the applet, and only this user's applet answers | `SO_PEERCRED` at both ends, failing closed | invert the check and confirm refusal |
 | Nothing run as root is writable by a second principal | helper refuses with 26 | environment tier, and `install.sh` |
 | The cookie never reaches a command line or the log | `--cookie-on-stdin` only | grep the log and the journal |
 | Interposing never costs routing | derive the script, step aside if unusable | environment tier |
@@ -576,7 +576,7 @@ where it can be, checked by `asuvpn selftest`.
 
 ## How this is tested
 
-Three tiers in `asuvpn-selftest` (68 checks), plus the scenario sandbox in
+Three tiers in `asuvpn-selftest` (69 checks), plus the scenario sandbox in
 [tests/sandbox](tests/sandbox/README.md).
 
 The shaping constraint: **conventional unit tests would not have caught any of
@@ -627,6 +627,7 @@ breaking the code on purpose:
 | a `vpnc-script` with `case` branches missing two reasons | the default script handles every reason |
 | an `openconnect-sso` venv without `pkg_resources` | `openconnect-sso` can import `pkg_resources` |
 | teach the stand-in an invented line (`Connected as …`) | the stand-in only speaks lines from the installed catalogue |
+| weaken the log scrubber back to colour codes only | hostile control sequences never reach the log |
 | neuter the contract's shared-group predicate | `sec.sh` (b2): the helper no longer exits 26 |
 | neuter the loader's inline check as well | `sec.sh` (b): a group-shared contract executes |
 
