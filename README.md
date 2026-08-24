@@ -118,7 +118,7 @@ Launching the app connects straight away:
 | --- | --- |
 | Filled VPN badge | Connected |
 | Dashed VPN badge | Disconnected |
-| Acquiring badge | Signing in, connecting, or disconnecting |
+| Acquiring badge | Signing in, connecting, retrying a lost link, not carrying traffic, or disconnecting — the status line says which |
 | Error badge | Something failed |
 
 The menu shows only what applies to the current state: **Connect** when down,
@@ -144,7 +144,8 @@ matters raises a desktop notification:
 | **VPN carrying traffic again** | the tunnel recovered | — |
 | **VPN signing in again** | the nudge did not help and automatic reconnection is on | **a Duo push and a password** |
 | **VPN disconnected** | the tunnel closed, with the reason if it was not you | — |
-| **VPN teardown warning** | the network may not have been restored | — |
+| **Sign-in failed** | the sign-in step itself failed; the text says why | — |
+| **VPN warning** | the helper hit trouble — most seriously, the network may not have been restored after teardown | — |
 
 The distinction the wording carries is deliberate: *connection lost* and
 *reconnecting* are free and need nothing from you, while *signing in again* is
@@ -181,12 +182,12 @@ connect.
 | `health-strikes` | `2` | Consecutive bad checks before the badge stops claiming Connected. |
 | `probe` | `on` | Ask the network whether traffic still flows. The only check that catches a tunnel that looks perfect and delivers nothing. |
 | `probe-target` | *(empty)* | Address to probe. Empty means the resolver the VPN itself pushed. |
-| `probe-port`, `probe-every`, `probe-timeout` | `53`, `3`, `5` | Port, how often, how long to wait. |
+| `probe-port`, `probe-every`, `probe-timeout` | `53`, `3`, `5` | Port, how often, how long to wait (the wait is capped at 120). |
 | `nudge-min-gap` | `120` | Seconds between free re-establish requests. |
 | `autoreconnect-min-gap` | `300` | Seconds between unattended sign-ins. |
-| `teardown-timeout` | `75` | Seconds to wait for the helper. Must outlast its signal escalation. |
+| `teardown-timeout` | `75` | Seconds to wait for the helper. Must outlast its signal escalation, so values below 35 are refused and the default used. |
 | `log-max-kb` | `4096` | Size the session log may reach before it is rotated. **`0` never rotates on size.** |
-| `log-keep` | `3` | Rotated logs kept as `session.log.1`, `.2`, … Connecting rotates too, so this is also how many past sessions survive. `0` keeps none. |
+| `log-keep` | `3` | Rotated logs kept as `session.log.1`, `.2`, … Connecting rotates too, so this is also how many past sessions survive. `0` keeps none; capped at 99. |
 
 `asuvpn autoreconnect on` edits the file in place, changing that one line and
 leaving everything else as you left it.
@@ -224,7 +225,7 @@ Exit codes are meant for scripting:
 | Exit code | Meaning |
 | --- | --- |
 | `0` | The request was carried out — and for `status` or `--wait`, connected |
-| `1` | `status` or `--wait`: not connected. `disconnect`: the tunnel did not close |
+| `1` | `status` or `--wait`: not connected. `disconnect`: the tunnel did not close. `quit`: still shutting down. `log`: no log yet |
 | `2` | A bad command line (argparse's own code) |
 | `3` | `status` — or a `--wait` the applet vanished under: it is not running |
 | `4` | A different server was asked for than the running applet is using |
@@ -903,9 +904,11 @@ HH:MM:SS  [tray] …            the applet: decisions, checks, state changes
 HH:MM:SS  [config] …          a problem in asuvpn.conf, reported once
 HH:MM:SS  [sso] …             openconnect-sso's own output during sign-in
 HH:MM:SS  [helper] NOTE …     the root helper, informational
-HH:MM:SS  [helper] WARNING …  the network may not have been restored
+HH:MM:SS  [helper] WARNING …  needs attention — most seriously, the network
+                              may not have been restored
 HH:MM:SS  [helper] FATAL …    refused before openconnect ever started
 HH:MM:SS  [helper] STATE …    a transition from openconnect's script contract
+HH:MM:SS  [helper] DEVICE …   the tunnel device this session will create
 HH:MM:SS  [vpn] …             one line of openconnect's own output, relayed
 HH:MM:SS  [old tunnel] …      a superseded helper's last words
 ```
@@ -947,9 +950,12 @@ teardown, and logged precisely so a declined action never reads as a hang.
 | [`bootstrap.sh`](bootstrap.sh) | Installs dependencies, then calls `install.sh`. |
 | [`install.sh`](install.sh) | Copies the app into `~/.local` and registers it. No system changes. |
 | [`asuvpn.svg`](asuvpn.svg) | App icon. |
+| [`tests/sandbox/`](tests/sandbox/README.md) | Scenario tests: the real programs run whole lifetimes against stand-ins, in a namespace. |
 | [`DESIGN.md`](DESIGN.md) | Internals: state machine, concurrency, invariants, how it is tested. |
 | [`HANDOVER.md`](HANDOVER.md) | What is proven and what is not, the lessons behind the design, and what to do next. |
+| [`STATE-MACHINE-PLAN.md`](STATE-MACHINE-PLAN.md) | The state-machine rebuild's plan of record: the rationale and the decisions. The as-built table is in DESIGN.md. |
 | [`ruff.toml`](ruff.toml) | Lint config. Its `ignore` list records which rules are off and why. |
+| [`LICENSE`](LICENSE) | MIT. |
 
 ### Checking it
 
@@ -979,7 +985,7 @@ the middle one is the point:
 
 | Tier | What it checks |
 | --- | --- |
-| `logic` | Pure functions: the option blocklist, interface-name validation, `--interface`/`--script` parsing, the permission rules, state-payload parsing, and that `openconnect`'s output cannot forge a helper message |
+| `logic` | Pure functions and the state machine: the option blocklist, interface-name validation, `--interface`/`--script` parsing, the permission rules, state-payload parsing, the transition table driven with real message sequences, and that `openconnect`'s output cannot forge a helper message |
 | `environment` | Our assumptions put to the installed binaries — that `openconnect` exists, that the `vpnc-script` it names is executable and handles every `reason` we send, that our fallback log patterns still appear in its message catalogue, and that nothing the helper runs as root is writable by anyone else |
 | `wiring` | `asuvpn-notify` actually executed: the event arrives with the right token and fields, the real `vpnc-script` still runs with its environment intact, the token is scrubbed before it sees it, and no event can emit more than one line |
 
@@ -1065,11 +1071,11 @@ arrangement let a test reach a real binary. A namespace cannot leak: the real
 filesystem is not modified at all, and is byte-identical afterwards.
 
 The `reason` values the framework depends on were confirmed present in the
-installed `libopenconnect.so.5` rather than assumed. `connect` and `reconnect`
+installed `libopenconnect.so.5` rather than assumed. `reconnect` and `connect`
 do not appear in `strings` output because the linker tail-merges them into
-`attempt-reconnect` — they are at `attempt-reconnect`+8 and +10 — and the
-installed `vpnc-script` enumerates exactly those five in its own `case`
-statement.
+`attempt-reconnect` — they are at `attempt-reconnect`+8 and +10 respectively —
+and the installed `vpnc-script` enumerates exactly those five in its own
+`case` statement.
 
 Behaviours confirmed by first reproducing the bug and then the fix: a failure
 after a successful connect now reports `Failed to connect to host …` rather than
@@ -1098,8 +1104,8 @@ keyring probe reports correctly, and GNOME resolves the launcher and icon.
 
 > [!IMPORTANT]
 > Stand-ins are only as good as the strings they imitate. An earlier version
-> of the fake `openconnect` printed `Connected as …`, which openconnect has
-> not said since v7 — so the applet's connect detection passed every test
+> of the fake `openconnect` printed `Connected as …`, which openconnect
+> stopped saying in v8 — so the applet's connect detection passed every test
 > while being dead against the real v9.12 binary, and would have hung in
 > "Connecting…" on any network without DTLS. The patterns are now taken from
 > the installed binary's own message catalogue (`strings libopenconnect.so.5`)

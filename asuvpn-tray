@@ -86,15 +86,17 @@ def _xdg_dir(variable, fallback):
 
 CONFIG_FILE = Path(C.config_path())
 # Loaded once here for the one-shot CLI paths, and refreshed by the applet when
-# the file changes, so most settings take effect without a reconnect.
-SETTINGS, SETTING_PROBLEMS = C.load_settings(CONFIG_FILE)
+# the file changes, so most settings take effect without a reconnect. Problems
+# in the file are reported by the applet's health tick, which re-reads it —
+# the initial load's problems need no keeping.
+SETTINGS = C.load_settings(CONFIG_FILE)[0]
 
 
 def reload_settings():
     """Re-read the config. Returns the problems found, newest wins."""
-    global SETTINGS, SETTING_PROBLEMS  # one config per process, by design
-    SETTINGS, SETTING_PROBLEMS = C.load_settings(CONFIG_FILE)
-    return SETTING_PROBLEMS
+    global SETTINGS  # one config per process, by design
+    SETTINGS, problems = C.load_settings(CONFIG_FILE)
+    return problems
 
 
 APP_ID = "asuvpn-tray"
@@ -160,9 +162,10 @@ STATE_LABELS = {
 # Everything that can happen is a message; the machine below is the only thing
 # that turns messages into state. Watchers, workers, log readers and user
 # verbs INJECT these — they never assign state themselves.
-MSG_CONNECT = "connect"                    # user: keep_log
+MSG_CONNECT = "connect"                    # user
 MSG_DISCONNECT = "disconnect"              # user
-MSG_RECONNECT = "reconnect"                # user or ladder: keep_log
+MSG_RECONNECT = "reconnect"                # user; the ladder reaches the same
+                                           # handler directly, keep_log=True
 MSG_CANCEL = "cancel"                      # user
 MSG_QUIT = "quit"                          # user
 MSG_AUTH_OK = "auth-ok"                    # sign-in: host, cookie, fingerprint, attempt
@@ -217,7 +220,7 @@ TRANSITIONS = {
     (ANY, MSG_DEVICE): "remember_device",
     (ANY, MSG_FATAL): "remember_fatal",
     (ANY, MSG_PROBLEM): "remember_problem",
-    (ANY, MSG_WARNING): "teardown_warning",
+    (ANY, MSG_WARNING): "helper_warning",
     (ANY, MSG_HELPER_EXITED): "helper_exited",
     (DISCONNECTING, MSG_TEARDOWN_FINISHED): "teardown_finished",
     (DISCONNECTING, MSG_TEARDOWN_TIMEOUT): "teardown_timed_out",
@@ -344,7 +347,7 @@ def probe_tunnel(address, port, timeout):
         return True, f"{address} answered"
     except ConnectionRefusedError:
         return True, f"{address} refused the connection, which is still a reply"
-    except (TimeoutError, socket.timeout):
+    except TimeoutError:  # socket.timeout is this same class since 3.10
         return False, f"{address} did not answer in {timeout}s"
     except (OSError, ValueError) as exc:
         # No route, network down: the passive checks own that diagnosis and
@@ -449,8 +452,14 @@ def write_setting(name, value):
             break
     else:
         lines.append(rendered)
-    CONFIG_FILE.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    os.chmod(CONFIG_FILE, 0o600)
+    # Written beside and renamed over, never truncated in place: the applet
+    # re-reads this file on every health tick, and a read landing inside a
+    # truncate-then-write window would see an empty file and run one whole
+    # check on defaults. install.sh edits the same file the same way.
+    scratch = CONFIG_FILE.with_name(CONFIG_FILE.name + ".tmp")
+    scratch.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    os.chmod(scratch, 0o600)
+    os.replace(scratch, CONFIG_FILE)
     reload_settings()
 
 
@@ -587,7 +596,6 @@ class StateMachine:
     auth_generation = 0
     helper_spoke = False
     helper_proc: subprocess.Popen | None
-    probe_in_flight: bool
     teardown_intent: str | None
     reconnect_keep_log: bool
 
@@ -658,14 +666,14 @@ class StateMachine:
 
     # The user verbs are message injections, nothing more.
 
-    def connect(self, keep_log=False):
-        self.dispatch(MSG_CONNECT, keep_log=keep_log)
+    def connect(self):
+        self.dispatch(MSG_CONNECT)
 
     def disconnect(self):
         self.dispatch(MSG_DISCONNECT)
 
-    def reconnect(self, keep_log=False):
-        self.dispatch(MSG_RECONNECT, keep_log=keep_log)
+    def reconnect(self):
+        self.dispatch(MSG_RECONNECT)
 
     def cancel(self):
         self.dispatch(MSG_CANCEL)
@@ -814,9 +822,12 @@ class StateMachine:
     def _tr_remember_problem(self, data):
         self.last_failure = data["sentence"]
 
-    def _tr_teardown_warning(self, data):
-        # Anything suggesting the network did not come back.
-        self.notify("VPN teardown warning", data["sentence"],
+    def _tr_helper_warning(self, data):
+        # Anything the helper marked WARNING: most seriously that the network
+        # did not come back after teardown, but also degraded supervision —
+        # the event channel dying, a vpnc-script it could not chain to. The
+        # title says warning, not teardown, because not all of them are.
+        self.notify("VPN warning", data["sentence"],
                     icon="dialog-warning-symbolic")
 
     # -- rows: the watchdog's verdicts
@@ -927,7 +938,7 @@ class StateMachine:
             return
         self._set_state(FAILED, "helper did not exit — the tunnel may still be up")
         self.notify(
-            "VPN teardown warning",
+            "VPN warning",
             "The helper did not exit. Check 'asuvpn log'.",
             icon="dialog-warning-symbolic",
         )
@@ -1048,28 +1059,46 @@ class StateMachine:
     def _apply_state_event(self, payload):
         """Translate a script-contract event into a message; decide nothing.
 
-        The wire words are REASON_STATES' values. This used to act on state
-        directly, carrying its own private copy of the teardown guard — the
-        transition table owns every such decision now, so this watcher only
-        reports what it saw.
+        The wire words are the contract's STATE_* constants — they were bare
+        literals here once, restating what REASON_STATES already said. This
+        used to act on state directly, carrying its own private copy of the
+        teardown guard — the transition table owns every such decision now,
+        so this watcher only reports what it saw.
         """
         state, fields = parse_state_payload(payload)
-        if state not in ("connected", "connecting", "disconnected"):
+        if state not in (C.STATE_CONNECTED, C.STATE_CONNECTING,
+                         C.STATE_DISCONNECTED):
             return
         self.state_events = True  # the log-matching fallback is now redundant
-        if state == "connected":
+        if state == C.STATE_CONNECTED:
             self.dispatch(MSG_TUNNEL_UP,
                           device=fields.get("dev") or self.tunnel_device,
                           address=fields.get("addr", ""),
                           dns=fields.get("dns", ""))
-        elif state == "connecting":
+        elif state == C.STATE_CONNECTING:
             self.dispatch(MSG_LINK_LOST)
         # A "disconnected" event is deliberately not a message: the exit path
         # already distinguishes a requested teardown from a dropped tunnel.
 
+    def _clear_incident(self):
+        """A clean slate for the watchdog: no strikes, no demoter, no latch.
+
+        One place, because this five-field reset already exists in two
+        callers and a third divergent copy is how the tunnel-state reset
+        went wrong once (see _reset_tunnel_state).
+        """
+        self.strikes = {"device": 0, "probe": 0}
+        self.demoted_by = None
+        self.nudge_spent = False
+        self.failure_notified = False
+        self.routes_seen = {"routes4": False, "routes6": False}
+
     def _adopt_tunnel(self, device, address, dns=""):
         """Record what the watchdog should be watching, once it is up."""
-        self.tunnel_address = address
+        if address:
+            # An addr-less source (a fallback line like "CSTP connected"
+            # names no address) must not blank one a real event delivered.
+            self.tunnel_address = address
         # The probe target, taken from what this tunnel says to resolve
         # against. Nothing is hardcoded: a VPN that pushes no resolver simply
         # gets the device checks, which need no target at all.
@@ -1084,11 +1113,7 @@ class StateMachine:
             # Clearing it here let a reconnect that fixed nothing restart the
             # incident every two minutes: badge flap, repeated notifications,
             # and an escalation that could never be reached.
-            self.strikes = {"device": 0, "probe": 0}
-            self.demoted_by = None
-            self.nudge_spent = False
-            self.failure_notified = False
-            self.routes_seen = {"routes4": False, "routes6": False}
+            self._clear_incident()
         if not device or not C.INTERFACE_RE.match(device):
             return
         self.tunnel_device = device
@@ -1120,11 +1145,7 @@ class StateMachine:
         self.tunnel_address = ""
         self.tunnel_dns = ""
         self.tunnel_ever_connected = False
-        self.strikes = {"device": 0, "probe": 0}
-        self.demoted_by = None
-        self.nudge_spent = False
-        self.failure_notified = False
-        self.routes_seen = {"routes4": False, "routes6": False}
+        self._clear_incident()
 
 
 
@@ -1248,11 +1269,13 @@ class VpnTray(StateMachine):
         self.menu.append(log_item)
 
         # Named for what it does: puts the applet in the tray at login without
-        # firing off a Duo push before anyone has asked for one.
-        self.autostart_item = Gtk.CheckMenuItem(label="Start on login (applet only)")
-        self.autostart_item.set_active(AUTOSTART_FILE.exists())
-        self.autostart_item.connect("toggled", self._on_autostart_toggled)
-        self.menu.append(self.autostart_item)
+        # firing off a Duo push before anyone has asked for one. A local:
+        # unlike autoreconnect_item, nothing re-reads it after this menu is
+        # built — the toggled handler receives it as an argument.
+        autostart_item = Gtk.CheckMenuItem(label="Start on login (applet only)")
+        autostart_item.set_active(AUTOSTART_FILE.exists())
+        autostart_item.connect("toggled", self._on_autostart_toggled)
+        self.menu.append(autostart_item)
 
         # Off by default: reconnecting means a fresh sign-in, which means a Duo
         # push and a polkit prompt. That is a reasonable thing to ask for and a
@@ -1338,7 +1361,10 @@ class VpnTray(StateMachine):
                              os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
                 with os.fdopen(fd, "a") as fh:
                     fh.write(line + "\n")
-                self._log_bytes += len(line) + 1
+                # Bytes, not characters: the cap and the rotation threshold
+                # are file sizes, and this file is UTF-8 with multi-byte
+                # dashes in the applet's own wording.
+                self._log_bytes += len(line.encode("utf-8")) + 1
             except OSError:
                 pass
         # The window is GTK, so it may only be touched from the main loop.
@@ -1365,8 +1391,12 @@ class VpnTray(StateMachine):
                         older.replace(
                             LOG_FILE.with_name(f"{LOG_FILE.name}.{index + 1}"))
                 LOG_FILE.replace(LOG_FILE.with_name(f"{LOG_FILE.name}.1"))
-            LOG_FILE.write_text("")
-            os.chmod(LOG_FILE, 0o600)
+            # Born 0600 like every log file this applet creates: write_text
+            # would create it with umask permissions first and fix them a
+            # moment later, giving the one file two creation modes.
+            os.close(os.open(LOG_FILE,
+                             os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600))
+            os.chmod(LOG_FILE, 0o600)  # an inherited pre-0600 file, truncated
         except OSError:
             pass  # an unwritable cache dir costs the log, not the applet
         # Re-measured rather than assumed zero: a failed rotation leaves the
@@ -1836,6 +1866,9 @@ class VpnTray(StateMachine):
             return False  # this timer is replaced by the one just armed
         if SETTINGS["health-interval"] <= 0:
             return True  # watchdog off: keep reading the config, check nothing
+        # The same three states that have MSG_CHECK rows in TRANSITIONS. The
+        # table would drop a verdict sent from any other state anyway; this
+        # gate only spares the log an "ignoring" line every interval.
         if (self.state not in (CONNECTED, RECOVERING, DEMOTED)
                 or self.helper_proc is None):
             return True
@@ -1943,7 +1976,12 @@ class VpnTray(StateMachine):
                     if pattern.search(line):
                         self.dispatch(MSG_LINK_LOST)
                         return False
-            if self.state in (CONNECTING, RECOVERING):
+            # DEMOTED is included so a nudge-produced re-establish is adopted
+            # (new address, new ifindex, fresh route-family latch) in fallback
+            # mode too — the (DEMOTED, tunnel-up) row keeps the badge honest
+            # either way. CONNECTED is deliberately not: mid-session DTLS and
+            # rehandshake lines match these patterns on a healthy tunnel.
+            if self.state in (CONNECTING, RECOVERING, DEMOTED):
                 for pattern in CONNECTED_PATTERNS:
                     match = pattern.search(line)
                     if match:
@@ -1958,15 +1996,19 @@ class VpnTray(StateMachine):
             if pattern.search(line):
                 # "[vpn] " is how the helper stops openconnect's output forging
                 # helper messages; it is framing, not something to show anyone.
-                self.dispatch(MSG_PROBLEM, sentence=C.strip_relay(line).strip())
+                # Scrubbed here, where the sentence is built: it becomes the
+                # failure detail, which reaches a desktop notification and the
+                # terminal via `asuvpn status` — paths the log scrubber never
+                # sees, and this text is whatever the server chose to say.
+                sentence = ANSI_ESCAPE.sub("", C.strip_relay(line)).strip()
+                self.dispatch(MSG_PROBLEM, sentence=sentence)
                 self.log(f"[tray] openconnect reported a problem: {line}")
                 return False
         return False
 
     # ------------------------------------------------------------ teardown
 
-    def _close_helper_stdin(self, proc=None):
-        proc = proc if proc is not None else self.helper_proc
+    def _close_helper_stdin(self, proc):
         if proc is None:
             return
         # Two teardown paths can arrive together (Disconnect then Quit), and a
@@ -2233,7 +2275,8 @@ commands:
 
 exit codes:
   0  the request was carried out; for status and --wait, connected
-  1  status/--wait: not connected. disconnect: the tunnel did not close
+  1  status/--wait: not connected. disconnect: the tunnel did not close.
+     quit: still shutting down. log: no log yet
   2  a bad command line (argparse's own code)
   3  status, or a --wait the applet vanished under: it is not running
   4  a different server was asked for than the running applet is using

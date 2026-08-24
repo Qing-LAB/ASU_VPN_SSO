@@ -58,12 +58,16 @@ class Results:
     def __init__(self, quiet=False):
         self.quiet = quiet
         self.counts = {PASS: 0, FAIL: 0, WARN: 0}
-        self.tier = None
 
     def section(self, tier):
-        self.tier = tier
         if not self.quiet:
             print(f"\n{tier}")
+
+    def info(self, text):
+        """A fact for the reader. Not a check: it cannot fail, so it is not
+        counted — a pass that can never fail would only pad the total."""
+        if not self.quiet:
+            print(f"  [ info ] {text}")
 
     def record(self, outcome, name, detail=""):
         self.counts[outcome] += 1
@@ -141,7 +145,7 @@ def check_contract(C, r):
 
     values, problems = C.parse_settings(
         "server = x.edu\nprobe = off\ndpd = 0\nnope = 1\nprobe-every = -3\n"
-        "probe-port = 70000\n")
+        "probe-port = 70000\nteardown-timeout = 10\n")
     r.check("settings parse by type, and every default survives a bad file",
             values["server"] == "x.edu" and values["probe"] is False
             and values["dpd"] == 0
@@ -149,7 +153,15 @@ def check_contract(C, r):
             and values["probe-port"] == C.SETTINGS_BY_NAME["probe-port"].default,
             f"got {values!r}")
     r.check("unknown keys and out-of-range values are reported, not raised",
-            len(problems) == 3, f"got {problems!r}")
+            len(problems) == 4, f"got {problems!r}")
+    # The schema's own floor: a teardown wait shorter than the helper's
+    # 15+10+5 signal escalation reports every clean disconnect as a failure,
+    # so the setting's documentation forbids it and the parser enforces that.
+    r.check("a teardown-timeout below the signal escalation is refused",
+            values["teardown-timeout"]
+            == C.SETTINGS_BY_NAME["teardown-timeout"].default
+            and any("teardown-timeout" in p for p in problems),
+            f"got {values['teardown-timeout']!r}, problems={problems!r}")
     rendered, round_trip_problems = C.parse_settings(C.render_settings())
     r.check("the generated config file parses back to the defaults, cleanly",
             rendered == C.defaults() and not round_trip_problems,
@@ -230,6 +242,11 @@ def check_option_parsing(helper, r):
     r.check("--script=VALUE is recognised",
             helper.requested_script(argv) == "/a/b",
             f"got {helper.requested_script(argv)!r}")
+    dpd = helper.requested_dpd(["--force-dpd", "10", "--force-dpd=45"])
+    r.check("the last --force-dpd wins, like every other option reader",
+            dpd == "45",
+            f"got {dpd!r}; a reader with different semantics from its"
+            " siblings is a trap for whoever starts using the value")
     stripped = list(helper.strip_script_option(["-s", "/a/b", "--foo", "--script=/c"]))
     r.check("the caller's --script is removed before ours is added",
             stripped == ["--foo"], f"got {stripped}")
@@ -341,18 +358,30 @@ def check_tunnel_health(tray, r):
     r.check("routes are counted for a real device and not for a fake one",
             tray.route_count("lo") != (0, 0) and fake[0] == 0 and not fake[1],
             f"lo={tray.route_count('lo')} fake={fake}")
-    # The rule, held against whatever lo actually has right now: a family this
-    # tunnel was seen to have, wholly gone, is a verdict even while the other
-    # family survives. `ip route flush dev X` removes only IPv4, and a summed
-    # count sat green through exactly that break on a live tunnel.
-    v4, v6 = tray.route_count("lo")
+    # The rule, staged deterministically: a family this tunnel was seen to
+    # have, wholly gone, is a verdict even while the other family survives.
+    # `ip route flush dev X` removes only IPv4, and a summed count sat green
+    # through exactly that break on a live tunnel. Staged by standing in for
+    # route_count, because what lo happens to carry differs per host — an
+    # earlier version read the live counts and was vacuous wherever both
+    # families happened to be populated.
     seen_all = {"routes4": True, "routes6": True}
-    reason, facts = tray.tunnel_health("lo", lo_index, seen_all)
-    should_flag = v4 == 0 or v6 == 0
+    original_count = tray.route_count
+    try:
+        tray.route_count = lambda _dev: (0, 6)
+        gone4, _ = tray.tunnel_health("lo", lo_index, seen_all)
+        tray.route_count = lambda _dev: (3, 0)
+        gone6, _ = tray.tunnel_health("lo", lo_index, seen_all)
+        tray.route_count = lambda _dev: (3, 6)
+        healthy, _ = tray.tunnel_health("lo", lo_index, seen_all)
+    finally:
+        tray.route_count = original_count
     r.check("a route family the tunnel had, wholly gone, is a verdict",
-            (reason is not None) == should_flag,
-            f"lo has v4={v4} v6={v6}, seen={seen_all}, verdict {reason!r} —"
-            " the per-family rule and the counts disagree")
+            gone4 is not None and "IPv4" in gone4
+            and gone6 is not None and "IPv6" in gone6
+            and healthy is None,
+            f"v4-gone={gone4!r} v6-gone={gone6!r} both-present={healthy!r} —"
+            " the per-family rule does not hold")
 
 
 def check_notifications(tray, r):
@@ -425,6 +454,14 @@ def check_demotion_rules(tray, r):
                     if not callable(getattr(tray.VpnTray, "_tr_" + name, None))]
     r.check("every transition row names a real handler", not rows_missing,
             f"rows without handlers: {rows_missing}")
+    # And the reverse: a handler no row names is dead code the analysers
+    # cannot see, because rows reach handlers by computed name — deleting a
+    # row while its handler survives would otherwise pass everything.
+    named = set(tray.TRANSITIONS.values())
+    orphans = sorted(name for name in dir(tray.VpnTray)
+                     if name.startswith("_tr_") and name[4:] not in named)
+    r.check("no handler is orphaned by the table", not orphans,
+            f"handlers no row names: {orphans}")
 
     # The base class comes out of a path-loaded module, which the type
     # checker cannot see into — the same limitation as the loaders'
@@ -450,7 +487,6 @@ def check_demotion_rules(tray, r):
             self.last_autoreconnect = float("-inf")
             self.helper_generation = 0
             self.helper_proc = None
-            self.probe_in_flight = False
             self.teardown_intent = None
             self.reconnect_keep_log = False
             self.autoreconnect = False
@@ -596,6 +632,39 @@ def check_demotion_rules(tray, r):
             and connected.signins == [] and connected.state == tray.CONNECTED,
             f"demoted={demoted.signins} connected={connected.signins}"
             f" state={connected.state!r}")
+
+    # The log-matching fallback must feed the same table. A nudge-produced
+    # re-establish that arrives only as a log line (no event channel) still
+    # lands on the (DEMOTED, tunnel-up) row: adopt the tunnel, never promote
+    # the badge. The event path proved this above; this is the other source.
+    fallback = Stub()
+    fallback.state = tray.DEMOTED
+    fallback.tunnel_address = "10.0.0.1"
+    fallback.helper_generation = 1
+    tray.VpnTray._on_tunnel_output(fallback, "Configured as 10.0.0.7", 1)
+    r.check("a fallback tunnel-up mid-demotion adopts but does not promote",
+            fallback.state == tray.DEMOTED
+            and fallback.tunnel_address == "10.0.0.7",
+            f"state={fallback.state!r} addr={fallback.tunnel_address!r}")
+    # Some connected patterns carry no address ("CSTP connected"); adopting
+    # from one of those must not blank the address a real source delivered.
+    tray.VpnTray._on_tunnel_output(fallback, "CSTP connected. DPD 30", 1)
+    r.check("an addr-less fallback line does not blank a known address",
+            fallback.tunnel_address == "10.0.0.7",
+            f"addr={fallback.tunnel_address!r}")
+
+    # A failure sentence lifted from openconnect's output becomes the detail
+    # the user sees outside the log — in a notification and on the terminal
+    # via `asuvpn status` — so it is scrubbed where it is built. The log's
+    # own scrubber never sees those paths.
+    hostile = "[vpn] Failed to connect to host \x1b]0;evil\x07" + chr(0x9B) + "x"
+    tray.VpnTray._on_tunnel_output(fallback, hostile, 1)
+    kept = fallback.last_failure or ""
+    r.check("a failure sentence is scrubbed before it becomes the detail",
+            "Failed to connect" in kept
+            and not any(ord(ch) < 0x20 or 0x7f <= ord(ch) <= 0x9f
+                        for ch in kept),
+            f"last_failure={kept!r}")
 
 
 def check_log_rotation(tray, r):
@@ -771,13 +840,19 @@ def check_log_write_path(tray, r):
             return False
 
     original_log = tray.LOG_FILE
+    holder = Holder()
     with tempfile.TemporaryDirectory() as base:
         tray.LOG_FILE = type(original_log)(base) / "session.log"
         try:
             tray.VpnTray.log(
-                Holder(), "\x1b]0;evil\x07x " + chr(0x9B) + "gone \x1b[31mred")
+                holder, "\x1b]0;evil\x07x " + chr(0x9B) + "gone \x1b[31mred")
+            # A multi-byte line: the rotation threshold is a file size, so
+            # the meter must count bytes — counting characters undercounts
+            # every em-dash in the applet's own wording by two.
+            tray.VpnTray.log(holder, "and a dash — three bytes wide")
             text = tray.LOG_FILE.read_text()
             mode = os.stat(tray.LOG_FILE).st_mode & 0o777
+            size = os.stat(tray.LOG_FILE).st_size
         finally:
             tray.LOG_FILE = original_log
     problems = []
@@ -787,6 +862,9 @@ def check_log_write_path(tray, r):
         problems.append(f"the written line was not scrubbed: {text!r}")
     if mode != 0o600:
         problems.append(f"a file created by the logger is {oct(mode)}, not 0600")
+    if holder._log_bytes != size:
+        problems.append(f"the size meter says {holder._log_bytes}, the file"
+                        f" is {size} bytes — the rotation cap would misfire")
     r.check(name, not problems, "; ".join(problems))
 
 
@@ -971,7 +1049,14 @@ def check_standin_catalogue(binary, r):
     name = "the sandbox stand-in only speaks lines from the installed catalogue"
     fake = os.path.join(HERE, "tests", "sandbox", "bin", "openconnect")
     if not os.path.exists(fake):
-        r.ok(name, "no sandbox beside this copy; installed copies have none")
+        if os.path.isdir(os.path.join(HERE, "tests")):
+            # A checkout with tests/ but no stand-in at the expected path is
+            # a moved or renamed fake — the honesty check silently passing
+            # forever is exactly how a drifting stand-in gets loose.
+            r.warn(name, "tests/ exists but tests/sandbox/bin/openconnect"
+                   " does not; the honesty check has nothing to hold")
+        else:
+            r.ok(name, "no sandbox beside this copy; installed copies have none")
         return
     if not binary:
         r.warn(name, "openconnect itself is missing, so there is no catalogue"
@@ -1068,6 +1153,37 @@ def check_sso_environment(tray, sso, r):
         r.fail(name,
                "sign-in dies at import. The setuptools pin did not take:\n"
                "            pipx inject openconnect-sso 'setuptools<71' --force")
+
+
+def check_install_scripts(C, r):
+    """The shell installers' hand-copied server default, held to the schema.
+
+    bash cannot load this schema, so install.sh and bootstrap.sh each state
+    the default once, with a comment promising to stay in sync by hand. This
+    is that promise, enforced. Installed copies have no scripts beside them
+    and nothing to drift, so the check passes vacuously there; it bites in a
+    checkout, which is where the default would be edited.
+    """
+    name = "the shell installers' server default matches the schema"
+    default = C.SETTINGS_BY_NAME["server"].default
+    scripts = [os.path.join(HERE, s) for s in ("install.sh", "bootstrap.sh")]
+    present = [s for s in scripts if os.path.exists(s)]
+    if not present:
+        r.ok(name, "no installer scripts beside this copy; nothing to drift")
+        return
+    wrong = []
+    for script in present:
+        try:
+            with open(script, encoding="utf-8") as fh:
+                text = fh.read()
+        except OSError as exc:
+            r.warn(name, f"cannot read {script}: {exc}")
+            return
+        if f'SERVER="{default}"' not in text:
+            wrong.append(os.path.basename(script))
+    r.check(name, not wrong,
+            f"{', '.join(wrong)}: no SERVER=\"{default}\" line — the by-hand"
+            " sync with the schema's default has drifted")
 
 
 def check_no_bytecode(r):
@@ -1208,11 +1324,12 @@ def check_fatal_reporting(r):
         r.warn("a refused connect explains itself", f"{path} not executable")
         return
     cases = [
-        (["--", "--background"], "an option that would detach openconnect"),
-        (["--", "--interface", "../../etc/passwd"], "an impossible device name"),
+        (["--", "--background"], "an option that would detach openconnect", 25),
+        (["--", "--interface", "../../etc/passwd"],
+         "an impossible device name", 22),
     ]
     unmarked = []
-    for extra, label in cases:
+    for extra, label, expected_rc in cases:
         try:
             out = subprocess.run(
                 [path, "--host", "https://example.invalid",
@@ -1224,8 +1341,11 @@ def check_fatal_reporting(r):
             return
         marked = any(line.startswith("[helper] FATAL ")
                      for line in out.stdout.splitlines())
-        if not (marked and out.returncode in (22, 25)):
-            unmarked.append(f"{label}: rc={out.returncode} out={out.stdout!r}")
+        # Each refusal pinned to its own documented code: accepting either
+        # for either would let two exit paths swap meanings unnoticed.
+        if not (marked and out.returncode == expected_rc):
+            unmarked.append(f"{label}: rc={out.returncode}"
+                            f" (expected {expected_rc}) out={out.stdout!r}")
     r.check("a refused connect explains itself rather than exiting a number",
             not unmarked, "; ".join(unmarked))
 
@@ -1402,14 +1522,15 @@ def main():
 
     if "environment" in tiers:
         r.section("environment — our assumptions, put to the installed binaries")
-        r.ok(f"the contract is version {C.CONTRACT_VERSION}",
-             "every program loaded the same one, from beside itself")
+        r.info(f"the contract is version {C.CONTRACT_VERSION}; every program"
+               " loaded the one beside itself")
         binary = guarded(check_openconnect, helper, r)
         guarded(check_default_script, helper, C, binary, r)
         guarded(check_message_catalogue, tray, binary, r)
         guarded(check_standin_catalogue, binary, r)
         guarded(check_desktop_stack, tray, r)
         guarded(check_installed_permissions, C, r)
+        guarded(check_install_scripts, C, r)
         guarded(check_no_bytecode, r)
 
     if "wiring" in tiers:

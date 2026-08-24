@@ -35,10 +35,17 @@ which:
   can. (An earlier single-gid namespace made that scenario a silent no-op: its
   `chgrp` failed with the error discarded, and the helper ran against an
   unchanged file.)
+- the fake world gets its **own session bus** (`dbus-run-session`). The tmpfs
+  over `/run` hides the real one, and GTK's autolaunch fallback was both slow
+  and able to reach the real bus through the abstract socket namespace —
+  which is how scenario runs used to raise notifications on the actual
+  desktop. Now they land on a bus that dies with the namespace.
 
-The real filesystem is never modified and is byte-identical after every run;
-a namespace cannot leak the way a symlink arrangement can. When the namespace
-exits, the fake world is gone.
+The system paths the stand-ins cover are never modified — the bind mounts
+vanish with the namespace, which cannot leak the way a symlink arrangement
+can. This directory itself does accumulate staged runtime files between runs
+(`app/`, `rbin/`, `home/`, `tray.err`, `xauth` — all gitignored; `xauth` is a
+0600 copy of your X cookie, refreshed or removed on each `enter.sh` run).
 
 ## Keeping the stand-ins honest
 
@@ -77,30 +84,39 @@ tab-completing a scenario directly used to run the real tray against the real
 `pkexec`, `openconnect-sso` and `openconnect` — the exact accident the guard
 exists to prevent, now structural at both ends of the door.
 
+Every scenario **asserts its outcome and exits 1 when it is not met**. Six of
+them once only printed what happened; a print-only scenario proves nothing,
+and these six could not even prove the tray had started — their readiness
+loop tested `asuvpn status` for plain success, which the applet answers with
+exit 1 while up-but-disconnected, so the loop had silently never succeeded
+and the long sleeps after it hid that. The shared plumbing (the guard, the
+staged HOME, the proven tray start, the assertion helpers) lives in
+[`lib.sh`](lib.sh).
+
 | Scenario | What it proves | Display needed |
 | --- | --- | --- |
-| `sec.sh` | the permission refusals, on the real helper: world-writable, **group-shared (asserts)**, directory, symlink swap | no |
-| `sec2.sh` | staging positive-control: the `chgrp` to a second group really takes (**asserts**) | no |
-| `sec3.sh` | negative dpd refused with its documented exit code; 0 means "leave the server alone"; a world-writable contract refused at the loader | no |
-| `fdcheck.sh` | openconnect's stdin is not the helper's control pipe, so it cannot inject control verbs (**asserts**, and fails if it finds no subject to inspect) | no |
-| `lifecycle.sh` | connect → reconnect → probes → disconnect → quit, all through the tray | yes |
-| `discon.sh` | a demoted tunnel still disconnects cleanly (`FAKE_DEAF=1` ignores nudges) | yes |
-| `escalate.sh` | the watchdog's ladder: one nudge, then—with autoreconnect on—one full sign-in (**asserts: exactly one of each**) | yes |
-| `watchdog-test.sh` | a gone device: strikes → demotion → one nudge; the reconnect event adopts the tunnel but the badge stays demoted while the device never returns | yes |
-| `blackhole.sh` | device and routes healthy, probe target silent → demote, one nudge, and a badge that stays honest because only the probe can promote it | yes |
-| `contract-test.sh` | the config file drives the helper (`--force-dpd`) and the watchdog cadence end to end | yes |
+| `sec.sh` | the permission refusals, on the real helper: world-writable, group-shared, directory, symlink swap — each refused before anything executed, and the normal contrast case NOT refused | no |
+| `sec2.sh` | staging positive-control: the `chgrp` to a second group really takes | no |
+| `sec3.sh` | negative dpd refused with its documented exit 27; 0 means "leave the server alone"; a normal value reaches openconnect's command line | no |
+| `fdcheck.sh` | openconnect's stdin is not the helper's control pipe, so it cannot inject control verbs (fails if it finds no subject to inspect) | no |
+| `lifecycle.sh` | connect → reconnect → probes → disconnect → quit, the state asserted at each step, and a healthy tunnel never demoted | yes |
+| `discon.sh` | a demoted tunnel still disconnects cleanly: exit 0 and a Disconnected badge (`FAKE_DEAF=1` ignores nudges) | yes |
+| `escalate.sh` | the watchdog's ladder: exactly one nudge, then — with autoreconnect on — exactly one full sign-in | yes |
+| `watchdog-test.sh` | a gone device: strikes → demotion → exactly one nudge; the reconnect event adopts the tunnel but the badge stays demoted | yes |
+| `blackhole.sh` | device and routes healthy, probe target silent → demoted with the probe named in the verdict, one nudge, and a badge that stays demoted because only the probe can promote it | yes |
+| `contract-test.sh` | the config file drives the helper (`--force-dpd 45` on the real command line) and the CLI autoreconnect toggle lands back in the file | yes |
 
 "Display needed" scenarios start the real tray, which needs GTK and an X
 display (`:0` is assumed; on Wayland that is XWayland). `enter.sh` copies the
 session's X cookie to `xauth` when `XAUTHORITY` is set. The scenarios that
 drive the helper directly run anywhere, headless included.
 
-Scenarios print what happened for a reader, and the load-bearing outcomes
-**assert** — `sec.sh` (b)/(b2), `sec2.sh`'s staging control, `fdcheck.sh`'s
-distinct-stdin verdict, and `escalate.sh`'s one-nudge-one-sign-in count all
-exit 1 on the wrong outcome. The `sec.sh` assertions are mutation-verified:
+Scenarios still print what happened for a reader; the assertions are what
+make a run mean something. The `sec.sh` assertions are mutation-verified:
 neutering the contract's group predicate makes (b2) fail, and neutering the
-loader's inline check as well makes (b) fail.
+loader's inline check as well makes (b) fail. The `lib.sh` helpers'
+failure paths are exercised too — a `must_contain` miss and an
+`await_status` timeout both exit 1, checked against a stub.
 
 ## What a pass here does and does not claim
 

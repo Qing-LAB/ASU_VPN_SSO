@@ -10,9 +10,18 @@
 > at the top of the file, eight states with RECOVERING and DEMOTED promoted
 > out of their hiding flag, and unlisted (state, message) pairs dropped with a
 > log line. Making DEMOTED a real state exposed and fixed a dead spot: the
-> menu's own Reconnect on a demoted tunnel had been silently refused. The
-> as-built table lives in DESIGN.md's state-machine section; this file remains
-> as the plan of record and the rationale.
+> menu's own Reconnect on a demoted tunnel had been silently refused.
+>
+> **Read the rest as the proposal it was, not as the as-built record.** The
+> built machine differs in detail: the message names are `MSG_*` (not
+> `EVT_*`/`CMD_*`), the row set is not the table in §3.3 (the real one adds
+> rows — teardown-finished, teardown-timeout, device/fatal/warning any-state
+> rows — and settles §3.3's ambiguities), the migration ran as one reviewed
+> cut-over rather than §5's shadow-mode steps, and the table-driven checks
+> joined the existing `logic` tier instead of becoming §6's fourth tier. The
+> as-built table is `TRANSITIONS` in `asuvpn-tray`, documented in DESIGN.md's
+> state-machine section; this file remains as the rationale and the record of
+> the decisions.
 
 Requested by the user on 2026-08-23, during the full review: *define a real
 state machine, write it down with clear transitions and conditions, double-check
@@ -237,6 +246,6 @@ Rollback at every step is `git revert` of one commit.
 4. **Shadow-mode duration** — how long step 2 runs against your real sessions
    before cutting over: one day of normal use is the proposal.
 5. **When** — this plan can start as the next work item, or wait until after
-   the routes-lost live re-verification (HANDOVER item 2). They are
-   independent; doing the live check first pins today's behavior tighter
+   the routes-lost live re-verification (HANDOVER's live-verify item). They
+   are independent; doing the live check first pins today's behavior tighter
    before the migration reproduces it. *Recommendation: live check first.*

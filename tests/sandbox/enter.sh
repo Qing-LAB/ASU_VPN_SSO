@@ -87,9 +87,23 @@ for b in openconnect openconnect-sso pkexec; do
 done
 [ "$fail" -eq 0 ] || { echo "ABORTING: isolation incomplete" >&2; exit 90; }
 echo "guard: every binary a scenario could reach is a stand-in" >&2
+# A private session bus for the fake world. The tmpfs over /run hides the
+# user's real bus, leaving GTK's autolaunch fallback — a detour that is at
+# best slow and at worst reached the real session bus through the abstract
+# namespace, which is how scenario runs used to raise notifications on the
+# real desktop. A throwaway bus makes startup deterministic and keeps the
+# fake world's notifications inside it. The system binary by absolute path:
+# a conda install shadows it on PATH with one that may pull the wrong
+# dbus-daemon.
+runner=()
+if [ -x /usr/bin/dbus-run-session ]; then
+    runner=(/usr/bin/dbus-run-session --)
+elif command -v dbus-run-session >/dev/null 2>&1; then
+    runner=("$(command -v dbus-run-session)" --)
+fi
 # The heredoc that carried this script consumed fd 0 and is at EOF; hand the
 # caller's real stdin (saved as fd 3 outside) to the command. Without this,
 # `enter.sh /bin/bash` printed the guard line and exited instantly — dropping
 # the user back into their REAL shell right after saying all is a stand-in.
-exec "$@" 0<&3 3<&-
+exec "${runner[@]}" "$@" 0<&3 3<&-
 INNER

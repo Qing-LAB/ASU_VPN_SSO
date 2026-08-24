@@ -71,7 +71,8 @@ MESSAGE_PREFIX = "[helper]"
 RELAY_PREFIX = "[vpn]"
 
 KIND_NOTE = "NOTE"        # informational; logged as-is, raises no notification
-KIND_WARNING = "WARNING"  # the network may not have been restored
+KIND_WARNING = "WARNING"  # needs attention: most seriously, the network may
+                          # not have been restored; also degraded supervision
 KIND_FATAL = "FATAL"      # refused before openconnect ever started
 KIND_STATE = "STATE"      # a transition from openconnect's script contract
 KIND_DEVICE = "DEVICE"    # the tunnel device this session will create
@@ -124,10 +125,10 @@ def strip_relay(line):
 # line. Anything unrecognised is ignored rather than guessed at. A "disconnect"
 # verb was defined here once, accepted by the helper and sent by nothing —
 # closing the pipe *is* the disconnect — and a verb with no sender is drift
-# waiting to happen, so it is gone.
+# waiting to happen, so it is gone. (A CONTROL_STOP set outlived it for a
+# while; with one member it said nothing CONTROL_QUIT does not.)
 CONTROL_QUIT = "quit"
 CONTROL_RECONNECT = "reconnect"
-CONTROL_STOP = (CONTROL_QUIT,)
 CONTROL_VERBS = (CONTROL_QUIT, CONTROL_RECONNECT)
 
 
@@ -197,11 +198,19 @@ def decode_event(data):
 # environment. These five values are inherited from vpnc, documented, and
 # unchanged across the v7-to-v8 rename that silently broke log matching.
 # pre-init is absent on purpose: nothing is configured yet.
+#
+# The wire words a STATE line may carry. Named here because both ends need
+# them: the helper writes them, the tray decides what each means in its
+# current state. They were bare literals at both ends once, which is the
+# restated-fact drift this file exists to remove.
+STATE_CONNECTED = "connected"
+STATE_CONNECTING = "connecting"
+STATE_DISCONNECTED = "disconnected"
 REASON_STATES = {
-    "connect": "connected",
-    "reconnect": "connected",
-    "attempt-reconnect": "connecting",
-    "disconnect": "disconnected",
+    "connect": STATE_CONNECTED,
+    "reconnect": STATE_CONNECTED,
+    "attempt-reconnect": STATE_CONNECTING,
+    "disconnect": STATE_DISCONNECTED,
 }
 
 # IFNAMSIZ is 16 including the NUL. Anything outside this cannot name a device,
@@ -235,15 +244,23 @@ def one_line(value):
 
 
 class Setting:
-    """One knob: how it is spelled, what it means, and what it is when unset."""
+    """One knob: how it is spelled, what it means, and what it is when unset.
 
-    __slots__ = ("default", "kind", "maximum", "name", "summary")
+    `minimum` and `maximum` refuse values the setting's own documentation
+    rules out — a teardown wait shorter than the signal escalation it must
+    outlast, a log-keep so large that rotation would stall the applet. A
+    refused value costs that line its default and earns a [config] sentence,
+    like any other unparseable line.
+    """
 
-    def __init__(self, name, kind, default, summary, maximum=None):
+    __slots__ = ("default", "kind", "maximum", "minimum", "name", "summary")
+
+    def __init__(self, name, kind, default, summary, minimum=None, maximum=None):
         self.name = name
         self.kind = kind
         self.default = default
         self.summary = summary
+        self.minimum = minimum
         self.maximum = maximum
 
     def parse(self, text):
@@ -259,6 +276,8 @@ class Setting:
             value = int(text.strip())
             if value < 0:
                 raise ValueError("cannot be negative")
+            if self.minimum is not None and value < self.minimum:
+                raise ValueError(f"must be at least {self.minimum}")
             if self.maximum is not None and value > self.maximum:
                 raise ValueError(f"cannot exceed {self.maximum}")
             return value
@@ -283,7 +302,8 @@ SETTINGS = (
             " 0 leaves the server's choice alone."),
     Setting("health-interval", "int", 20,
             "Seconds between checks of the tunnel device and its routes."
-            " 0 turns the watchdog off entirely."),
+            " 0 turns the watchdog off; this file is still re-read at the"
+            " default cadence, so turning it back on needs no restart."),
     Setting("health-strikes", "int", 2,
             "Consecutive bad checks before the badge stops claiming Connected."
             " Two, because routes are briefly absent during a real reconnect."
@@ -305,7 +325,10 @@ SETTINGS = (
             " probing on every check."),
     Setting("probe-timeout", "int", 5,
             "Seconds to wait for an answer. A healthy tunnel replies in"
-            " milliseconds, so this is generous by two orders of magnitude."),
+            " milliseconds, so this is generous by two orders of magnitude."
+            " Capped at 120: only one probe runs at a time, so an answer that"
+            " never comes would otherwise block probing for as long as this.",
+            maximum=120),
     Setting("nudge-min-gap", "int", 120,
             "Seconds between asking openconnect to re-establish. Free, but not"
             " something to do every time a check fails."),
@@ -313,14 +336,19 @@ SETTINGS = (
             "Seconds between automatic sign-ins, when autoreconnect is on."),
     Setting("teardown-timeout", "int", 75,
             "Seconds to wait for the helper to finish. Must outlast its own"
-            " signal escalation of 15 + 10 + 5 plus the routing check after."),
+            " signal escalation of 15 + 10 + 5 plus the routing check after,"
+            " so values below 35 are refused: a shorter wait reports every"
+            " clean disconnect as a failure while the helper is still fine.",
+            minimum=35),
     Setting("log-max-kb", "int", 4096,
             "Size the session log may reach before it is rotated, in KiB."
             " 0 means never rotate on size."),
     Setting("log-keep", "int", 3,
             "Rotated logs kept beside the current one; session.log.1 is the"
             " newest. Connecting rotates too, so this is also how many past"
-            " sessions survive. 0 keeps none, and rotation just truncates."),
+            " sessions survive. 0 keeps none, and rotation just truncates."
+            " Capped at 99: every rotation walks the whole numbered chain.",
+            maximum=99),
 )
 SETTINGS_BY_NAME = {s.name: s for s in SETTINGS}
 CONFIG_BASENAME = "asuvpn.conf"

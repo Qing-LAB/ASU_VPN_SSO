@@ -123,7 +123,7 @@ Four programs, two privilege levels.
 `openconnect-sso` and the Qt browser it opens run **as you**. The only thing
 that crosses the privilege boundary is the session cookie, on stdin.
 
-Five channels connect the pieces; everything else in this document rides on
+The channels connecting the pieces; everything else in this document rides on
 one of them:
 
 ```mermaid
@@ -163,7 +163,7 @@ sequenceDiagram
     Tray->>Helper: cookie on stdin, pipe held open
     Helper->>OC: --cookie-on-stdin --script asuvpn-notify
     OC->>Notify: reason=connect, TUNDEV, INTERNAL_IP4_ADDRESS
-    Notify->>Helper: datagram with token, reason, dev, addr
+    Notify->>Helper: datagram with token, reason, dev, addr, dns
     Notify->>Notify: exec the real vpnc-script for routes and DNS
     Helper-->>Tray: STATE connected dev=asuvpn0 addr=10.x.x.x
     Tray-->>You: Connected, 10.x.x.x
@@ -193,10 +193,11 @@ verdicts once got to act. Every transition happens on the GLib main loop.
 ```mermaid
 stateDiagram-v2
     [*] --> disconnected
-    disconnected --> authenticating: connect
-    failed --> authenticating: connect
+    disconnected --> authenticating: connect, reconnect
+    failed --> authenticating: connect, reconnect
     authenticating --> connecting: sign-in ok, cookie to the helper
     authenticating --> failed: no saved password, keyring locked, sign-in failed
+    authenticating --> disconnected: cancel (no tunnel yet)
     connecting --> connected: tunnel-up (reason=connect)
     connected --> recovering: link-lost (reason=attempt-reconnect)
     recovering --> connected: tunnel-up (reason=reconnect)
@@ -205,15 +206,24 @@ stateDiagram-v2
     demoted --> connected: the demoting source passes again
     connected --> disconnecting: disconnect, reconnect, quit
     recovering --> disconnecting: disconnect, cancel, quit
-    demoted --> disconnecting: disconnect, reconnect, connect, quit
-    authenticating --> disconnecting: cancel while a helper is alive
-    connecting --> disconnecting: cancel
+    demoted --> disconnecting: disconnect, reconnect, connect, quit, watchdog sign-in
+    connecting --> disconnecting: cancel, disconnect
     disconnecting --> disconnected: helper exited
     disconnecting --> authenticating: helper exited, intent reconnect
     disconnecting --> failed: helper did not exit in time
     connecting --> failed: openconnect exited
     connected --> failed: tunnel dropped
+    recovering --> failed: helper died mid-retry
+    demoted --> failed: helper died while demoted
 ```
+
+Three any-state rows are not drawn, to keep the diagram readable: `quit`
+works from every state (with a live tunnel it goes through `disconnecting`;
+without one the applet just exits), the helper's exit is weighed wherever it
+lands (a stale generation is only logged), and the helper's informational
+messages (device name, fatal or warning sentences) are remembered in any
+state. A `cancel` during `authenticating` normally ends in `disconnected` —
+the sign-in has no tunnel to tear down.
 
 `RECOVERING` (openconnect re-establishing its own session) and `DEMOTED`
 (established but not carrying traffic — the watchdog's verdict) used to hide
@@ -249,12 +259,12 @@ phrased as an action being taken on their behalf.
 
 Two rules the table now makes structural rather than careful:
 
-- **Nothing leaves `disconnecting` except the helper's exit.** The state has
-  rows only for `helper-exited`, `teardown-finished`, `teardown-timeout` and
-  `quit`; a late event or verdict finds no row and is dropped with a log
-  line. (A late `reconnect` event once flipped the badge back to `connected`
-  mid-teardown, and a probe strike once handed a user's Disconnect to the
-  escalation ladder.)
+- **Nothing leaves `disconnecting` except its own teardown's outcome.** The
+  state has rows only for `helper-exited`, `teardown-finished`,
+  `teardown-timeout` and `quit`; a late event or verdict finds no row and is
+  dropped with a log line. (A late `reconnect` event once flipped the badge
+  back to `connected` mid-teardown, and a probe strike once handed a user's
+  Disconnect to the escalation ladder.)
 - **`reconnect` stays busy the whole way through.** The teardown carries
   `intent = reconnect`, so the badge goes `disconnecting → authenticating`
   with no momentary gap for `asuvpn reconnect --wait` to mistake for
@@ -280,6 +290,13 @@ environment. The mapping the helper applies:
 | `attempt-reconnect` | `recovering` | **Connecting… — link lost, retrying** |
 | `reconnect` | `connected` | **Connected — 10.x.x.x** (address may have changed) |
 | `disconnect` | *(deferred)* | left to the exit path, which knows whether you asked for it |
+
+The wire itself carries only the contract's three words — `connected`,
+`connecting`, `disconnected` (`STATE_*` in the contract). Which of the eight
+machine states results depends on the state the word arrives in — that is
+the transition table's job, and this table shows the healthy path: the same
+`connected` word that promotes a `recovering` tunnel only *adopts* on a
+`demoted` one.
 
 ### Why the contract and not the log
 
@@ -531,8 +548,14 @@ stateDiagram-v2
     Demoted --> Healthy: the demoting source passes
     Nudged --> Healthy: the demoting source passes
     Nudged --> SignIn: still demoted, autoreconnect on, its gap elapsed
-    SignIn --> Healthy: fresh session up and the source passes
+    SignIn --> Healthy: fresh session up (a new tunnel starts with a clean slate)
 ```
+
+These are positions within one incident, not machine states: `Demoted` and
+`Nudged` are both the machine's `DEMOTED` (the nudge is bookkeeping inside
+it), and `SignIn` runs `disconnecting → authenticating → connecting` like
+any other reconnect — the fresh tunnel's `tunnel-up` promotes it, because a
+new tunnel begins with no incident to clear.
 
 A nudge merely *held* by its gap keeps the incident in Demoted — the ladder
 waits it out rather than escalating past it, because jumping to a sign-in
@@ -584,7 +607,7 @@ running applet picks up the change without any message passing, and the menu
 checkbox follows the file rather than its own memory. (An earlier mechanism
 used the presence of a marker file; `install.sh` still deletes the leftover.)
 
-### Two orderings that are load-bearing
+## Two orderings that are load-bearing
 
 **The exit message is posted before the event that releases teardown.** In
 `_tunnel_thread`'s `finally`, `post(helper-exited)` comes before
@@ -598,11 +621,13 @@ row captures `was_connected` before `_reset_tunnel_state()`, because a
 DEMOTED tunnel is no longer in `CONNECTED` but certainly was one, and
 "connection dropped" explains its death better than an exit status does.
 
-There is exactly one `_reset_tunnel_state()`, called from `__init__`, the
-tunnel starter and the `helper-exited` row. It was open-coded in three places and had
-already diverged: the copy in `_start_tunnel` omitted `tunnel_dns`, so a new
-tunnel kept probing the *previous* one's resolver — an address with no reason to
-be reachable through it.
+There is exactly one `_reset_tunnel_state()`, with four callers: `__init__`,
+the tunnel starter, the `helper-exited` row, and the dead-helper branch of
+the reconnect row. It was open-coded in three places and had already
+diverged: the copy in `_start_tunnel` omitted `tunnel_dns`, so a new tunnel
+kept probing the *previous* one's resolver — an address with no reason to be
+reachable through it. The incident half of it (`_clear_incident`) is shared
+with mid-session adoption for the same reason.
 
 ## Teardown
 
@@ -619,7 +644,9 @@ The escalation ladder, deliberately generous:
 | `SIGKILL` | 5 s | **no** |
 
 `teardown-timeout` defaults to 75 s so the tray outlasts the whole ladder plus
-draining output and checking the routing table.
+draining output and checking the routing table; the schema refuses values
+below 35, because a wait shorter than the ladder reports every clean
+disconnect as a failure while the helper is still fine.
 
 Three independent guards, each covering a different death:
 
@@ -644,7 +671,7 @@ Only *our* device is ever deleted, identified by the ifindex captured when
 | Code | Meaning |
 | --- | --- |
 | `0` | the request was carried out; for `status` and `--wait`, connected |
-| `1` | `status`/`--wait`: not connected. `disconnect`: the tunnel did not close. `log`: no log yet |
+| `1` | `status`/`--wait`: not connected. `disconnect`: the tunnel did not close. `quit`: still shutting down. `log`: no log yet |
 | `2` | bad command line (argparse's own code) |
 | `3` | `status` — or a `--wait` the applet vanished under: it is not running |
 | `4` | a different server was asked for than the running applet is using |
@@ -699,7 +726,7 @@ where it can be, checked by `asuvpn selftest`.
 
 ## How this is tested
 
-Three tiers in `asuvpn-selftest` (84 checks), plus the scenario sandbox in
+Three tiers in `asuvpn-selftest` (90 checks), plus the scenario sandbox in
 [tests/sandbox](tests/sandbox/README.md).
 
 The shaping constraint: **conventional unit tests would not have caught any of
@@ -731,6 +758,14 @@ from the installed binary's catalogue, and it invokes `--script` the way the
 real one does, so the contract is exercised rather than mocked around.
 `asuvpn selftest` enforces the wording rule mechanically.
 
+Every scenario asserts its outcome and exits 1 when it is not met — a
+scenario that only prints proves nothing, and six of them once did exactly
+that: their tray-readiness loop had never succeeded even once (`asuvpn
+status` exits 1 while up-but-disconnected, and the loop tested for 0), and
+the long sleeps that followed hid it. The readiness probe now treats any
+answer but "not running" as up, and failing to come up at all fails the
+scenario loudly, with the tray's stderr attached.
+
 ### Mutation testing
 
 A suite that only ever passes proves nothing, so the checks are verified by
@@ -755,7 +790,7 @@ breaking the code on purpose:
 | let the reconnect event promote a demoted badge | a reconnect event mid-demotion adopts the tunnel but not the badge |
 | let a mid-demotion adoption reset the incident flags | an incident takes one nudge, then says the free option is spent |
 | allow re-nudging within one incident | the same check — after winding the clock past the rate limit, so the flag and not the timestamp is what refuses |
-| remove the demoted-tunnel delegation from `connect` | connect on a demoted tunnel means reconnect, and only there |
+| empty the demoted-connect handler so the verb is refused again | connect on a demoted tunnel means reconnect, and only there |
 | reword the declined-action log line | a cycle that declines to act logs its decision and its reason |
 | drop the rotation shift so `.1` is clobbered | the log rotates, keeps log-keep files, and starts fresh |
 | neuter the contract's shared-group predicate | `sec.sh` (b2): the helper no longer exits 26 |
@@ -775,6 +810,14 @@ breaking the code on purpose:
 | delete the demoted-connect row from the table | connect on a demoted tunnel means reconnect, and only there |
 | delete or repoint the mid-demotion event row | a reconnect event mid-demotion adopts the tunnel but not the badge |
 | point a table row at a handler that does not exist | every transition row names a real handler |
+| delete a row while its handler survives | no handler is orphaned by the table |
+| drop the teardown-timeout floor from the schema | a teardown-timeout below the signal escalation is refused |
+| stop scrubbing the captured failure sentence | a failure sentence is scrubbed before it becomes the detail |
+| drop DEMOTED from the fallback scan gate | a fallback tunnel-up mid-demotion adopts but does not promote |
+| let an addr-less line blank a known address | an addr-less fallback line does not blank a known address |
+| drift the installers' hand-copied server default | the shell installers' server default matches the schema |
+| count the log's size meter in characters again | the log-write-path check, its size-meter half |
+| return the first `--force-dpd` instead of the last | the last `--force-dpd` wins, like every other option reader |
 
 The fallback-patterns row is the one that matters most: it is the check that
 would have caught the original `Connected as` failure, and the stand-in row
@@ -803,11 +846,13 @@ twice, and no longer tries.)
 **Adding a state or a transition.** States are the constants above `ICONS`;
 every message is an `MSG_*` constant; every behavior is a row in
 `TRANSITIONS` plus a `_tr_*` handler on `StateMachine`. A row without a
-handler fails the selftest's table check; a message arriving in a state with
-no row is dropped and logged, never guessed at. If the handler needs a new
-side effect from the host, add a raising stub to `StateMachine`'s declared
-surface and the real method to `VpnTray` — an incomplete host fails at the
-first call, not silently.
+handler fails the selftest's table check, and so does a handler no row
+names — deleting a row cannot silently strand its code, because rows reach
+handlers by computed name and no analyser sees that. A message arriving in a
+state with no row is dropped and logged, never guessed at. If the handler
+needs a new side effect from the host, add a raising stub to `StateMachine`'s
+declared surface and the real method to `VpnTray` — an incomplete host fails
+at the first call, not silently.
 
 **Adding or updating a log pattern.** They live in `CONNECTED_MESSAGES`,
 `RECONNECTING_MESSAGES` and `FAILURE_MESSAGES` in `asuvpn-tray`, as
@@ -817,9 +862,12 @@ first call, not silently.
 `False` for a pattern kept only for older releases.
 
 **Adding a `reason`.** `REASON_STATES` in `asuvpn_contract.py` maps it to a
-state; the tray accepts `connected`, `connecting` and `disconnected` only. The
-self-test asserts the map matches the documented contract, so it will fail until
-you update it there too — deliberately.
+wire word — the contract's `STATE_*` constants, of which there are exactly
+three: `connected`, `connecting`, `disconnected`. The tray turns those into
+its eight machine states by context, so a new reason usually means a new
+mapping, not a new word. The self-test asserts the map matches the
+documented contract, so it will fail until you update it there too —
+deliberately.
 
 **Adding a CLI command.** Add it to `COMMANDS` and `COMMAND_HELP` in
 `asuvpn-tray`, and handle it in `main()`. If it should drive a *running* applet,

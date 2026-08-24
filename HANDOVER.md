@@ -20,7 +20,7 @@ Everything is committed and pushed to `main` at
 | Programs | `asuvpn-tray` (you), `asuvpn-helper` (root, via pkexec), `asuvpn-notify` (root, run by openconnect), `asuvpn-selftest` (you) |
 | Shared | `asuvpn_contract.py` — loaded by explicit path, never imported |
 | Settings | `~/.config/asuvpn/asuvpn.conf`, generated from the contract's schema |
-| Checks | `asuvpn selftest` — 84, in three tiers; scenario suite in [tests/sandbox](tests/sandbox/README.md) |
+| Checks | `asuvpn selftest` — 90, in three tiers; scenario suite in [tests/sandbox](tests/sandbox/README.md), every scenario asserting its outcome |
 | Analysers | ruff, pyflakes, pylint, mypy, bandit, vulture, shellcheck — all clean |
 | Tested against | openconnect v9.12-3.3, Ubuntu, GNOME, ASU's `sslvpn.asu.edu` |
 
@@ -230,6 +230,12 @@ others use `abspath`, and the reference copy in the contract says which.
   nothing beside the helper").
 - **The running applet holds its code in memory.** After `install.sh`, a plain
   `asuvpn reconnect` still runs the old tray. `asuvpn quit` then connect.
+- **`asuvpn status` exits 1 while up-but-disconnected.** A liveness probe
+  that tests for plain success never sees a freshly started applet as up;
+  only exit 3 means "not running". The sandbox scenarios' readiness loop made
+  exactly this mistake and silently never succeeded for as long as it
+  existed — the long sleeps after it hid that until the scenarios learned to
+  assert.
 
 ---
 
@@ -254,11 +260,11 @@ others use `abspath`, and the reference copy in the contract says which.
    fresh applet, flush the routes again and expect two strikes → demotion →
    one nudge → the badge *staying* demoted with one warning notification —
    and with `autoreconnect on`, a sign-in within `autoreconnect-min-gap`.
-3. **Try `autoreconnect = on`** for a while, if the user wants unattended
+2. **Try `autoreconnect = on`** for a while, if the user wants unattended
    recovery, and see whether the 300 s floor is right.
-4. **Consider whether `probe-every = 3` is the right frequency** now that a real
+3. **Consider whether `probe-every = 3` is the right frequency** now that a real
    probe costs ~17 ms and one TCP handshake a minute.
-5. Leave the polkit prompt alone unless the user reopens it.
+4. Leave the polkit prompt alone unless the user reopens it.
 
 ---
 

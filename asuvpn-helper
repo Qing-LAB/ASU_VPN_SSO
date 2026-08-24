@@ -266,7 +266,7 @@ def serve_events(server, token, ifname, owned):
         if device and not C.INTERFACE_RE.match(device):
             log(f"ignoring an event for an impossible device name: {device!r}")
             device = ""
-        if state == "connected":
+        if state == C.STATE_CONNECTED:
             # The authoritative moment to claim the device: openconnect has just
             # created it, so this ifindex is provably ours.
             index = interface_index(device or ifname)
@@ -383,13 +383,19 @@ def requested_interface(extra):
 
 
 def requested_dpd(extra):
-    """Whether the caller set their own DPD interval, so ours is not imposed."""
+    """Whether the caller set their own DPD interval, so ours is not imposed.
+
+    Last occurrence, like the other option readers: getopt gives openconnect
+    the last one, and a reader with different semantics from its siblings is a
+    trap for whoever starts using the value instead of its presence.
+    """
+    chosen = None
     for index, arg in enumerate(extra):
         if arg == "--force-dpd" and index + 1 < len(extra):
-            return extra[index + 1]
-        if arg.startswith("--force-dpd="):
-            return arg.split("=", 1)[1]
-    return None
+            chosen = extra[index + 1]
+        elif arg.startswith("--force-dpd="):
+            chosen = arg.split("=", 1)[1]
+    return chosen
 
 
 def requested_script(extra):
@@ -562,16 +568,15 @@ class Tunnel:
     def __init__(self, proc):
         self.proc = proc
         self.killed = False
-        self.returncode = None
         self.exited = threading.Event()
         self._lock = threading.Lock()
         self._closing = False
 
     def reap(self):
         """The single owner of Popen.wait()."""
-        self.returncode = self.proc.wait()
+        returncode = self.proc.wait()
         self.exited.set()
-        return self.returncode
+        return returncode
 
     def nudge(self):
         """Ask openconnect to re-establish, keeping the session.
@@ -639,7 +644,7 @@ def watch_control_channel(tunnel):
     try:
         for line in sys.stdin:
             verb = C.decode_control(line)
-            if verb in C.CONTROL_STOP:
+            if verb == C.CONTROL_QUIT:
                 log("disconnect requested")
                 return
             if verb == C.CONTROL_RECONNECT:

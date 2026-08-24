@@ -1,15 +1,20 @@
 #!/bin/bash
-SB="$(cd "$(dirname "$0")" && pwd)"
-grep -qa SANDBOX-MARKER /usr/bin/pkexec 2>/dev/null || { echo "not inside the sandbox; run: tests/sandbox/enter.sh ${0##*/}" >&2; exit 90; }
-rm -rf "${SB:?}/home"; mkdir -p "$SB/home/.cache" "$SB/home/.config/asuvpn"
-export HOME="$SB/home" XDG_CACHE_HOME="$SB/home/.cache" XDG_CONFIG_HOME="$SB/home/.config"
-export XDG_RUNTIME_DIR=/run/user/1000 GDK_BACKEND=x11 DISPLAY=:0 XAUTHORITY="$SB/xauth"
-unset WAYLAND_DISPLAY; chmod 700 /run/user/1000 2>/dev/null; export FAKE_DEAF=1
-A="$SB/app/asuvpn-tray"
-"$A" --foreground tray >"$SB/tray.err" 2>&1 & T=$!
-for _ in $(seq 80); do "$A" status >/dev/null 2>&1 && break; sleep 0.1; done
-"$A" connect >/dev/null 2>&1; sleep 45
-echo "  demoted:      $("$A" status)"
-"$A" disconnect >/dev/null 2>&1
-echo "  after disconn: $("$A" status)  exit=$?"
-"$A" quit >/dev/null 2>&1; wait $T 2>/dev/null; exit 0
+# A demoted tunnel is still an established one. FAKE_DEAF makes the nudge do
+# nothing and the fake names a device that does not exist, so the watchdog
+# demotes — and then Disconnect must still tear it down cleanly: exit 0 from
+# the CLI, Disconnected on the badge.
+SB="$(cd "$(dirname "$0")" && pwd)"; A="$SB/app/asuvpn-tray"
+# shellcheck source=tests/sandbox/lib.sh
+. "$SB/lib.sh"; sandbox_guard; fresh_home
+export FAKE_DEAF=1
+start_tray
+"$A" connect >/dev/null 2>&1
+await_status "not carrying traffic" 90 "the tunnel was demoted"
+"$A" disconnect >/dev/null 2>&1; drc=$?
+s="$("$A" status)"
+echo "  after disconnect (disconnect exited $drc): $s"
+"$A" quit >/dev/null 2>&1; wait "$T" 2>/dev/null
+[ "$drc" -eq 0 ] || { echo "  FAIL: disconnect exited $drc on a demoted tunnel" >&2; exit 1; }
+must_contain "disconnected at the end" "$s" "Disconnected"
+echo "  PASS: a demoted tunnel disconnects cleanly"
+exit 0

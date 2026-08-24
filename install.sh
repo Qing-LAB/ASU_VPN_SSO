@@ -192,7 +192,9 @@ command -v gtk-update-icon-cache >/dev/null &&
   gtk-update-icon-cache -f -t "$HOME/.local/share/icons/hicolor" 2>/dev/null || true
 
 echo "Installed:"
-echo "  program   $INSTALL_DIR  (not group- or world-writable)"
+# No mode claim here: the go-w above is allowed to fail on a read-only
+# checkout, and the self-check below is what actually verifies writability.
+echo "  program   $INSTALL_DIR"
 echo "  launcher  $DESKTOP_FILE"
 echo "  icon      $ICON_DIR/asuvpn.svg"
 echo "  command   $BIN_DIR/asuvpn"
