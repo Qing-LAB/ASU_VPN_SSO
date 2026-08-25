@@ -21,8 +21,9 @@ if [ -z "$REAL_SSO" ]; then
 fi
 REAL_SSO="$(realpath "$REAL_SSO")"
 
-# Stage what the scenarios run. app/ is refreshed from the repository every
-# time so a scenario can never test stale code. rbin/ holds runtime copies of
+# Stage what the scenarios run (asuvpn-selftest comes along for hand
+# sessions, not for any scenario). app/ is refreshed from the repository
+# every time so a scenario can never test stale code. rbin/ holds runtime copies of
 # the fakes because the fake openconnect-sso needs a shebang naming an
 # absolute path on *this* machine: the tray reads that shebang to find the
 # venv python, so it has to point at the stand-in interpreter.
@@ -69,6 +70,7 @@ SB="$1"; REAL_SSO="$2"; shift 2
 export PATH="$SB/rbin:$PATH"
 mount -t tmpfs tmpfs /run
 mkdir -p /run/user/1000
+chmod 700 /run/user/1000  # dbus refuses a runtime dir other uids could write
 mount --bind "$SB/rbin/openconnect" /usr/sbin/openconnect
 [ -e /usr/bin/openconnect ] && mount --bind "$SB/rbin/openconnect" /usr/bin/openconnect
 mount --bind "$SB/rbin/pkexec" /usr/bin/pkexec

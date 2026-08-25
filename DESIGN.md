@@ -197,7 +197,7 @@ stateDiagram-v2
     failed --> authenticating: connect, reconnect
     authenticating --> connecting: sign-in ok, cookie to the helper
     authenticating --> failed: no saved password, keyring locked, sign-in failed
-    authenticating --> disconnected: cancel (no tunnel yet)
+    authenticating --> disconnected: cancel, disconnect (no tunnel yet)
     connecting --> connected: tunnel-up (reason=connect)
     connected --> recovering: link-lost (reason=attempt-reconnect)
     recovering --> connected: tunnel-up (reason=reconnect)
@@ -217,13 +217,15 @@ stateDiagram-v2
     demoted --> failed: helper died while demoted
 ```
 
-Three any-state rows are not drawn, to keep the diagram readable: `quit`
+The any-state rows are not drawn, to keep the diagram readable: `quit`
 works from every state (with a live tunnel it goes through `disconnecting`;
 without one the applet just exits), the helper's exit is weighed wherever it
-lands (a stale generation is only logged), and the helper's informational
+lands (a stale generation is only logged), the helper's informational
 messages (device name, fatal or warning sentences) are remembered in any
-state. A `cancel` during `authenticating` normally ends in `disconnected` —
-the sign-in has no tunnel to tear down.
+state, and so is the tray's own failure-scan sentence (`problem` — built
+from openconnect's output, not sent by the helper). A `cancel` — or a
+`disconnect`, which reaches the same handler — during `authenticating`
+normally ends in `disconnected`: the sign-in has no tunnel to tear down.
 
 `RECOVERING` (openconnect re-establishing its own session) and `DEMOTED`
 (established but not carrying traffic — the watchdog's verdict) used to hide
@@ -260,11 +262,13 @@ phrased as an action being taken on their behalf.
 Two rules the table now makes structural rather than careful:
 
 - **Nothing leaves `disconnecting` except its own teardown's outcome.** The
-  state has rows only for `helper-exited`, `teardown-finished`,
-  `teardown-timeout` and `quit`; a late event or verdict finds no row and is
-  dropped with a log line. (A late `reconnect` event once flipped the badge
-  back to `connected` mid-teardown, and a probe strike once handed a user's
-  Disconnect to the escalation ladder.)
+  rows that can fire there are `helper-exited`, `teardown-finished`,
+  `teardown-timeout`, `quit`, and the any-state bookkeeping rows (device,
+  fatal, problem, warning — none of which move the state); a late tunnel
+  event or watchdog verdict finds no row and is dropped with a log line. (A
+  late `reconnect` event once flipped the badge back to `connected`
+  mid-teardown, and a probe strike once handed a user's Disconnect to the
+  escalation ladder.)
 - **`reconnect` stays busy the whole way through.** The teardown carries
   `intent = reconnect`, so the badge goes `disconnecting → authenticating`
   with no momentary gap for `asuvpn reconnect --wait` to mistake for
@@ -366,6 +370,7 @@ The GLib main loop owns all state and all GTK. Everything else posts to it.
 | `_pump` | drains sign-in stderr into the log | |
 | `_tunnel_thread` | reads the helper's output, then reaps it | the **only** caller of `helper.wait()` |
 | teardown workers | `_disconnect_thread`, `_reconnect_thread`, `_cancel_tunnel_thread`, `_quit_thread` | wait on an `Event`, never on `wait()` |
+| probe worker | one TCP connect through the tunnel | spawned per probe; replies via `idle_add`, and `probe_in_flight` keeps them from stacking |
 | IPC loop | accepts CLI connections, checks `SO_PEERCRED` | runs actions on the main loop and waits for them |
 
 | Lock / primitive | Protects |
@@ -497,9 +502,11 @@ All of the above can pass while the tunnel carries nothing. So every
 closes it, on a worker thread — `probe-timeout` seconds on the GLib main loop
 would freeze the UI.
 
-The target is derived, not configured: `INTERNAL_IP4_DNS`, forwarded from
-`asuvpn-notify` through the same script contract as everything else. Whatever
-this tunnel says to resolve against ought to answer through it.
+The target is derived by default, never hardcoded: `INTERNAL_IP4_DNS`,
+forwarded from `asuvpn-notify` through the same script contract as everything
+else. Whatever this tunnel says to resolve against ought to answer through
+it. The `probe-target` setting overrides the derivation for the rare network
+where the pushed resolver is not the right thing to ask.
 
 **A refusal counts as alive.** Measured against a live ASU tunnel, one pushed
 resolver completed the handshake in 29ms and the other answered with a RST in
@@ -580,7 +587,7 @@ Three details that are easy to get wrong, and were:
   record of a breakage that was silent by definition, and wiping them leaves a
   fresh log saying nothing happened.
 - **The rate-limit timestamps survive a reconnect.** Every automatic recovery
-  arrives back through `_start_tunnel`, so resetting them there — which an
+  arrives back through `_act_start_tunnel`, so resetting them there — which an
   earlier version did — cleared the limits on every cycle and let a tunnel that
   kept breaking take a `SIGUSR2` or a Duo push each time round.
 - **A demoted tunnel is still an established one.** It has a helper and a
@@ -624,7 +631,7 @@ DEMOTED tunnel is no longer in `CONNECTED` but certainly was one, and
 There is exactly one `_reset_tunnel_state()`, with four callers: `__init__`,
 the tunnel starter, the `helper-exited` row, and the dead-helper branch of
 the reconnect row. It was open-coded in three places and had already
-diverged: the copy in `_start_tunnel` omitted `tunnel_dns`, so a new tunnel
+diverged: the tunnel starter's copy omitted `tunnel_dns`, so a new tunnel
 kept probing the *previous* one's resolver — an address with no reason to be
 reachable through it. The incident half of it (`_clear_incident`) is shared
 with mid-session adoption for the same reason.
@@ -708,25 +715,25 @@ where it can be, checked by `asuvpn selftest`.
 
 | Invariant | Enforced by | Checked by |
 | --- | --- | --- |
-| `openconnect` always gets to run `vpnc-script` on the way out | escalation ladder, output relay, `PR_SET_PDEATHSIG` | teardown scenarios in the sandbox |
+| `openconnect` always gets to run `vpnc-script` on the way out | escalation ladder, output relay, `PR_SET_PDEATHSIG` | teardown scenarios in the sandbox; `stubborn.sh` asserts the ladder's *order* against a peer that ignores `SIGINT` — `SIGTERM` only after the grace, `SIGKILL` not at all |
 | No root process outlives the tray | control pipe, `PR_SET_PDEATHSIG`, no `--background` | `SIGKILL` the tray and look for survivors |
-| Only a device this session created is ever deleted | ifindex ownership, free-name selection | `--interface <existing>` is refused |
+| Only a device this session created is ever deleted | ifindex ownership, free-name selection | `--interface <existing>` is refused (exit 23, wiring tier), and the logic tier drives `verify_teardown` both ways: a foreign ifindex is left alone, our own is deleted |
 | A device name never reaches the filesystem or `ip` unvalidated | `INTERFACE_RE`, checked at both ends — where produced and where consumed | logic + wiring tiers, with traversal and whitespace payloads |
 | `openconnect` cannot forge a helper message | `[vpn] ` prefix on every relayed line | wiring tier, with `\r` and `\n` payloads |
 | A state event cannot inject a line or a field | reject impossible device names; collapse every field to one token | wiring tier, with space-and-`=` payloads |
-| Only this user can drive the applet, and only this user's applet answers | `SO_PEERCRED` at both ends, failing closed | invert the check and confirm refusal |
+| Only this user can drive the applet, and only this user's applet answers | `SO_PEERCRED` at both ends, failing closed | `ipc-gate.sh` stages a real second uid: refused with no reply, logged with the uid — and the same poke from our own uid answered, so the refusal is not vacuous |
 | The cookie never reaches a command line or the log | `--cookie-on-stdin` only | grep the log and the journal |
 | Interposing never costs routing | derive the script, step aside if unusable | environment tier |
 | A stalled tunnel is noticed rather than shown as connected | `--force-dpd`, plus a watchdog for what DPD cannot see | logic tier, and a sandbox scenario where the device never appears |
 | Recovery never costs a Duo push unless asked | `SIGUSR2` first — waited for if rate-limited, never skipped — sign-in only on opt-in | `escalate.sh` **asserts** exactly one nudge and one sign-in over 100s; the held-nudge rule in the logic tier |
-| openconnect cannot drive the control channel | it is spawned with its own `stdin` pipe | compared `/proc/<pid>/fd/0` of both: distinct pipes, child's is `O_RDONLY` |
-| A refusal is reported as a sentence, not a number | `[helper] FATAL ` marker, set by the helper | wiring tier, by running two refused connects |
+| openconnect cannot drive the control channel | it is spawned with its own `stdin` pipe | `fdcheck.sh` asserts `/proc/<pid>/fd/0` of the two are distinct (the child's open mode is printed for the reader) |
+| A refusal is reported as a sentence, not a number | `[helper] FATAL ` marker, set by the helper | wiring tier, by running three refused connects |
 | Everything executed as root is unwritable by a second principal | every loader's bootstrap check, the helper's runtime list (exit 26), `install.sh`'s `go-w` sweep | environment tier, by making each file writable in turn, and end to end for a shared group in the sandbox (`sec.sh` b/b2) |
 | `openconnect-sso` can still import `pkg_resources` | `setuptools<71` pinned with `pipx inject --force` | environment tier, by importing it |
 
 ## How this is tested
 
-Three tiers in `asuvpn-selftest` (90 checks), plus the scenario sandbox in
+Three tiers in `asuvpn-selftest` (99 checks), plus the scenario sandbox in
 [tests/sandbox](tests/sandbox/README.md).
 
 The shaping constraint: **conventional unit tests would not have caught any of
@@ -818,6 +825,18 @@ breaking the code on purpose:
 | drift the installers' hand-copied server default | the shell installers' server default matches the schema |
 | count the log's size meter in characters again | the log-write-path check, its size-meter half |
 | return the first `--force-dpd` instead of the last | the last `--force-dpd` wins, like every other option reader |
+| revert the interface regex to `$`, so a trailing newline passes | unusable interface names are rejected (twice: the name lists, and the health-path leak check) |
+| drop the probe-port floor from the schema | settings parse by type, and the problems count |
+| widen the config regeneration back to every read error | one setting changes; the rest of the file is the user's |
+| re-add a momentary DISCONNECTED to the reconnect handoff (both sites) | the teardown-to-sign-in handoff publishes no state of its own |
+| neuter the RECOVERING stand-aside | a verdict during openconnect's own recovery is set aside |
+| flip the ifindex comparison before root's `ip link delete` | only the device this session created is ever deleted |
+| neuter the existing-interface refusal | a refused connect explains itself (the exit-23 case — with the refusal gone, the real openconnect actually ran) |
+| refuse the negative dpd only after the event channel opens | `sec3.sh`: the refusal leaked a session channel |
+| put `SIGKILL` first in the escalation ladder | `stubborn.sh`: exited 137 instead of walking the ladder |
+| weaken the IPC gate to accept any readable peer | `ipc-gate.sh`: a foreign uid read the applet's state |
+| break the helper-exited reconnect intent | `escalate.sh`: the announced sign-in never started a second tunnel |
+| invert the closing flag's test, either direction | a deliberate event-channel close is silent; a surprise one warns |
 
 The fallback-patterns row is the one that matters most: it is the check that
 would have caught the original `Connected as` failure, and the stand-in row

@@ -115,15 +115,18 @@ if [ -f "$CONFIG_FILE" ]; then
   # END appends when no server line exists — a half-written file from an
   # interrupted first install used to swallow --server silently, forever —
   # and the mv is a separate command so set -e catches an awk failure
-  # instead of skipping the mv and reporting success.
-  awk -v line="server = $SERVER" \
+  # instead of skipping the mv and reporting success. The scratch name
+  # carries this pid because the applet and the CLI write the same file with
+  # their own scratches; umask 077 births it 0600 instead of fixing the mode
+  # after the content is already on disk.
+  ( umask 077; awk -v line="server = $SERVER" \
     '{ split($0, f, "#"); split(f[1], kv, "="); k=kv[1]; gsub(/^[ \t]+|[ \t]+$/, "", k)
        if (k == "server") { print line; found=1 } else { print } }
      END { if (!found) print line }' \
-    "$CONFIG_FILE" > "$CONFIG_FILE.tmp"
-  mv "$CONFIG_FILE.tmp" "$CONFIG_FILE"
+    "$CONFIG_FILE" > "$CONFIG_FILE.$$.tmp" )
+  mv "$CONFIG_FILE.$$.tmp" "$CONFIG_FILE"
 else
-  "$INSTALL_DIR/asuvpn-tray" --write-config "$SERVER" > "$CONFIG_FILE"
+  ( umask 077; "$INSTALL_DIR/asuvpn-tray" --write-config "$SERVER" > "$CONFIG_FILE" )
 fi
 chmod 0600 "$CONFIG_FILE"
 

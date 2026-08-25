@@ -21,8 +21,18 @@ echo "  --- anything the watchdog complained about? ---"
 grep -E 'check |not usable|FATAL|previous tunnel|signing in' "$LOG" \
   | sed 's/^/    /' || echo "    nothing (healthy throughout)"
 must_contain "still connected across the probe window" "$s" "Connected"
-if grep -q 'not usable' "$LOG"; then
+# A negative grep over a missing file passes vacuously, so the log's
+# existence is asserted first — and the reconnect above rotated it, so the
+# first connect's lines live in .1: both files are evidence.
+[ -s "$LOG" ] || { echo "  FAIL: no session log was written" >&2; exit 1; }
+if cat "$LOG" "$LOG.1" 2>/dev/null | grep -q 'not usable'; then
     echo "  FAIL: a healthy tunnel was demoted" >&2; exit 1
+fi
+# A clean run must not cry wolf: the event channel closing at teardown is
+# deliberate and must stay silent. (The flag that keeps it silent is pinned
+# deterministically by the selftest; this grep is the end-to-end net.)
+if cat "$LOG" "$LOG.1" 2>/dev/null | grep -q 'event channel stopped'; then
+    echo "  FAIL: a clean teardown warned about the event channel" >&2; exit 1
 fi
 echo "  PASS: whole lifecycle, healthy throughout"
 exit 0

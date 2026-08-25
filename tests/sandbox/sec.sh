@@ -8,7 +8,8 @@
 # happen before anything executed — and the normal contrast case must NOT be
 # refused, or the refusals above prove nothing.
 SB="$(cd "$(dirname "$0")" && pwd)"
-grep -qa SANDBOX-MARKER /usr/bin/pkexec 2>/dev/null || { echo "not inside the sandbox; run: tests/sandbox/enter.sh ${0##*/}" >&2; exit 90; }
+# shellcheck source=tests/sandbox/lib.sh
+. "$SB/lib.sh"; sandbox_guard
 export HOME="$SB/home"; mkdir -p "$SB/home"
 A="$SB/app"
 run_raw() { printf 'COOKIE\n' | timeout 8 "$A/asuvpn-helper" --host https://x \
@@ -65,6 +66,9 @@ echo "$out" | head -2 | sed 's/^/      /'
 rm -f "$A/asuvpn_contract.py"; mv "$A/real_contract.py" "$A/asuvpn_contract.py"
 rm -f "$SB/evil_contract.py"  # a 0666 file has no business outliving its case
 refused "a symlink to a writable contract" "$rc" "$out"
+# There is no case (e): the dpd refusals that carried the letter moved to
+# sec3.sh, and the letters after it are cross-referenced from sec2.sh and
+# the design notes, so they keep their names.
 echo "--- f) normal, for contrast ---"
 out="$(run_raw --dpd=0)"; rc=$?
 printf '%s\n' "$out" | grep -F "$SPAWNED" | head -1 | cut -c1-96 | sed 's/^/      /'
@@ -74,8 +78,17 @@ if ! printf '%s' "$out" | grep -qF "$SPAWNED"; then
     exit 1
 fi
 echo
-echo "--- g) the event socket directory, as root ---"
+echo "--- g) the event socket directory, as root: no session leftovers ---"
 # shellcheck disable=SC2012  # ls output is displayed for the reader, not parsed
-ls -ld /run/asuvpn 2>/dev/null | sed 's/^/      /' || echo "      (none left behind)"
+ls -ld /run/asuvpn 2>/dev/null | sed 's/^/      /' || echo "      (never created)"
+# Asserted, not just shown: the clean run in (f) opened a session channel
+# under /run/asuvpn, and its teardown must have removed it. This case used
+# to print whatever was there and could not fail.
+leftovers=$(find /run/asuvpn -mindepth 1 -maxdepth 1 2>/dev/null)
+if [ -n "$leftovers" ]; then
+  echo "      FAIL: session channels left behind in /run/asuvpn: $leftovers" >&2
+  exit 1
+fi
+echo "      clean: every session removed its channel directory"
 echo "  PASS: every refusal refused before anything ran; the normal case ran"
 exit 0

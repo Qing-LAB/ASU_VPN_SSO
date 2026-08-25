@@ -442,9 +442,13 @@ def write_setting(name, value):
     setting = C.SETTINGS_BY_NAME[name]
     rendered = f"{name} = {setting.render(value)}"
     CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(CONFIG_FILE.parent, 0o700)  # a pre-existing directory keeps 0700 too
     try:
         lines = CONFIG_FILE.read_text(encoding="utf-8").splitlines()
-    except OSError:
+    except FileNotFoundError:
+        # Only a *missing* file earns a full regeneration. Any other read
+        # failure propagates: quietly replacing an existing file the user
+        # customised with rendered defaults would lose every other setting.
         lines = C.render_settings().splitlines()
     for index, line in enumerate(lines):
         if line.split("#", 1)[0].partition("=")[0].strip() == name:
@@ -455,11 +459,20 @@ def write_setting(name, value):
     # Written beside and renamed over, never truncated in place: the applet
     # re-reads this file on every health tick, and a read landing inside a
     # truncate-then-write window would see an empty file and run one whole
-    # check on defaults. install.sh edits the same file the same way.
-    scratch = CONFIG_FILE.with_name(CONFIG_FILE.name + ".tmp")
-    scratch.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    os.chmod(scratch, 0o600)
-    os.replace(scratch, CONFIG_FILE)
+    # check on defaults. The scratch name carries the pid, because the CLI
+    # and install.sh write the same file from other processes and a shared
+    # scratch let one writer rename the other's half-written file into place.
+    # Born 0600 like the config itself: write_text would create it with umask
+    # permissions first and fix them a moment later.
+    scratch = CONFIG_FILE.with_name(f"{CONFIG_FILE.name}.{os.getpid()}.tmp")
+    fd = os.open(scratch, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write("\n".join(lines) + "\n")
+        os.replace(scratch, CONFIG_FILE)
+    except OSError:
+        scratch.unlink(missing_ok=True)  # nothing half-written survives
+        raise
     reload_settings()
 
 
@@ -568,8 +581,8 @@ class StateMachine:
     Separable from the GTK class on purpose — `asuvpn selftest` subclasses
     this with stubbed side effects and drives the very table that ships. The
     concrete class supplies the side effects: log, notify, _set_state,
-    _send_helper, _act_start_signin, _act_start_tunnel, autoreconnect_enabled,
-    and the teardown worker threads.
+    _send_helper, _act_start_signin, _kill_auth, _act_start_tunnel,
+    autoreconnect_enabled, and the teardown worker threads.
     """
 
     # What the machine reads and writes. Declared so the boundary is written
@@ -683,8 +696,11 @@ class StateMachine:
 
     # -- rows: user verbs
 
-    def _tr_start_signin(self, data):
-        self._act_start_signin(keep_log=data.get("keep_log", False))
+    def _tr_start_signin(self, _data):
+        # Always a fresh log: this row serves the user verbs, and the
+        # keep-the-log flavor travels only through the reconnect teardown
+        # (_tr_teardown_reconnect), never through a connect from cold.
+        self._act_start_signin(keep_log=False)
 
     def _tr_connect_means_reconnect(self, _data):
         # The menu offers Reconnect on a demoted tunnel, and the CLI verb
@@ -714,10 +730,11 @@ class StateMachine:
             # Nothing to tear down. The bump retires the dead helper's
             # still-queued exit message: the health timer can run before
             # queued idles, and without it that message would paint FAILED
-            # over the sign-in this line starts.
+            # over the sign-in this line starts. No state is published in
+            # between — the sign-in sets the next one, so a `--wait` polling
+            # this verb never samples a momentary DISCONNECTED.
             self.helper_generation += 1
             self._reset_tunnel_state()
-            self._set_state(DISCONNECTED)
             self._act_start_signin(keep_log=keep)
             return
         # Stay busy for the whole tear-down-then-connect sequence. Surfacing
@@ -924,7 +941,10 @@ class StateMachine:
         self.reconnect_keep_log = False
         self.teardown_intent = None
         self.helper_proc = None
-        self._set_state(DISCONNECTED)
+        # Straight into the sign-in, publishing no state of its own: the badge
+        # goes disconnecting → authenticating. A momentary DISCONNECTED here
+        # was readable by the IPC thread, and `asuvpn reconnect --wait`
+        # sampling that instant reported the reconnect finished.
         self._act_start_signin(keep_log=keep)
 
     def _tr_teardown_timed_out(self, data):
@@ -2385,8 +2405,8 @@ def wait_until_settled(timeout=300.0):
     return last
 
 
-def wait_until_gone(timeout=None):
-    timeout = SETTINGS["teardown-timeout"] + 15 if timeout is None else timeout
+def wait_until_gone():
+    timeout = SETTINGS["teardown-timeout"] + 15
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if send_to_running_instance("ping") is None:
@@ -2498,14 +2518,14 @@ def main():
     # every later flag, so "asuvpn connect --wait" would silently pass --wait to
     # openconnect instead of to us.
     argv = sys.argv[1:]
-    # Intercepted before parsing so that --tier and --quiet reach the self-test
-    # rather than being rejected here as unknown flags.
     # Generating the config is the installer's job, but the schema lives in the
     # contract, so the program that can read it is the one that writes it. Kept
     # out of argparse deliberately: it is an installation step, not a command.
     if len(argv) == 2 and argv[0] == "--write-config":
         sys.stdout.write(C.render_settings({"server": argv[1]}))
         return 0
+    # Intercepted before parsing so that --tier and --quiet reach the self-test
+    # rather than being rejected here as unknown flags.
     if argv and argv[0] == "selftest":
         return run_selftest(argv[1:])
     # Intercepted for the same reason: it takes a value, and threading an

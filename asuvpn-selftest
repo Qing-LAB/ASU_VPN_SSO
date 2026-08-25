@@ -145,15 +145,18 @@ def check_contract(C, r):
 
     values, problems = C.parse_settings(
         "server = x.edu\nprobe = off\ndpd = 0\nnope = 1\nprobe-every = -3\n"
-        "probe-port = 70000\nteardown-timeout = 10\n")
+        "probe-port = 70000\nprobe-port = 0\nteardown-timeout = 10\n")
     r.check("settings parse by type, and every default survives a bad file",
             values["server"] == "x.edu" and values["probe"] is False
             and values["dpd"] == 0
             and values["probe-every"] == C.SETTINGS_BY_NAME["probe-every"].default
             and values["probe-port"] == C.SETTINGS_BY_NAME["probe-port"].default,
             f"got {values!r}")
+    # probe-port 0 is among the refused lines above: it is not a connectable
+    # port, so accepting it would make every probe silently inconclusive —
+    # the watchdog's probe half blind while `probe = on` claims coverage.
     r.check("unknown keys and out-of-range values are reported, not raised",
-            len(problems) == 4, f"got {problems!r}")
+            len(problems) == 5, f"got {problems!r}")
     # The schema's own floor: a teardown wait shorter than the helper's
     # 15+10+5 signal escalation reports every clean disconnect as a failure,
     # so the setting's documentation forbids it and the parser enforces that.
@@ -221,7 +224,10 @@ def check_option_blocklist(helper, r):
 def check_interface_names(C, r):
     """Anything failing this reaches `ip link delete` running as root."""
     good = ["asuvpn0", "tun0", "a", "x" * 15, "eth0.100", "my-vpn_1"]
-    bad = ["", "../../etc/passwd", "x" * 16, "-lo", "a/b", "a b", ".hidden"]
+    # The trailing newline is the regex trap: $ matches before it, \Z does
+    # not, and "asuvpn0\n" once passed as a device name because of exactly that.
+    bad = ["", "../../etc/passwd", "x" * 16, "-lo", "a/b", "a b", ".hidden",
+           "asuvpn0\n"]
     rejected = [n for n in good if not C.INTERFACE_RE.match(n)]
     accepted = [n for n in bad if C.INTERFACE_RE.match(n)]
     r.check("usable interface names are accepted", not rejected,
@@ -344,7 +350,7 @@ def check_tunnel_health(tray, r):
     # The helper validates it on the way out; this is the other end doing the
     # same rather than taking that on trust.
     hostile = ["../../etc/passwd", "a/b", "", "x" * 16, ".hidden", "-lo",
-               "asuvpn0 ", "asuvpn0\nevil"]
+               "asuvpn0 ", "asuvpn0\nevil", "asuvpn0\n"]
     # "used as a path" means it reached the /sys lookup: facts carry the device
     # and no note saying it was set aside. An empty name returns before either.
     leaked = []
@@ -568,6 +574,17 @@ def check_demotion_rules(tray, r):
     r.check("a probe verdict arriving mid-teardown changes nothing",
             stub.state == tray.DISCONNECTING and stub.strikes["probe"] == 0,
             f"state={stub.state!r} strikes={stub.strikes}")
+
+    # openconnect re-establishing its own session outranks the watchdog: a
+    # bad check landing in RECOVERING is weighed and deliberately set aside.
+    # Counting it would strike, demote and nudge a tunnel openconnect is
+    # already in the middle of fixing.
+    stub.state = tray.RECOVERING
+    stub.dispatch(tray.MSG_CHECK, source="probe",
+                  reason="nothing answers", detail="no reply")
+    r.check("a verdict during openconnect's own recovery is set aside",
+            stub.state == tray.RECOVERING and stub.strikes["probe"] == 0,
+            f"state={stub.state!r} strikes={stub.strikes}")
     stub.state = tray.DEMOTED
 
     stub.dispatch(tray.MSG_CHECK, source="probe", reason=None, detail="answered")
@@ -622,10 +639,10 @@ def check_demotion_rules(tray, r):
     # still declines, as ever.
     demoted = Stub()
     demoted.state = tray.DEMOTED
-    demoted.dispatch(tray.MSG_CONNECT, keep_log=False)
+    demoted.dispatch(tray.MSG_CONNECT)
     connected = Stub()
     connected.state = tray.CONNECTED
-    connected.dispatch(tray.MSG_CONNECT, keep_log=False)
+    connected.dispatch(tray.MSG_CONNECT)
     r.check("connect on a demoted tunnel means reconnect, and only there",
             demoted.signins == [False]
             and any("reconnecting instead" in line for line in demoted.logged)
@@ -665,6 +682,97 @@ def check_demotion_rules(tray, r):
             and not any(ord(ch) < 0x20 or 0x7f <= ord(ch) <= 0x9f
                         for ch in kept),
             f"last_failure={kept!r}")
+
+
+def check_teardown_rows(tray, r):
+    """The teardown outcomes the sandbox cannot reach quickly.
+
+    A helper that outlives teardown-timeout takes the whole signal ladder to
+    stage for real, so the two timeout rows are driven here, on the shipping
+    table. The reconnect handoff is pinned too: it must publish no state of
+    its own, because a momentary DISCONNECTED between teardown and sign-in
+    was readable by the IPC thread, and `asuvpn reconnect --wait` sampling
+    that instant reported the reconnect finished.
+    """
+
+    class Stub(tray.StateMachine):  # type: ignore[misc, name-defined]
+        server = "vpn.example.edu"
+
+        def __init__(self):
+            self.state = tray.DISCONNECTING
+            self.detail = ""
+            self.state_events = False
+            self.quitting = False
+            self.demoted_by = None
+            self.strikes = {"device": 0, "probe": 0}
+            self.nudge_spent = self.failure_notified = False
+            self.routes_seen = {"routes4": False, "routes6": False}
+            self.tunnel_device = None
+            self.tunnel_ifindex = None
+            self.tunnel_address = self.tunnel_dns = ""
+            self.tunnel_ever_connected = False
+            self.last_failure = None
+            self.last_nudge = float("-inf")
+            self.last_autoreconnect = float("-inf")
+            self.helper_generation = 0
+            self.helper_proc = None
+            self.teardown_intent = "reconnect"
+            self.reconnect_keep_log = False
+            self.published, self.notes = [], []
+            self.signins, self.logged = [], []
+
+        def notify(self, summary, body="", icon=None):
+            self.notes.append(summary)
+
+        def log(self, line):
+            self.logged.append(line)
+
+        def _set_state(self, state, detail=""):
+            self.state, self.detail = state, detail
+            self.published.append(state)
+
+        def _act_start_signin(self, keep_log):
+            self.signins.append(keep_log)
+
+    timed = Stub()
+    timed.reconnect_keep_log = True
+    timed.dispatch(tray.MSG_TEARDOWN_TIMEOUT, during="reconnect")
+    r.check("a reconnect whose old tunnel will not close is abandoned",
+            timed.state == tray.FAILED and timed.signins == []
+            and timed.reconnect_keep_log is False
+            and any("abandoned" in line for line in timed.logged),
+            f"state={timed.state!r} signins={timed.signins}"
+            f" logged={timed.logged} — carrying on would start a second root"
+            " tunnel beside one that is still up")
+
+    stuck = Stub()
+    stuck.teardown_intent = "disconnect"
+    stuck.dispatch(tray.MSG_TEARDOWN_TIMEOUT, during="disconnect")
+    r.check("a helper that will not exit is reported, with a warning raised",
+            stuck.state == tray.FAILED and stuck.notes == ["VPN warning"],
+            f"state={stuck.state!r} notes={stuck.notes}")
+
+    handoff = Stub()
+    handoff.reconnect_keep_log = True
+    handoff.dispatch(tray.MSG_TEARDOWN_FINISHED)
+    r.check("the teardown-to-sign-in handoff publishes no state of its own",
+            handoff.signins == [True] and handoff.published == []
+            and handoff.teardown_intent is None and handoff.helper_proc is None,
+            f"signins={handoff.signins} published={handoff.published} — a"
+            " momentary state here is what `reconnect --wait` mistakes for"
+            " completion")
+
+    dead = Stub()
+    dead.state = tray.CONNECTED
+    dead.teardown_intent = None
+    before = dead.helper_generation
+    dead.dispatch(tray.MSG_RECONNECT)
+    r.check("a reconnect with no live helper signs in without a state detour",
+            dead.signins == [False] and dead.published == []
+            and dead.helper_generation == before + 1,
+            f"signins={dead.signins} published={dead.published}"
+            f" generation={dead.helper_generation} (was {before}) — the bump"
+            " retires the dead helper's still-queued exit message")
 
 
 def check_log_rotation(tray, r):
@@ -721,6 +829,70 @@ def check_log_rotation(tray, r):
             tray.SETTINGS["log-keep"] = original_keep
 
 
+def check_config_editing(tray, r):
+    """write_setting's contract: change one line, keep the user's file.
+
+    `asuvpn autoreconnect on|off` and the menu checkbox both land here. A
+    missing file earns the full documented render; an existing file keeps
+    every other line as the user left it; and an unreadable file raises
+    instead of being quietly replaced — a silent fall-back to defaults here
+    would let one toggle discard every customization, server included.
+    """
+    original_config = tray.CONFIG_FILE
+    problems = []
+    try:
+        with tempfile.TemporaryDirectory() as base:
+            tray.CONFIG_FILE = type(original_config)(base) / "cfg" / "asuvpn.conf"
+            parent = tray.CONFIG_FILE.parent
+            tray.write_setting("autoreconnect", True)
+            text = tray.CONFIG_FILE.read_text()
+            if "autoreconnect = on" not in text.splitlines():
+                problems.append(f"the toggle did not land: {text!r}")
+            if not text.startswith("# ASU VPN settings."):
+                problems.append("a missing file was not regenerated in full")
+            mode = os.stat(tray.CONFIG_FILE).st_mode & 0o777
+            if mode != 0o600:
+                problems.append(f"config mode is {oct(mode)}, not 0600")
+            dmode = os.stat(parent).st_mode & 0o777
+            if dmode != 0o700:
+                problems.append(f"config directory is {oct(dmode)}, not 0700")
+            r.check("a missing config is regenerated in full, born private",
+                    not problems, "; ".join(problems))
+
+            problems = []
+            tray.CONFIG_FILE.write_text(
+                "server = my.example.edu  # mine\ndpd = 45\n")
+            tray.write_setting("autoreconnect", False)
+            lines = tray.CONFIG_FILE.read_text().splitlines()
+            if lines[:2] != ["server = my.example.edu  # mine", "dpd = 45"]:
+                problems.append(f"the user's lines were not preserved: {lines}")
+            if "autoreconnect = off" not in lines:
+                problems.append(f"the toggle did not land: {lines}")
+            if os.geteuid() != 0:  # root reads through a 0000 mode
+                os.chmod(tray.CONFIG_FILE, 0)
+                try:
+                    tray.write_setting("autoreconnect", True)
+                except OSError:
+                    pass
+                else:
+                    problems.append("an unreadable config was quietly replaced"
+                                    " with defaults")
+                finally:
+                    os.chmod(tray.CONFIG_FILE, 0o600)
+                after = tray.CONFIG_FILE.read_text().splitlines()
+                if after != lines:
+                    problems.append("the refused edit still changed the file:"
+                                    f" {after}")
+            leftovers = sorted(p.name for p in parent.glob("*.tmp"))
+            if leftovers:
+                problems.append(f"scratch files left behind: {leftovers}")
+            r.check("one setting changes; the rest of the file is the user's",
+                    not problems, "; ".join(problems))
+    finally:
+        tray.CONFIG_FILE = original_config
+        tray.reload_settings()
+
+
 def check_liveness_probe(tray, r):
     """The probe's verdicts, against endpoints every machine has.
 
@@ -731,9 +903,15 @@ def check_liveness_probe(tray, r):
     failure would declare a perfectly good tunnel dead whenever the service
     behind the probe happened to be down.
     """
-    # Nothing listens here, so the kernel answers with a RST immediately.
-    closed = ("127.0.0.1", 9)
-    alive, detail = tray.probe_tunnel(closed[0], 9, 3)
+    # A port the kernel just handed out and took back: provably nothing
+    # listens there, so the connect is answered with a RST. Port 9 was used
+    # before, but a host running a discard service would have turned this
+    # into a successful connect — the same True for the wrong reason.
+    lease = socket.socket()
+    lease.bind(("127.0.0.1", 0))
+    port = lease.getsockname()[1]
+    lease.close()
+    alive, detail = tray.probe_tunnel("127.0.0.1", port, 3)
     r.check("a refused connection counts as a live tunnel", alive is True,
             f"got alive={alive!r} ({detail}) — a RST is a reply, and treating"
             " it as death would condemn a working tunnel")
@@ -907,6 +1085,90 @@ def check_output_framing(helper, r):
             len(emitted) == len(lines)
             and all(ln.count("\n") == 1 and ln.endswith("\n") for ln in emitted),
             f"fed {len(lines)} lines, got {len(emitted)}: {emitted}")
+
+
+def check_closing_flag(helper, r):
+    """A deliberate event-channel close is silent; an unexpected one warns.
+
+    `closing` is what tells the two apart: teardown sets it before closing
+    the socket, so a clean disconnect never raises a spurious "the state
+    event channel stopped" warning — while the same failure mid-tunnel must
+    warn, because state precision just silently degraded to log matching.
+    Driven synchronously on an already-closed socket: recvfrom raises at
+    once, which is the same except-branch the live close reaches.
+    """
+    emitted: list[str] = []
+    original = helper.emit
+    helper.emit = emitted.append
+    try:
+        helper.closing.set()
+        gone = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+        gone.close()
+        helper.serve_events(gone, "tok", "asuvpn0", {})
+        silent = not any("channel stopped" in line for line in emitted)
+        emitted.clear()
+        helper.closing.clear()
+        gone = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+        gone.close()
+        helper.serve_events(gone, "tok", "asuvpn0", {})
+        warned = any("channel stopped" in line for line in emitted)
+    finally:
+        helper.closing.clear()
+        helper.emit = original
+    r.check("a deliberate event-channel close is silent; a surprise one warns",
+            silent and warned,
+            f"deliberate-close silent={silent}, surprise-close warned={warned}"
+            " — one way every clean disconnect cries wolf, the other way a"
+            " dead channel is never reported")
+
+
+def check_teardown_ownership(helper, r):
+    """Only the device this session created is ever deleted.
+
+    verify_teardown runs as root and can call `ip link delete`; the ifindex
+    captured when openconnect created the device is what proves the name
+    still means *our* tunnel. Two helpers racing can both pick asuvpn0 — the
+    loser must not delete the winner's live tunnel. No sandbox scenario can
+    reach this (the namespace cannot create devices), so the decision is
+    driven here with the module's own seams stood in for.
+    """
+
+    class Result:
+        returncode = 0
+        stdout = "default via 198.51.100.1 dev wlan0\n"
+        stderr = ""
+
+    deleted, logged = [], []
+    originals = {name: getattr(helper, name) for name in
+                 ("find_ip", "tunnel_interfaces", "interface_exists",
+                  "interface_index", "run", "log")}
+
+    def fake_run(command, timeout=5):
+        deleted.append(list(command))
+        return Result()
+
+    helper.find_ip = lambda: "/fake/ip"
+    helper.tunnel_interfaces = set  # called with no args; an empty set back
+    helper.interface_exists = lambda name: True
+    helper.run = fake_run
+    helper.log = logged.append
+    try:
+        helper.interface_index = lambda name: 7
+        helper.verify_teardown("asuvpn0", set(), False, 9)  # not our incarnation
+        foreign_deletes = [c for c in deleted if "delete" in c]
+        left_alone = any("leaving it alone" in line for line in logged)
+        deleted.clear()
+        logged.clear()
+        helper.verify_teardown("asuvpn0", set(), False, 7)  # ours: index matches
+        ours_deleted = ["/fake/ip", "link", "delete", "asuvpn0"] in deleted
+    finally:
+        for name, value in originals.items():
+            setattr(helper, name, value)
+    r.check("only the device this session created is ever deleted",
+            not foreign_deletes and left_alone and ours_deleted,
+            f"foreign deletes={foreign_deletes} left_alone={left_alone}"
+            f" ours_deleted={ours_deleted} — a name match without the ifindex"
+            " match must never reach `ip link delete` as root")
 
 
 # --------------------------------------------------------------- environment
@@ -1327,6 +1589,10 @@ def check_fatal_reporting(r):
         (["--", "--background"], "an option that would detach openconnect", 25),
         (["--", "--interface", "../../etc/passwd"],
          "an impossible device name", 22),
+        # lo exists on every machine this runs on, and refusing to take over
+        # a device this session did not create is what keeps `--interface
+        # docker0` from having root delete the caller's bridge at teardown.
+        (["--", "--interface", "lo"], "a device this session did not create", 23),
     ]
     unmarked = []
     for extra, label, expected_rc in cases:
@@ -1334,7 +1600,7 @@ def check_fatal_reporting(r):
             out = subprocess.run(
                 [path, "--host", "https://example.invalid",
                  "--fingerprint", "pin-sha256:x", *extra],
-                input="not-a-real-cookie\n", stdin=None, capture_output=True,
+                input="not-a-real-cookie\n", capture_output=True,
                 text=True, timeout=30)
         except (OSError, subprocess.SubprocessError) as exc:
             r.warn("a refused connect explains itself", f"{label}: {exc}")
@@ -1515,10 +1781,14 @@ def main():
         guarded(check_log_write_path, tray, r)
         guarded(check_tunnel_health, tray, r)
         guarded(check_demotion_rules, tray, r)
+        guarded(check_teardown_rows, tray, r)
         guarded(check_log_rotation, tray, r)
+        guarded(check_config_editing, tray, r)
         guarded(check_liveness_probe, tray, r)
         guarded(check_notifications, tray, r)
         guarded(check_output_framing, helper, r)
+        guarded(check_closing_flag, helper, r)
+        guarded(check_teardown_ownership, helper, r)
 
     if "environment" in tiers:
         r.section("environment — our assumptions, put to the installed binaries")

@@ -18,9 +18,16 @@ grep -E 'not usable|re-establish|SIGUSR2|signing in again|tunnel check|authentic
 # nudge, and a loose substring counted the one nudge twice.
 nudges=$(grep -cF '[tray] asked openconnect to re-establish' "$LOG" 2>/dev/null || true)
 signins=$(grep -cF '[tray] signing in again to rebuild' "$LOG" 2>/dev/null || true)
-if [ "$nudges" = 1 ] && [ "$signins" = 1 ]; then
-  echo "  PASS: exactly one free nudge and one sign-in over the window"
+# The announcement is written before the teardown-and-sign-in it promises,
+# so counting it alone passes on a ladder whose reconnect intent is broken.
+# "signed in, starting openconnect" is logged when the new sign-in has
+# actually produced a cookie and a second helper spawn begins: once for the
+# initial connect, once more for the escalation — the outcome, not the word.
+starts=$(grep -cF '[tray] signed in, starting openconnect' "$LOG" 2>/dev/null || true)
+if [ "$nudges" = 1 ] && [ "$signins" = 1 ] && [ "$starts" -ge 2 ]; then
+  echo "  PASS: exactly one free nudge and one sign-in — and the sign-in ran"
   exit 0
 fi
-echo "  FAIL: expected one nudge and one sign-in; got nudges=$nudges signins=$signins" >&2
+echo "  FAIL: expected one nudge, one sign-in, and a second tunnel start;" >&2
+echo "        got nudges=$nudges signins=$signins starts=$starts" >&2
 exit 1

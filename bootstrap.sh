@@ -25,8 +25,10 @@ PY=3.12
 PYBIN="/usr/bin/python$PY"
 DEADSNAKES_PPA="ppa:deadsnakes/ppa"
 
-# The [full] extra pulls in keyring support. setuptools must stay below 71:
-# openconnect-sso still imports pkg_resources, which 71 dropped.
+# The [full] extra pulls in keyring support. setuptools must stay pinned:
+# openconnect-sso still imports pkg_resources, which current setuptools no
+# longer ships. <71 is the known-good bound, not the exact boundary — the
+# long comment inside install_openconnect_sso() has the measured versions.
 SSO_SPEC='openconnect-sso[full]'
 SETUPTOOLS_PIN='setuptools<71'
 

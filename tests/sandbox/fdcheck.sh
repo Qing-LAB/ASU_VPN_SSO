@@ -1,6 +1,7 @@
 #!/bin/bash
 SB="$(cd "$(dirname "$0")" && pwd)"
-grep -qa SANDBOX-MARKER /usr/bin/pkexec 2>/dev/null || { echo "not inside the sandbox; run: tests/sandbox/enter.sh ${0##*/}" >&2; exit 90; }
+# shellcheck source=tests/sandbox/lib.sh
+. "$SB/lib.sh"; sandbox_guard
 export HOME="$SB/home"; mkdir -p "$SB/home"
 mkfifo "$SB/ctl" 2>/dev/null; exec 9<>"$SB/ctl"
 printf 'FAKECOOKIE\n' >&9

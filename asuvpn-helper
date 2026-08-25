@@ -322,7 +322,7 @@ def log(message):
         pass
 
 
-def die_with_parent(parent_pid=None):
+def die_with_parent(parent_pid):
     """Ask the kernel to signal openconnect if this helper dies.
 
     The control pipe protects against the *tray* dying. This is the other
@@ -342,7 +342,7 @@ def die_with_parent(parent_pid=None):
     # never be noticed. Comparing against the recorded pid rather than testing
     # for init: under systemd an orphan reparents to the nearest subreaper
     # (systemd --user), never to pid 1, so that test silently never fired.
-    if parent_pid is not None and os.getppid() != parent_pid:
+    if os.getppid() != parent_pid:
         os._exit(1)
 
 
@@ -704,6 +704,15 @@ def main():
         if refusal:
             fatal(refusal)
             return 25
+    # Validated rather than trusted, and up here with the other refusals: a
+    # refusal after event_channel() below would leave its socket and directory
+    # behind in /run. The config parser refuses a negative, so one can only
+    # arrive from a caller invoking this directly -- which needs pkexec and is
+    # therefore no escalation -- but a privileged program has no business
+    # passing its caller's arithmetic through to a root subprocess.
+    if args.dpd < 0:
+        fatal(f"refusing a negative dead peer detection interval: {args.dpd}")
+        return 27
     # Name the device so teardown can prove which interface is ours before
     # deleting anything as root. A caller-supplied name is honoured instead.
     ifname = requested_interface(extra)
@@ -771,14 +780,8 @@ def main():
 
     # Says what was done, not what the server did: this runs before the server
     # has said anything, and asserting its behaviour here would be wrong for
-    # every gateway that does negotiate DPD.
-    # Validated rather than trusted. The config parser refuses a negative, so
-    # one can only arrive from a caller invoking this directly -- which needs
-    # pkexec and is therefore no escalation -- but a privileged program has no
-    # business passing its caller's arithmetic through to a root subprocess.
-    if args.dpd < 0:
-        fatal(f"refusing a negative dead peer detection interval: {args.dpd}")
-        return 27
+    # every gateway that does negotiate DPD. (A negative value was refused
+    # above, before anything was allocated.)
     if args.dpd and requested_dpd(extra) is None:
         extra = [*extra, "--force-dpd", str(args.dpd)]
         log(f"forcing dead peer detection every {args.dpd}s;"

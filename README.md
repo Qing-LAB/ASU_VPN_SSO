@@ -146,6 +146,7 @@ matters raises a desktop notification:
 | **VPN disconnected** | the tunnel closed, with the reason if it was not you | — |
 | **Sign-in failed** | the sign-in step itself failed; the text says why | — |
 | **VPN warning** | the helper hit trouble — most seriously, the network may not have been restored after teardown | — |
+| **Cannot start** | `openconnect-sso` is not installed, so there is nothing to sign in with | — |
 
 The distinction the wording carries is deliberate: *connection lost* and
 *reconnecting* are free and need nothing from you, while *signing in again* is
@@ -182,7 +183,7 @@ connect.
 | `health-strikes` | `2` | Consecutive bad checks before the badge stops claiming Connected. |
 | `probe` | `on` | Ask the network whether traffic still flows. The only check that catches a tunnel that looks perfect and delivers nothing. |
 | `probe-target` | *(empty)* | Address to probe. Empty means the resolver the VPN itself pushed. |
-| `probe-port`, `probe-every`, `probe-timeout` | `53`, `3`, `5` | Port, how often, how long to wait (the wait is capped at 120). |
+| `probe-port`, `probe-every`, `probe-timeout` | `53`, `3`, `5` | Port (1–65535; 0 would blind the probe and is refused), how often, how long to wait (the wait is capped at 120). |
 | `nudge-min-gap` | `120` | Seconds between free re-establish requests. |
 | `autoreconnect-min-gap` | `300` | Seconds between unattended sign-ins. |
 | `teardown-timeout` | `75` | Seconds to wait for the helper. Must outlast its signal escalation, so values below 35 are refused and the default used. |
@@ -657,11 +658,12 @@ no subprocess. But they all share a blind spot: a tunnel can have a healthy
 device, correct routes, and still carry nothing. So every third cycle the applet
 also **asks the network**.
 
-The target is not configured and not hardcoded — it is the resolver the VPN
-itself pushed (`INTERNAL_IP4_DNS`), forwarded through the same script contract
+The target is never hardcoded — by default it is the resolver the VPN itself
+pushed (`INTERNAL_IP4_DNS`), forwarded through the same script contract
 everything else uses. Whatever this tunnel says to resolve against is by
-definition something that ought to answer through it. A VPN that pushes no
-resolver simply gets the device checks.
+definition something that ought to answer through it. The `probe-target`
+setting overrides that derivation if you know better for your network. A VPN
+that pushes no resolver simply gets the device checks.
 
 The probe opens a TCP connection and closes it. **A refusal counts as alive**,
 which is the part worth understanding: measured against a live ASU tunnel, one
@@ -1127,7 +1129,7 @@ the measured window.
 The stand-in exercises earlier in this section — the launch races, the exit
 code sweep, the arbitrary-directory installs — predate the committed suite
 and were run with the same fakes before the harness moved into the
-repository; the ten committed scenarios are the ones tabulated in
+repository; the twelve committed scenarios are the ones tabulated in
 [tests/sandbox](tests/sandbox/README.md).
 
 What is proven live against the real gateway (full connects and teardowns,

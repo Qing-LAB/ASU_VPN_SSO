@@ -99,12 +99,14 @@ staged HOME, the proven tray start, the assertion helpers) lives in
 | `sec2.sh` | staging positive-control: the `chgrp` to a second group really takes | no |
 | `sec3.sh` | negative dpd refused with its documented exit 27; 0 means "leave the server alone"; a normal value reaches openconnect's command line | no |
 | `fdcheck.sh` | openconnect's stdin is not the helper's control pipe, so it cannot inject control verbs (fails if it finds no subject to inspect) | no |
+| `stubborn.sh` | the teardown ladder's *order*, against a stand-in that ignores SIGINT: SIGINT first, SIGTERM only after the full grace, never SIGKILL against a peer that yields — and a clean exit 0 at the end | no |
 | `lifecycle.sh` | connect → reconnect → probes → disconnect → quit, the state asserted at each step, and a healthy tunnel never demoted | yes |
 | `discon.sh` | a demoted tunnel still disconnects cleanly: exit 0 and a Disconnected badge (`FAKE_DEAF=1` ignores nudges) | yes |
 | `escalate.sh` | the watchdog's ladder: exactly one nudge, then — with autoreconnect on — exactly one full sign-in | yes |
 | `watchdog-test.sh` | a gone device: strikes → demotion → exactly one nudge; the reconnect event adopts the tunnel but the badge stays demoted | yes |
 | `blackhole.sh` | device and routes healthy, probe target silent → demoted with the probe named in the verdict, one nudge, and a badge that stays demoted because only the probe can promote it | yes |
 | `contract-test.sh` | the config file drives the helper (`--force-dpd 45` on the real command line) and the CLI autoreconnect toggle lands back in the file | yes |
+| `ipc-gate.sh` | the control socket's uid gate, against a real second uid (mapped via `/etc/subuid`): the foreign poke gets no reply and is logged with its uid, while the same raw poke from our own uid is answered — so the refusal is proven non-vacuous | yes |
 
 "Display needed" scenarios start the real tray, which needs GTK and an X
 display (`:0` is assumed; on Wayland that is XWayland). `enter.sh` copies the

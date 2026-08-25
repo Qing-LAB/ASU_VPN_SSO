@@ -20,7 +20,7 @@ Everything is committed and pushed to `main` at
 | Programs | `asuvpn-tray` (you), `asuvpn-helper` (root, via pkexec), `asuvpn-notify` (root, run by openconnect), `asuvpn-selftest` (you) |
 | Shared | `asuvpn_contract.py` — loaded by explicit path, never imported |
 | Settings | `~/.config/asuvpn/asuvpn.conf`, generated from the contract's schema |
-| Checks | `asuvpn selftest` — 90, in three tiers; scenario suite in [tests/sandbox](tests/sandbox/README.md), every scenario asserting its outcome |
+| Checks | `asuvpn selftest` — 99, in three tiers; scenario suite in [tests/sandbox](tests/sandbox/README.md), every scenario asserting its outcome |
 | Analysers | ruff, pyflakes, pylint, mypy, bandit, vulture, shellcheck — all clean |
 | Tested against | openconnect v9.12-3.3, Ubuntu, GNOME, ASU's `sslvpn.asu.edu` |
 
@@ -69,6 +69,13 @@ not, and each cost a round of rework.
   after a spent nudge, and the opt-in sign-in.
 - The nudge rate limits, notification wording, every failure path, and the
   config driving behaviour end to end.
+- The teardown ladder's **order** (2026-08-24): `stubborn.sh` stages a peer
+  that ignores SIGINT and asserts SIGTERM comes only after the full grace and
+  SIGKILL not at all. Live teardowns had only ever exercised the first rung.
+- The control socket's **uid gate** against a real second uid (2026-08-24):
+  `ipc-gate.sh` pokes the applet's socket as uid 65534 (refused, no reply,
+  logged) and as our own uid (answered). Previously verified once by hand,
+  by inverting the check.
 - The **shared-group** permission refusal, end to end since 2026-08-22: the
   sandbox now maps this user's `/etc/subgid` block (`--map-auto`), so
   `tests/sandbox/sec.sh` stages a file owned by a second group and watches the
@@ -200,7 +207,7 @@ the present tense.
 
 Five message prefixes, two config mechanisms, nine tunables across two programs,
 a permission rule copied three times — each restated where it was needed and
-each quietly diverged. One `_start_tunnel` reset omitted `tunnel_dns` and a new
+each quietly diverged. One tunnel-starter reset omitted `tunnel_dns` and a new
 tunnel probed the previous one's resolver.
 
 `asuvpn_contract.py` now holds anything more than one program needs to know. The
@@ -271,7 +278,7 @@ others use `abspath`, and the reference copy in the contract says which.
 ## How to work on it
 
 ```bash
-asuvpn selftest                 # 84 checks; run before and after any change
+asuvpn selftest                 # 99 checks; run before and after any change
 tests/sandbox/enter.sh sec.sh   # scenario tests, in a namespace of stand-ins
 ./install.sh                    # copies into ~/.local, runs the self-check
 asuvpn log -f                   # what it is actually doing

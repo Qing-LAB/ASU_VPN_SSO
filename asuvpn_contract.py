@@ -215,8 +215,9 @@ REASON_STATES = {
 
 # IFNAMSIZ is 16 including the NUL. Anything outside this cannot name a device,
 # and unchecked it would reach an `ip link delete` running as root, or be
-# interpolated into a path under /sys.
-INTERFACE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,14}$")
+# interpolated into a path under /sys. \Z, not $: a dollar also matches just
+# before a trailing newline, so "asuvpn0\n" passed as a device name.
+INTERFACE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,14}\Z")
 INTERFACE_PREFIX = "asuvpn"
 
 # What we present to the gateway. Both the tray (which passes it) and the
@@ -316,9 +317,12 @@ SETTINGS = (
             "Address to probe. Empty means whatever resolver the VPN itself"
             " pushed, which is the right answer on every network it is used on."),
     Setting("probe-port", "int", 53,
-            "Port for the probe. Nothing is sent; a refusal counts as alive,"
-            " because a RST proves a packet crossed in each direction.",
-            maximum=65535),
+            "Port for the probe, 1-65535. Nothing is sent; a refusal counts as"
+            " alive, because a RST proves a packet crossed in each direction."
+            " 0 is refused: it is not a connectable port, so every probe would"
+            " silently come back inconclusive and the watchdog's probe half"
+            " would be blind while claiming to watch.",
+            minimum=1, maximum=65535),
     Setting("probe-every", "int", 3,
             "Run the probe on every Nth health check, so it costs a packet a"
             " minute rather than one every twenty seconds. 0 behaves as 1,"

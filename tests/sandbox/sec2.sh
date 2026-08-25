@@ -4,7 +4,8 @@
 # (The dpd edge cases that used to live here are sec3.sh's job, which shows
 # them against the helper's documented exit codes.)
 SB="$(cd "$(dirname "$0")" && pwd)"; A="$SB/app"
-grep -qa SANDBOX-MARKER /usr/bin/pkexec 2>/dev/null || { echo "not inside the sandbox; run: tests/sandbox/enter.sh ${0##*/}" >&2; exit 90; }
+# shellcheck source=tests/sandbox/lib.sh
+. "$SB/lib.sh"; sandbox_guard
 export HOME="$SB/home"
 echo "--- staging control: does chgrp to a second group actually take? ---"
 chgrp 65534 "$A/asuvpn_contract.py" 2>&1 | sed 's/^/      chgrp: /'
