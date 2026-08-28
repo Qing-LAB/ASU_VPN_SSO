@@ -7,6 +7,10 @@ SB="$(cd "$(dirname "$0")" && pwd)"; A="$SB/app/asuvpn-tray"
 # shellcheck source=tests/sandbox/lib.sh
 . "$SB/lib.sh"; sandbox_guard; fresh_home
 export FAKE_DEAF=1
+# Pinned off, not left to the default: this scenario is about the nudge-only
+# path, and a default that permits the sign-in rung would change what it
+# proves without changing a line of it.
+"$A" autoreconnect off >/dev/null
 start_tray
 "$A" connect >/dev/null 2>&1
 await_status "not carrying traffic" 90 "the tunnel was demoted"

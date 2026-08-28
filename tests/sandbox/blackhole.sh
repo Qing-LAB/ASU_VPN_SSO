@@ -7,6 +7,10 @@ SB="$(cd "$(dirname "$0")" && pwd)"; A="$SB/app/asuvpn-tray"
 . "$SB/lib.sh"; sandbox_guard; fresh_home
 # device that is genuinely healthy, target that will never answer (RFC 5737)
 export FAKE_TUNDEV=lo FAKE_DNS=198.51.100.1
+# Pinned off, not left to the default: this scenario is about the nudge-only
+# path, and a default that permits the sign-in rung would change what it
+# proves without changing a line of it.
+"$A" autoreconnect off >/dev/null
 start_tray
 "$A" connect >/dev/null 2>&1
 await_status "not carrying traffic" 240 "the probe demoted the tunnel"

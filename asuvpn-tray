@@ -109,6 +109,15 @@ AUTOSTART_FILE = (
     _xdg_dir("XDG_CONFIG_HOME", ".config") / "autostart" / "asuvpn-tray.desktop"
 )
 MAX_LOG_LINES = 4000  # the in-memory tail; the file's cap is the log-max-kb setting
+# How many times a tunnel that died on its own is rebuilt before the applet
+# stops and waits to be asked. Spacing alone is not a bound: a network that is
+# down stays down, and every attempt costs a browser window and a Duo push, so
+# the third one is where unattended recovery stops being a kindness.
+MAX_REBUILDS = 3
+# What the badge appends while a rebuild is still owed. One spelling, because
+# it is written in one place and taken off again in another, and two copies of
+# a literal like that drift the moment either is reworded.
+REBUILDING = "; rebuilding"
 IFF_UP = 0x1
 
 # Not 2: argparse already exits 2 for any bad command line, so a script could
@@ -180,6 +189,8 @@ MSG_CHECK = "check"                # watchdog: source, reason (None=ok), detail
 MSG_HELPER_EXITED = "helper-exited"        # reader thread: status, generation
 MSG_TEARDOWN_FINISHED = "teardown-finished"  # reconnect worker: old tunnel gone
 MSG_TEARDOWN_TIMEOUT = "teardown-timeout"    # any teardown worker: during
+MSG_REBUILD = "rebuild"                    # health tick: a dropped tunnel may
+                                           # be worth rebuilding by itself
 
 ANY = "*"
 
@@ -224,6 +235,10 @@ TRANSITIONS = {
     (ANY, MSG_HELPER_EXITED): "helper_exited",
     (DISCONNECTING, MSG_TEARDOWN_FINISHED): "teardown_finished",
     (DISCONNECTING, MSG_TEARDOWN_TIMEOUT): "teardown_timed_out",
+    # Only from FAILED, and only for a tunnel that had carried traffic: the
+    # arming rule lives in the exit row, so this one cannot fire behind a
+    # sign-in that never produced a working tunnel.
+    (FAILED, MSG_REBUILD): "rebuild_dropped",
 }
 
 # Taken from the message catalogue of the installed openconnect, not from
@@ -422,7 +437,14 @@ def tunnel_health(device, ifindex, routes_seen=None):
         pass  # unreadable flags are not evidence of a fault
     v4, v6 = route_count(device)
     facts["routes4"], facts["routes6"] = v4, v6
-    if v4 == 0 and v6 == 0:
+    # Every family we could read, and at least one we could: `v4 == 0 and
+    # v6 == 0` looks like the same test and is not. A kernel built without
+    # IPv6 has no /proc/net/ipv6_route, so v6 comes back None -- unreadable,
+    # not zero -- and that comparison then stayed False through a table with
+    # nothing in it at all. Unreadable is still never evidence of a fault, so
+    # both families unreadable says nothing rather than everything.
+    readable = [count for count in (v4, v6) if count is not None]
+    if readable and not any(readable):
         return "no routes point at the tunnel any more", facts
     seen = routes_seen or {}
     if seen.get("routes4") and v4 == 0:
@@ -474,6 +496,40 @@ def write_setting(name, value):
         scratch.unlink(missing_ok=True)  # nothing half-written survives
         raise
     reload_settings()
+
+
+class Deadline:
+    """Kill a child that outlasts `limit`, so a blocking read of it can end.
+
+    A `read()` cannot be given a timeout, so the timeout has to act on the
+    process instead: killing it closes the pipe, and the read returns. That
+    is the same move Cancel makes, which is why `kill` is passed in rather
+    than assumed.
+
+    Module level and injectable for one reason: the failure this exists to
+    prevent is a wait that never ends, and that is precisely the failure no
+    test can observe by waiting for it. `asuvpn selftest` drives this against
+    a real child that would outlive the run.
+    """
+
+    def __init__(self, proc, limit, kill):
+        self.overdue = threading.Event()
+        self._settled = threading.Event()
+        self._proc, self._limit, self._kill = proc, limit, kill
+
+    def __enter__(self):
+        threading.Thread(target=self._watch, daemon=True).start()
+        return self
+
+    def _watch(self):
+        if self._settled.wait(timeout=self._limit):
+            return  # finished on its own; nothing to do
+        self.overdue.set()  # set before the kill, so the waiter sees the cause
+        self._kill(self._proc)
+
+    def __exit__(self, *_exception):
+        self._settled.set()  # releases the watcher; a no-op once it has fired
+        return False
 
 
 def parse_state_payload(payload):
@@ -602,7 +658,10 @@ class StateMachine:
     tunnel_address: str
     tunnel_dns: str
     tunnel_ever_connected: bool
+    tunnel_up_since: float | None
     last_failure: str | None
+    dropped: bool
+    rebuilds: int
     last_nudge: float
     last_autoreconnect: float
     helper_generation = 0
@@ -697,6 +756,11 @@ class StateMachine:
     # -- rows: user verbs
 
     def _tr_start_signin(self, _data):
+        # A human is at the keyboard. Whatever the applet still owed a dropped
+        # tunnel is theirs to spend again, and nothing may keep retrying
+        # behind them -- this row and the one below are the only ways out of
+        # FAILED, which is the only state a rebuild is ever owed from.
+        self._clear_drop()
         # Always a fresh log: this row serves the user verbs, and the
         # keep-the-log flavor travels only through the reconnect teardown
         # (_tr_teardown_reconnect), never through a connect from cold.
@@ -708,14 +772,17 @@ class StateMachine:
         # that is up but carrying nothing is a teardown and a fresh sign-in.
         # Refusing silently read as "cannot connect" against exactly this
         # state on a live break.
+        self._clear_drop()
         self.log("[tray] connect asked for while the tunnel is demoted;"
                  " reconnecting instead")
         self._tr_teardown_reconnect({"keep_log": False})
 
     def _tr_already_disconnected(self, _data):
+        self._clear_drop()
         self._set_state(DISCONNECTED)
 
     def _tr_teardown_disconnect(self, _data):
+        self._clear_drop()
         if self.helper_proc is None or self.helper_proc.poll() is not None:
             self._set_state(DISCONNECTED)
             return
@@ -747,6 +814,10 @@ class StateMachine:
         threading.Thread(target=self._reconnect_thread, daemon=True).start()
 
     def _tr_cancel_attempt(self, _data):
+        # Reachable mid-rebuild, which is the case that needs this: cancelling
+        # the sign-in a rebuild started left the count spent, so a later drop
+        # got fewer attempts than the next user was ever told about.
+        self._clear_drop()
         self.auth_generation += 1  # invalidate any sign-in still in flight
         self.log("[tray] cancelled by user")
         self._kill_auth()
@@ -901,6 +972,9 @@ class StateMachine:
         # its death far better than a bare exit status does.
         was_connected = (self.state in (CONNECTED, RECOVERING, DEMOTED)
                          or self.tunnel_ever_connected)
+        # Read before the reset too, and for the same reason: how long this
+        # session lasted is what tells a recovery from a flap.
+        up_since = self.tunnel_up_since
         intent = self.teardown_intent
         self._reset_tunnel_state()
         if intent == "reconnect":
@@ -932,9 +1006,107 @@ class StateMachine:
             message = "connection dropped"
         else:
             message = f"openconnect exited with status {status}"
-        self._set_state(FAILED, message)
+        # A session that outlived the gap did not flap: whatever produced it
+        # worked, so this death starts its own count. One that died sooner
+        # keeps the count it inherited, and that is the whole reason
+        # MAX_REBUILDS can bite -- every rebuilt tunnel reaches "connected",
+        # so refunding the count there instead left the limit unreachable
+        # against exactly the flap it exists for.
+        if (up_since is not None
+                and time.monotonic() - up_since
+                >= SETTINGS["autoreconnect-min-gap"]):
+            self.rebuilds = 0
+        # The one place a rebuild is armed, and `was_connected` is the whole
+        # test: a tunnel that carried traffic and then died is worth
+        # rebuilding unasked, and a tunnel that never came up is not -- a
+        # rejected cookie, a dismissed authorization or an unmatched
+        # certificate pin will all do the same thing the second time, browser
+        # window and Duo push included. Every rebuild has to re-earn this the
+        # same way, which is what stops a retry becoming a loop.
+        #
+        # The setting is read here, unlike everywhere else, rather than only
+        # where it is acted on: a box ticked hours after a tunnel died should
+        # not open a browser window for it. Unticking it after the fact does
+        # still stop the retries -- the handler re-checks -- because that is
+        # the direction where acting on the newer answer means doing less.
+        self.dropped = was_connected and self.autoreconnect_enabled()
+        # The detail says what happens next, not only what happened: sitting
+        # at a bare "Not connected" while three sign-ins are still owed reads
+        # as a dead applet, both on the badge and through `asuvpn status`.
+        self._set_state(FAILED, message + REBUILDING if self.dropped
+                        else message)
         self.log(f"[tray] {message}")
         self.notify("VPN disconnected", message)
+        if self.dropped:
+            # Said here, once, rather than from the tick that acts on it:
+            # that one runs every health-interval for as long as this lasts.
+            self.log("[tray] rebuilding it shortly")
+        elif was_connected:
+            self.log("[tray] automatic sign-in is off; Connect when ready")
+
+    def _tr_rebuild_dropped(self, _data):
+        """Rebuild a tunnel that died on its own, while that is still sane.
+
+        The escalation ladder cannot reach this case and never could: it
+        escalates a tunnel that is *up* and useless, and this one is gone --
+        no helper to nudge, no device to watch, no check to strike. So
+        `autoreconnect` did nothing at all for the most ordinary break there
+        is. openconnect gives up after its own reconnect timeout (300s by
+        default), which a suspend or a WiFi outage clears easily, and the
+        applet then sat at "Not connected" until somebody came back and
+        clicked Connect -- with the setting that promises otherwise on.
+
+        Driven by the health tick because FAILED has no events of its own and
+        there is no other timer. Three things bound it, and each answers a
+        different way this could become a nuisance:
+
+          * `dropped`, armed only by an exit that followed real traffic, so a
+            rejected cookie or a dismissed authorization is never retried;
+          * `autoreconnect-min-gap`, shared with the ladder, so the two
+            automatic sign-ins cannot add up to more than the user allowed;
+          * `MAX_REBUILDS`, because a network that is down stays down and
+            spacing alone would keep opening browser windows all afternoon.
+        """
+        if not self.dropped:
+            # Nothing is owed. The health tick already tests this before it
+            # dispatches, but the invariant belongs to the machine rather
+            # than to whoever drives it -- and the give-up branch below is
+            # once-per-drop only because this line makes it so.
+            return
+        if not self.autoreconnect_enabled():
+            # Turned off since the drop -- by the menu or by `asuvpn
+            # autoreconnect off`, which this row sees identically because the
+            # config is re-read on every tick. Disarmed rather than merely
+            # skipped: left armed, ticking the box again hours later opened a
+            # browser window for a tunnel that had died before lunch, which
+            # is the same surprise the arming rule above exists to prevent.
+            # Nothing is said here; the exit row that armed it already did.
+            self._disarm("")
+            return
+        if self.rebuilds >= MAX_REBUILDS:
+            # Disarmed here, so this is said once and the tick stops asking.
+            self._disarm("; gave up reconnecting")
+            self.log(f"[tray] the tunnel did not come back in {MAX_REBUILDS}"
+                     " attempts; waiting to be asked")
+            self.notify("VPN still not connected",
+                        "automatic sign-in gave up — Connect when ready",
+                        icon="dialog-warning-symbolic")
+            return
+        now = time.monotonic()
+        if now - self.last_autoreconnect < SETTINGS["autoreconnect-min-gap"]:
+            # Deliberately silent: this row runs every health tick, and the
+            # ladder's habit of logging what it is waiting for would put a
+            # line in the log every twenty seconds for the whole gap.
+            return
+        self.rebuilds += 1
+        self.last_autoreconnect = now
+        self.log(f"[tray] rebuilding the dropped tunnel"
+                 f" (attempt {self.rebuilds} of {MAX_REBUILDS})")
+        # Announced for the same reason the ladder announces its sign-in: a
+        # Duo push and a password dialog are about to arrive, and the user
+        # should know what asked for them.
+        self.notify("VPN signing in again", "the tunnel dropped")
+        self._act_start_signin(keep_log=True)
 
     def _tr_teardown_finished(self, _data):
         keep = self.reconnect_keep_log
@@ -1056,6 +1228,15 @@ class StateMachine:
         """
         first = not self.tunnel_ever_connected
         self.tunnel_ever_connected = True
+        # There is a tunnel again, so nothing is owed. The *count* is
+        # deliberately not cleared here: every rebuild reaches this line,
+        # including the ones whose tunnel falls over seconds later, so
+        # clearing it here made MAX_REBUILDS unreachable against exactly the
+        # flap it exists for -- connect, die, connect, die, one Duo push per
+        # gap forever. What earns the count back is a session that lasted,
+        # judged on the way out in _tr_helper_exited.
+        self.dropped = False
+        self.tunnel_up_since = time.monotonic()
         # Reaching CONNECTED clears any earlier failure line; otherwise a blip
         # openconnect recovered from would be reported as the cause when the
         # tunnel eventually drops, hours later.
@@ -1099,6 +1280,37 @@ class StateMachine:
             self.dispatch(MSG_LINK_LOST)
         # A "disconnected" event is deliberately not a message: the exit path
         # already distinguishes a requested teardown from a dropped tunnel.
+
+    def _disarm(self, ending):
+        """Stop owing a rebuild, and stop the badge promising one.
+
+        The detail keeps the failure that caused all this -- outside the log
+        it is the only record of *why*, and it reaches the panel and
+        `asuvpn status` alike -- so only the trailing promise is rewritten.
+        Published rather than merely assigned, because two of the three ways
+        a rebuild is called off change no state of their own, and a menu
+        still offering to stop something that stopped is its own bug.
+        """
+        self.dropped = False
+        self._set_state(FAILED, self.detail.removesuffix(REBUILDING) + ending)
+
+    def _clear_drop(self):
+        """Nothing is owed a dropped tunnel: a human took over.
+
+        Called from the handlers a user verb is the *only* way to reach, so
+        that acting on the applet always hands the decision back. The one
+        user verb missing from that list is Reconnect: `_tr_teardown_reconnect`
+        is shared with the escalation ladder, and clearing the count from
+        there would let a demotion sign-in refund the drop budget every time
+        round. Nothing is lost -- a session that outlives the gap refunds it
+        anyway, judged on the way out.
+
+        A tunnel merely *coming up* clears the flag but not the count; see
+        _announce_connected, where getting that wrong made the limit
+        unreachable against the flap it exists for.
+        """
+        self.dropped = False
+        self.rebuilds = 0
 
     def _clear_incident(self):
         """A clean slate for the watchdog: no strikes, no demoter, no latch.
@@ -1165,6 +1377,7 @@ class StateMachine:
         self.tunnel_address = ""
         self.tunnel_dns = ""
         self.tunnel_ever_connected = False
+        self.tunnel_up_since = None
         self._clear_incident()
 
 
@@ -1207,6 +1420,11 @@ class VpnTray(StateMachine):
         # exactly when a tunnel brought up at login is most likely to need one.
         self.last_nudge = float("-inf")
         self.last_autoreconnect = float("-inf")
+        # Whether the last tunnel died on its own, and how many times it has
+        # been rebuilt for that death. Outside _reset_tunnel_state on purpose
+        # -- see _clear_drop.
+        self.dropped = False
+        self.rebuilds = 0
         # Why the current teardown is happening ("disconnect", "cancel",
         # "reconnect", "quit"); the helper-exited rows read it.
         self.teardown_intent = None
@@ -1255,7 +1473,14 @@ class VpnTray(StateMachine):
         self.status_item = Gtk.MenuItem(label="")
         self.status_item.set_sensitive(False)
         self.menu.append(self.status_item)
-        self.menu.append(Gtk.SeparatorMenuItem())
+
+        # Kept as an attribute: while disconnecting there is no verb to offer,
+        # and a separator that stays put then sits directly against the next
+        # one -- two rules with nothing between them, which reads as a menu
+        # that lost its items rather than one that has none to give.
+        self.verb_separator = Gtk.SeparatorMenuItem()
+        self.verb_separator.set_no_show_all(True)
+        self.menu.append(self.verb_separator)
 
         self.connect_item = Gtk.MenuItem(label="Connect")
         self.connect_item.connect("activate", lambda _w: self.connect())
@@ -1297,9 +1522,12 @@ class VpnTray(StateMachine):
         autostart_item.connect("toggled", self._on_autostart_toggled)
         self.menu.append(autostart_item)
 
-        # Off by default: reconnecting means a fresh sign-in, which means a Duo
-        # push and a polkit prompt. That is a reasonable thing to ask for and a
-        # rude thing to assume.
+        # On by default, and it gates the two automatic sign-ins: the
+        # ladder's last rung, which nothing reaches until the free
+        # re-establish has been tried on a tunnel that is up and carrying
+        # nothing, and the rebuild of a tunnel that died outright. Both spend
+        # one autoreconnect-min-gap budget. Unticking it stops at the
+        # demotion, or at "Not connected", and waits to be asked.
         self.autoreconnect_item = Gtk.CheckMenuItem(
             label="Reconnect automatically if traffic stops")
         self.autoreconnect_item.set_active(SETTINGS["autoreconnect"])
@@ -1345,12 +1573,30 @@ class VpnTray(StateMachine):
         # Disconnect and Reconnect — Cancel is the wrong word for tearing
         # down an established session.
         established = self.state in (CONNECTED, DEMOTED)
-        self.disconnect_item.set_visible(established)
+        # Offered in FAILED too, while a rebuild is still owed. The verb that
+        # stops one already existed and already did the right thing --
+        # (FAILED, disconnect) clears the budget and settles on disconnected,
+        # which is how `asuvpn disconnect` has always stopped it -- the menu
+        # simply never showed it, so the only way to call off a retry from
+        # the panel was to untick a setting the user may well want kept.
+        armed = self.state == FAILED and self.dropped
+        self.disconnect_item.set_visible(established or armed)
+        # Named for what it does there: "Disconnect" is the wrong word for a
+        # tunnel that is already gone, and what is being stopped is the
+        # sign-in that has not happened yet.
+        self.disconnect_item.set_label("Stop reconnecting" if armed
+                                       else "Disconnect")
         self.reconnect_item.set_visible(established)
         # Not while disconnecting: teardown must not be interrupted, and there
         # would be nothing left to cancel anyway.
         self.cancel_item.set_visible(
             self.state in (AUTHENTICATING, CONNECTING, RECOVERING))
+        # Follows the verbs it introduces. DISCONNECTING offers none of them --
+        # teardown must not be interrupted -- so the rule above them goes too.
+        self.verb_separator.set_visible(any(
+            item.get_visible() for item in (
+                self.connect_item, self.disconnect_item,
+                self.reconnect_item, self.cancel_item)))
 
     def _set_state(self, state, detail=""):
         self.state = state
@@ -1679,13 +1925,22 @@ class VpnTray(StateMachine):
         except (OSError, ValueError):
             pass
 
-        # Read stdout here rather than via communicate(), which would fight the
-        # stderr pump thread for the same pipes.
-        try:
-            stdout = proc.stdout.read()
-        except (OSError, ValueError):
-            stdout = ""
-        returncode = proc.wait()
+        # A sign-in that has not finished by now is not going to, and it has
+        # to end rather than merely be waited on. openconnect-sso opens a
+        # browser window and blocks on a Duo approval; with nobody at the
+        # keyboard -- which is exactly the situation an automatic rebuild runs
+        # in -- it blocks for as long as the applet lives. The badge sits at
+        # "Signing in…", the watchdog does not run in that state, and only
+        # Cancel clears it.
+        limit = SETTINGS["signin-timeout"]
+        # Read stdout inside it rather than via communicate(), which would
+        # fight the stderr pump thread for the same pipes.
+        with Deadline(proc, limit, self._kill_group) as clock:
+            try:
+                stdout = proc.stdout.read()
+            except (OSError, ValueError):
+                stdout = ""
+            returncode = proc.wait()
         stderr_thread.join(timeout=2)
         for stream in (proc.stdout, proc.stderr):
             try:
@@ -1697,6 +1952,13 @@ class VpnTray(StateMachine):
                 self.auth_proc = None
 
         if superseded():
+            return
+        if clock.overdue.is_set():
+            # Named for what happened, not for the signal it died of: the
+            # exit status of a process we killed says nothing useful.
+            self.post(MSG_AUTH_FAILED,
+                      reason=f"sign-in did not finish within {limit}s",
+                      attempt=attempt)
             return
         if returncode != 0:
             self.post(MSG_AUTH_FAILED,
@@ -1884,6 +2146,14 @@ class VpnTray(StateMachine):
             self._health_interval = SETTINGS["health-interval"]
             self._schedule_health_check()
             return False  # this timer is replaced by the one just armed
+        # Before the watchdog's own off switch, and not gated by it: this is
+        # not a check. `health-interval = 0` means "stop inspecting a live
+        # tunnel", which is a different wish from "stay disconnected after one
+        # drops" -- and the tick keeps running at the schema's cadence anyway,
+        # precisely so something is still here to notice.
+        if self.state == FAILED and self.dropped:
+            self.dispatch(MSG_REBUILD)
+            return True
         if SETTINGS["health-interval"] <= 0:
             return True  # watchdog off: keep reading the config, check nothing
         # The same three states that have MSG_CHECK rows in TRANSITIONS. The
@@ -1901,12 +2171,25 @@ class VpnTray(StateMachine):
         for family in ("routes4", "routes6"):
             if facts.get(family):
                 self.routes_seen[family] = True
+        # Latched here for the same reason, and against the same gap: in
+        # log-matching fallback the tunnel-up line ("CSTP connected") can
+        # arrive before openconnect has created the device, so the adoption
+        # reads no index and "the tunnel device was replaced by a different
+        # one" is then dead for the whole session. The first index this
+        # tunnel is seen to have is the one to hold it to.
+        if self.tunnel_ifindex is None and facts.get("ifindex") is not None:
+            self.tunnel_ifindex = facts["ifindex"]
         # The verdict is a message like any other; the table weighs it
         # (RECOVERING stands aside — openconnect owns its own retry).
         self.dispatch(MSG_CHECK, source="device", reason=reason,
                       detail=self._facts(facts))
-        if reason is not None and self.state in (CONNECTED, DEMOTED):
-            return True  # no point probing a device that is already broken
+        if reason is not None:
+            # No point probing a device that is already broken -- and that is
+            # as true in RECOVERING as anywhere. It used to be excluded here,
+            # so every third tick of an outage spent a thread and a five
+            # second connect on a verdict the table then set aside unread,
+            # openconnect owning its own recovery.
+            return True
 
         self.probe_cycle += 1
         if (SETTINGS["probe"] and self._probe_target() and not self.probe_in_flight
@@ -2284,7 +2567,8 @@ COMMAND_HELP = """
 commands:
   connect       sign in and bring the tunnel up (the default); a tunnel that
                 is up but not carrying traffic is reconnected instead
-  disconnect    close the tunnel, leaving the applet running
+  disconnect    close the tunnel, leaving the applet running; also calls
+                off a rebuild the applet is about to attempt
   reconnect     sign in again and replace the current tunnel
   status        print the current state
   log           print this session's log, -f to follow it

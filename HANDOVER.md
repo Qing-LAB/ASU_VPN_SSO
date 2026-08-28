@@ -66,9 +66,18 @@ not, and each cost a round of rework.
   never reached the ladder at all — openconnect recovered first, which is the
   designed order — and the live routes-flush did fire the nudge (see above).
   What has run only in the sandbox is the post-fix remainder: staying demoted
-  after a spent nudge, and the opt-in sign-in.
+  after a spent nudge, and the unattended sign-in.
 - The nudge rate limits, notification wording, every failure path, and the
   config driving behaviour end to end.
+- **Rebuilding a tunnel that died outright** (2026-08-28). `rebuild.sh` stages
+  openconnect giving up the way it does after its own reconnect timeout, and
+  asserts the applet signs in again unasked, stops after `MAX_REBUILDS`, and
+  says so once. The three bounds — armed only after real traffic, the shared
+  rate limit, the count — are each mutation-verified in the logic tier.
+- **The sign-in deadline** (2026-08-28), driven against a child that would
+  outlive the whole run. A wait that never returns cannot be observed by
+  waiting for it, so `Deadline` takes its kill as an argument and the check
+  hangs the suite rather than passing quietly if it ever stops firing.
 - The teardown ladder's **order** (2026-08-24): `stubborn.sh` stages a peer
   that ignores SIGINT and asserts SIGTERM comes only after the full grace and
   SIGKILL not at all. Live teardowns had only ever exercised the first rung.
@@ -267,18 +276,39 @@ others use `abspath`, and the reference copy in the contract says which.
    fresh applet, flush the routes again and expect two strikes → demotion →
    one nudge → the badge *staying* demoted with one warning notification —
    and with `autoreconnect on`, a sign-in within `autoreconnect-min-gap`.
-2. **Try `autoreconnect = on`** for a while, if the user wants unattended
-   recovery, and see whether the 300 s floor is right.
-3. **Consider whether `probe-every = 3` is the right frequency** now that a real
+2. **Live-verify the rebuild** (added 2026-08-28, with `autoreconnect` now on
+   by default). `autoreconnect` used to gate one rung of the demotion ladder
+   and nothing else, so it did nothing for the commonest break there is:
+   openconnect gives up after its own 300 s reconnect timeout and the applet
+   sat at *Not connected*. The `(failed, rebuild)` row now signs in again, up
+   to `MAX_REBUILDS` = 3.
+
+   **What to stage:** suspend the machine for longer than five minutes, then
+   wake it. Expect the badge to read `connection dropped; rebuilding`, a
+   sign-in within one `autoreconnect-min-gap`, and the tunnel back. Leave the
+   WiFi off instead and expect three attempts and then one "gave up"
+   notification — not a fourth.
+
+   Suite- and sandbox-proven (`rebuild.sh`, eight mutation-verified checks),
+   live-unproven.
+3. **Confirm `signin-timeout` against a real Duo push.** Five minutes is
+   generous by design, but it is the first thing in this program that can cut
+   a sign-in short, and only a live approval taken slowly proves the floor is
+   comfortable. If someone hits it legitimately, raise it — the ceiling is
+   3600.
+4. **Watch how often the Duo pushes actually arrive** now that both automatic
+   sign-ins are on by default and share one `autoreconnect-min-gap`. More than
+   one every five minutes means a bound is wrong, not that the feature is.
+5. **Consider whether `probe-every = 3` is the right frequency** now that a real
    probe costs ~17 ms and one TCP handshake a minute.
-4. Leave the polkit prompt alone unless the user reopens it.
+6. Leave the polkit prompt alone unless the user reopens it.
 
 ---
 
 ## How to work on it
 
 ```bash
-asuvpn selftest                 # 99 checks; run before and after any change
+asuvpn selftest                 # 119 checks; run before and after any change
 tests/sandbox/enter.sh sec.sh   # scenario tests, in a namespace of stand-ins
 ./install.sh                    # copies into ~/.local, runs the self-check
 asuvpn log -f                   # what it is actually doing

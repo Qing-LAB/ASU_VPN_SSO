@@ -195,8 +195,10 @@ stateDiagram-v2
     [*] --> disconnected
     disconnected --> authenticating: connect, reconnect
     failed --> authenticating: connect, reconnect
+    failed --> authenticating: rebuild — a dropped tunnel, autoreconnect on
     authenticating --> connecting: sign-in ok, cookie to the helper
     authenticating --> failed: no saved password, keyring locked, sign-in failed
+    authenticating --> failed: sign-in ran past signin-timeout
     authenticating --> disconnected: cancel, disconnect (no tunnel yet)
     connecting --> connected: tunnel-up (reason=connect)
     connected --> recovering: link-lost (reason=attempt-reconnect)
@@ -237,6 +239,31 @@ the table maps `connect` there to a reconnect rather than a silent refusal.
 (Making it a real state also surfaced a dead spot: the menu's own Reconnect
 on a demoted tunnel used to be silently refused by the busy-state test — the
 table row fixed what the flag had hidden.)
+
+### What the menu offers, and why that list
+
+The menu is a view of the table, not a second opinion about it. Every verb
+shown in a state has a row for that `(state, message)` pair; a verb with no
+row would be a button that logs `ignoring …` and does nothing.
+
+| State | Verbs offered | Why those |
+| --- | --- | --- |
+| `disconnected`, `failed` | Connect | nothing to tear down |
+| `failed`, rebuild owed | Connect, **Stop reconnecting** | something *is* pending, so there has to be a way to call it off that is not "change a setting". The row is `(failed, disconnect)`, which already did exactly this |
+| `authenticating`, `connecting` | Cancel | an attempt is in flight and nothing is established yet |
+| `recovering` | Cancel | openconnect owns the retry; stopping it is abandoning an attempt, not closing a session |
+| `connected`, `demoted` | Disconnect, Reconnect | both are established sessions. Cancel is the wrong word for tearing one down, which is why `demoted` had to become a real state |
+| `disconnecting` | none | teardown must not be interrupted, and there is nothing left to cancel |
+
+That last row is why the separator above the verbs is a field rather than a
+throwaway: with every verb hidden it sat straight against the next one, two
+rules with nothing between them — a menu that looks like it lost its items
+rather than one that has none to give. It is now shown and hidden with them.
+
+Labels follow the state where the same row means two different things.
+**Stop reconnecting** and **Disconnect** are one item and one handler: in
+`failed` there is no tunnel to disconnect, and what the user is stopping is a
+sign-in that has not happened yet.
 
 The machine lives in `class StateMachine`, which `VpnTray` inherits. The
 split is deliberate: the machine declares the exact surface it needs from
@@ -479,7 +506,7 @@ What survives is true of every working tunnel and false of a broken one:
 | `the tunnel device is gone` | `/sys/class/net/<dev>` no longer exists |
 | `the tunnel device was replaced by a different one` | the name is back but the `ifindex` is not the one this session created |
 | `the tunnel device is down` | `IFF_UP` clear |
-| `no routes point at the tunnel any more` | zero routes in `/proc/net/route` and `/proc/net/ipv6_route` — the case DPD cannot see |
+| `no routes point at the tunnel any more` | zero routes in every family that could be read, and at least one could. Not `v4 == 0 and v6 == 0`, which looks like the same test: a kernel built without IPv6 has no `/proc/net/ipv6_route`, so that count is *unreadable* rather than zero and the comparison stayed false through an empty table. Unreadable is still never evidence of a fault. The case DPD cannot see |
 | `the tunnel's IPv4 routes are gone` / `…IPv6…` | a family the tunnel was observed to have, wholly gone — `ip route flush dev X` removes only IPv4, and a summed count sat green through exactly that break on a live tunnel (2026-08-23) |
 
 Every failing check and every recovery carries its facts into the log — a
@@ -544,7 +571,7 @@ interchangeable:
 | --- | --- | --- |
 | `SIGUSR2` to `openconnect` via the control pipe | none — same session | once per incident; `nudge-min-gap`, default 120s, between incidents |
 | stay demoted, say the free option is spent | none | once per incident |
-| full sign-in (`reconnect`) | Duo approval **and** polkit password | `autoreconnect-min-gap`, default 300s, and opt-in |
+| full sign-in (`reconnect`) | Duo approval **and** polkit password | `autoreconnect-min-gap`, default 300s; on by default, and one untick from off |
 
 ```mermaid
 stateDiagram-v2
@@ -554,7 +581,7 @@ stateDiagram-v2
     Demoted --> Nudged: one SIGUSR2, if the last nudge is ≥ nudge-min-gap ago
     Demoted --> Healthy: the demoting source passes
     Nudged --> Healthy: the demoting source passes
-    Nudged --> SignIn: still demoted, autoreconnect on, its gap elapsed
+    Nudged --> SignIn: still demoted, autoreconnect on (the default), gap elapsed
     SignIn --> Healthy: fresh session up (a new tunnel starts with a clean slate)
 ```
 
@@ -563,6 +590,86 @@ These are positions within one incident, not machine states: `Demoted` and
 it), and `SignIn` runs `disconnecting → authenticating → connecting` like
 any other reconnect — the fresh tunnel's `tunnel-up` promotes it, because a
 new tunnel begins with no incident to clear.
+
+### When the tunnel is gone, not merely useless
+
+The ladder above escalates a tunnel that is **up** and useless. A tunnel that
+is **gone** cannot enter it at all — there is no helper to nudge, no device to
+watch, no check to strike — so for a long time `autoreconnect` did nothing
+whatever for the most ordinary break there is. `openconnect` gives up after
+its own `--reconnect-timeout` (300s by default), which any suspend or WiFi
+outage longer than that produces; the applet landed on `failed` and stayed
+there until somebody came back and clicked Connect, with the setting that
+promises otherwise switched on.
+
+The `(failed, rebuild)` row closes that. It is driven by the health tick,
+because `failed` has no events of its own and there is no other timer, and
+three separate bounds are what make retrying safe rather than rude:
+
+| Bound | What it answers |
+| --- | --- |
+| `dropped`, armed only by an exit that followed real traffic | a rejected cookie, a dismissed authorization or an unmatched certificate pin will do the same thing the second time — so they are never retried, and every rebuild has to re-earn the flag the same way |
+| `autoreconnect-min-gap`, shared with the ladder | the two automatic sign-ins cannot add up to more than the user allowed |
+| `MAX_REBUILDS`, three | a network that is down stays down, and spacing alone would keep opening browser windows all afternoon |
+
+The setting is read **at the drop** to arm it, and again before each attempt.
+Those two are not the same reading on purpose: a box ticked hours after a
+tunnel died should not open a browser window for it, while one unticked
+mid-retry should stop the next one. Acting on the newer answer is right in
+exactly the direction where it means doing less.
+
+Two pieces of bookkeeping carry this, and they are cleared by different
+things — which is the part that took two attempts to get right:
+
+| Event | Flag (`dropped`) | Count (`rebuilds`) | Why |
+| --- | --- | --- | --- |
+| Connect, Disconnect, Cancel | cleared | cleared | a human took over; nothing may keep retrying behind them |
+| Reconnect | — | — | `_tr_teardown_reconnect` is shared with the ladder, and clearing from there would let a demotion sign-in refund the drop budget every time round. Nothing is lost: the last row refunds it anyway |
+| the setting turned off | cleared | — | disarmed, not paused. Left armed, ticking the box again hours later opened a browser window for a tunnel that died before lunch |
+| `MAX_REBUILDS` reached | cleared | — | said once, and the badge stops promising a rebuild that is not coming |
+| reaching `connected` | cleared | **kept** | there is a tunnel, so nothing is owed — but every rebuild reaches this line, including the ones whose tunnel falls over seconds later |
+| a session outliving the gap, judged at its death | — | cleared | it did not flap, so whatever produced it worked |
+
+That last pair is the load-bearing one. Refunding the count at `connected`
+instead — which is where it obviously belongs, and where it first went — made
+`MAX_REBUILDS` unreachable against exactly the flap it exists for: connect,
+die, connect, die, one Duo push per gap forever. A tunnel has to *last* to
+earn its attempts back, and how long is already written down as
+`autoreconnect-min-gap`.
+
+Calling one off from the panel needed nothing new in the machine. The
+`(failed, disconnect)` row already cleared both and settled on `disconnected`
+— it is how `asuvpn disconnect` has always stopped a rebuild — the menu
+simply never offered the verb in that state, so the only way to stop one was
+to untick a setting the user may want kept. The item is now shown while a
+rebuild is owed, labelled **Stop reconnecting**: "Disconnect" is the wrong
+word for a tunnel that is already gone, and what is being stopped is a
+sign-in that has not happened yet.
+
+The three ways a rebuild is called off without a state change of its own all
+go through `_disarm`, which rewrites only the badge's trailing promise and
+keeps the failure that caused it. Outside the log that detail is the only
+record of *why*, and it reaches `asuvpn status` as well as the panel.
+
+### The sign-in has to end
+
+`openconnect-sso` opens a browser window and blocks on a Duo approval. Run
+from the menu that is fine — somebody is looking at it. Run from a rebuild it
+is not: with nobody at the keyboard it blocks for as long as the applet
+lives, the badge sits at `authenticating`, the watchdog does not run in that
+state, and only Cancel clears it. So `signin-timeout` (300s, held to
+60–3600, deliberately with no off) kills the sign-in's process group exactly
+the way Cancel does, and the blocking read of its stdout ends on the closed
+pipe — a read that cannot be given a timeout of its own. The attempt is then
+reported as `sign-in did not finish within Ns`, named for what happened
+rather than for the signal it died of.
+
+The waiting itself lives in a module-level `Deadline`, with the kill passed
+in, for the same reason `parse_state_payload` sits at module level: the
+failure it exists to prevent is a wait that never returns, and no test can
+observe that by waiting for it. `asuvpn selftest` drives it against a real
+child that would outlive the whole run, so a deadline that stopped firing
+hangs the suite rather than passing quietly.
 
 A nudge merely *held* by its gap keeps the incident in Demoted — the ladder
 waits it out rather than escalating past it, because jumping to a sign-in
@@ -607,9 +714,15 @@ Teardown always outranks the watchdog: `disconnecting` has no row for a
 verdict or for a reconnect, so nothing the ladder decides can interrupt a
 disconnect or quit already under way.
 
-Automatic sign-in is off unless asked for, via the menu or
-`asuvpn autoreconnect on` — both edit the `autoreconnect` line of
-`asuvpn.conf` in place. The watchdog re-reads that file on every check, so a
+Automatic sign-in is on by default and turned off via the menu or
+`asuvpn autoreconnect off` — both edit the `autoreconnect` line of
+`asuvpn.conf` in place. It is defaulted on rather than opt-in because of
+*where it sits*: the rung is reached only once the free re-establish has been
+spent on this incident and the tunnel is still carrying nothing, which is the
+point at which the only remaining recovery is a human at the keyboard. What
+the setting decides is whether the applet may spend a Duo push to avoid
+needing one; turning it off stops at the demotion instead, which is a real
+preference and stays one line away. The watchdog re-reads that file on every check, so a
 running applet picks up the change without any message passing, and the menu
 checkbox follows the file rather than its own memory. (An earlier mechanism
 used the presence of a marker file; `install.sh` still deletes the leftover.)
@@ -725,7 +838,9 @@ where it can be, checked by `asuvpn selftest`.
 | The cookie never reaches a command line or the log | `--cookie-on-stdin` only | grep the log and the journal |
 | Interposing never costs routing | derive the script, step aside if unusable | environment tier |
 | A stalled tunnel is noticed rather than shown as connected | `--force-dpd`, plus a watchdog for what DPD cannot see | logic tier, and a sandbox scenario where the device never appears |
-| Recovery never costs a Duo push unless asked | `SIGUSR2` first — waited for if rate-limited, never skipped — sign-in only on opt-in | `escalate.sh` **asserts** exactly one nudge and one sign-in over 100s; the held-nudge rule in the logic tier |
+| A tunnel that dies unattended is rebuilt, and a retry never becomes a loop | armed only by an exit that followed real traffic, capped at `MAX_REBUILDS`, sharing the ladder's rate limit | logic tier drives all three bounds on the shipping table, both directions of the setting included |
+| A sign-in always ends | `signin-timeout` kills the process group; the blocking read ends on the closed pipe | logic tier; the setting has no off, so the guarantee has no hole |
+| Recovery never costs a Duo push while a free option remains | `SIGUSR2` first — waited for if rate-limited, never skipped — the sign-in rung is unreachable until the nudge is spent | `escalate.sh` **asserts** exactly one nudge and one sign-in over 100s; the held-nudge rule in the logic tier |
 | openconnect cannot drive the control channel | it is spawned with its own `stdin` pipe | `fdcheck.sh` asserts `/proc/<pid>/fd/0` of the two are distinct (the child's open mode is printed for the reader) |
 | A refusal is reported as a sentence, not a number | `[helper] FATAL ` marker, set by the helper | wiring tier, by running three refused connects |
 | Everything executed as root is unwritable by a second principal | every loader's bootstrap check, the helper's runtime list (exit 26), `install.sh`'s `go-w` sweep | environment tier, by making each file writable in turn, and end to end for a shared group in the sandbox (`sec.sh` b/b2) |
@@ -733,7 +848,7 @@ where it can be, checked by `asuvpn selftest`.
 
 ## How this is tested
 
-Three tiers in `asuvpn-selftest` (99 checks), plus the scenario sandbox in
+Three tiers in `asuvpn-selftest` (119 checks), plus the scenario sandbox in
 [tests/sandbox](tests/sandbox/README.md).
 
 The shaping constraint: **conventional unit tests would not have caught any of
@@ -794,6 +909,13 @@ breaking the code on purpose:
 | teach the stand-in an invented line (`Connected as …`) | the stand-in only speaks lines from the installed catalogue |
 | weaken the log scrubber back to colour codes only | hostile control sequences never reach the log |
 | sum the route families again instead of counting each | a route family the tunnel had, wholly gone, is a verdict |
+| test `v4 == 0 and v6 == 0` again, so an unreadable family hides an empty table | an empty table is a verdict even where IPv6 cannot be read |
+| refund the rebuild count when a tunnel merely reaches connected | a flapping tunnel cannot outrun the rebuild limit |
+| arm the rebuild on any exit, not only one that followed real traffic | a tunnel that never came up is not rebuilt |
+| delete the `(failed, rebuild)` row | no handler is orphaned by the table, plus every rebuild check |
+| drop `_clear_drop` from the cancel row | cancelling a rebuild hands the whole budget back |
+| let `signin-timeout` accept 0, or any value at all | signin-timeout has no off, and no nonsense either |
+| let the deadline watcher return without killing | a sign-in that never finishes is ended, not waited on |
 | let the reconnect event promote a demoted badge | a reconnect event mid-demotion adopts the tunnel but not the badge |
 | let a mid-demotion adoption reset the incident flags | an incident takes one nudge, then says the free option is spent |
 | allow re-nudging within one incident | the same check — after winding the clock past the rate limit, so the flag and not the timestamp is what refuses |

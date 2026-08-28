@@ -55,7 +55,19 @@ say("Connected to 192.0.2.4:443")
 say("CSTP connected. DPD 0, Keepalive 0")     # exactly what ASU negotiates
 run_script("pre-init"); run_script("connect")
 say("Configured as 10.242.7.31, with SSL connected and DTLS connected")
-while not state["stop"]: time.sleep(0.05)
+# FAKE_DIE_AFTER models the real binary giving up: openconnect stops retrying
+# after --reconnect-timeout (300s by default) and exits nonzero, having run
+# the script one last time so the routing table is put back. Any suspend or
+# WiFi outage longer than that produces exactly this, and it is the break the
+# tray's (failed, rebuild) row exists for.
+give_up = float(os.environ.get("FAKE_DIE_AFTER") or 0)
+deadline = time.monotonic() + give_up if give_up else None
+while not state["stop"]:
+    if deadline and time.monotonic() >= deadline:
+        run_script("disconnect")
+        say("[stand-in] gave up reconnecting")
+        sys.exit(1)
+    time.sleep(0.05)
 run_script("disconnect"); say("[stand-in] logout sent")
 say(f"[stand-in] nudges received: {state['nudges']}")
 sys.exit(0)

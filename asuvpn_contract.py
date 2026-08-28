@@ -293,10 +293,12 @@ class Setting:
 SETTINGS = (
     Setting("server", "text", "sslvpn.asu.edu",
             "The VPN endpoint. Set by install.sh --server."),
-    Setting("autoreconnect", "bool", False,
+    Setting("autoreconnect", "bool", True,
             "Sign in again by itself when a stalled tunnel cannot be recovered"
-            " for free. Costs a Duo push and a password each time, so it is off"
-            " unless you ask for it."),
+            " for free. On by default: it is the last rung of the ladder, so it"
+            " is reached only after the free re-establish has been tried and"
+            " demonstrably did not work. Costs a Duo push and a password each"
+            " time it fires -- turn it off to be asked first."),
     Setting("dpd", "int", 30,
             "Seconds between dead-peer probes, forced on because some servers"
             " negotiate detection off and then a dropped tunnel looks connected."
@@ -337,7 +339,18 @@ SETTINGS = (
             "Seconds between asking openconnect to re-establish. Free, but not"
             " something to do every time a check fails."),
     Setting("autoreconnect-min-gap", "int", 300,
-            "Seconds between automatic sign-ins, when autoreconnect is on."),
+            "Seconds between automatic sign-ins, when autoreconnect is on."
+            " One budget, shared: a stalled tunnel's escalation and a dropped"
+            " tunnel's rebuild both spend it, so neither can starve the other"
+            " of the gap the user asked for."),
+    Setting("signin-timeout", "int", 300,
+            "Seconds a sign-in may take before it is abandoned. It opens a"
+            " browser window and waits on a Duo approval, so this is generous"
+            " -- but it has to end: a rebuild that runs with nobody at the"
+            " keyboard would otherwise sit in Signing in... behind a login"
+            " window forever, and only Cancel would clear it. Held to"
+            " 60-3600; there is deliberately no off.",
+            minimum=60, maximum=3600),
     Setting("teardown-timeout", "int", 75,
             "Seconds to wait for the helper to finish. Must outlast its own"
             " signal escalation of 15 + 10 + 5 plus the routing check after,"

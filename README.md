@@ -177,21 +177,24 @@ connect.
 | Setting | Default | What it decides |
 | --- | --- | --- |
 | `server` | `sslvpn.asu.edu` | The endpoint. Set by `install.sh --server`. |
-| `autoreconnect` | `off` | Sign in again unattended when a stall cannot be fixed for free. Costs a Duo push and a password. |
+| `autoreconnect` | `on` | Let the applet sign in again by itself — both when a stalled tunnel cannot be freed and when one has died outright. It is always the last thing tried, never the first, and it costs a Duo push and a password when it fires. |
 | `dpd` | `30` | Dead-peer probe interval, forced on. **`0` leaves the server's choice alone** — the escape hatch if forcing it ever misbehaves. |
 | `health-interval` | `20` | Seconds between checks. **`0` turns the watchdog off** — the config file is still re-read at the default cadence, so turning it back on needs no restart. |
 | `health-strikes` | `2` | Consecutive bad checks before the badge stops claiming Connected. |
 | `probe` | `on` | Ask the network whether traffic still flows. The only check that catches a tunnel that looks perfect and delivers nothing. |
 | `probe-target` | *(empty)* | Address to probe. Empty means the resolver the VPN itself pushed. |
 | `probe-port`, `probe-every`, `probe-timeout` | `53`, `3`, `5` | Port (1–65535; 0 would blind the probe and is refused), how often, how long to wait (the wait is capped at 120). |
-| `nudge-min-gap` | `120` | Seconds between free re-establish requests. |
-| `autoreconnect-min-gap` | `300` | Seconds between unattended sign-ins. |
+| `nudge-min-gap` | `120` | Seconds between free re-establish requests — the recovery that costs you nothing. |
+| `autoreconnect-min-gap` | `300` | Seconds between unattended sign-ins. One budget, shared by both kinds, so they cannot add up to more than you allowed. |
+| `signin-timeout` | `300` | How long a sign-in may take before it is given up on. **No off switch** (60–3600 only): an unattended one must never be able to sit behind a browser window forever. |
 | `teardown-timeout` | `75` | Seconds to wait for the helper. Must outlast its signal escalation, so values below 35 are refused and the default used. |
 | `log-max-kb` | `4096` | Size the session log may reach before it is rotated. **`0` never rotates on size.** |
 | `log-keep` | `3` | Rotated logs kept as `session.log.1`, `.2`, … Connecting rotates too, so this is also how many past sessions survive. `0` keeps none; capped at 99. |
 
 `asuvpn autoreconnect on` edits the file in place, changing that one line and
-leaving everything else as you left it.
+leaving everything else — comments included — as you left it. Most settings
+are re-read on every health check, so a change takes effect within seconds
+rather than at the next connect.
 
 ### The command line
 
@@ -696,31 +699,124 @@ A routes-lost incident reads like this:
 
 #### What it does about it
 
-Cheapest first, because the two recoveries are not interchangeable:
+Two different things can go wrong, and they need different answers:
 
-1. **Nudge.** Send `openconnect` a `SIGUSR2`, which it documents as forcing "an
-   immediate disconnection and reconnection". The session is reused, so this
-   costs no sign-in, no Duo push and no password — you need not even be at the
-   keyboard. One nudge per incident: if the tunnel is demoted again after its
-   nudge, the nudge demonstrably did not fix it, and asking every two minutes
-   forever is what a routes-lost tunnel actually got before this rule.
-2. **Say so.** The badge leaves *Connected*, so `asuvpn status` stops exiting 0,
-   and one notification per incident explains what was observed.
-3. **Sign in again — only if you asked for it.** Off by default, because it
-   means a Duo approval and typing your password into a polkit dialog.
+| What happened | What is left to work with | What the applet does |
+| --- | --- | --- |
+| The tunnel is **up but useless** — routes wiped, or a black hole | a live `openconnect`, a device, a session cookie | the ladder: nudge, then say so, then sign in again |
+| The tunnel is **gone** — `openconnect` gave up and exited | nothing at all | rebuild it from scratch, up to three times |
 
-```bash
-asuvpn autoreconnect          # on or off
-asuvpn autoreconnect on
+##### When the tunnel is up but useless
+
+Cheapest first, because the two recoveries are not interchangeable — one is
+free and one costs you a Duo approval:
+
+1. **Nudge it.** Send `openconnect` a `SIGUSR2`. It documents this as forcing
+   "an immediate disconnection and reconnection", and it reuses the session
+   cookie — so there is no sign-in, no Duo push and no password. You need not
+   even be at the keyboard.
+
+   One nudge per incident. If the tunnel is demoted again *after* its nudge,
+   the nudge demonstrably did not fix it, and asking again every two minutes
+   is what a routes-lost tunnel actually got before this rule.
+
+2. **Say so.** The badge leaves *Connected*, so `asuvpn status` stops exiting
+   0, and one notification explains what was seen. The menu still offers
+   Disconnect and Reconnect, because the tunnel is established — just not
+   usable.
+
+3. **Sign in again.** On by default. By the time this step is reached the free
+   option has been tried and the tunnel is *still* carrying nothing, so the
+   only thing left is a fresh session. It costs a Duo approval and a password,
+   so it happens at most once every five minutes.
+
+Picking up where the log above left off — the nudge has been sent, and the
+routes still have not come back:
+
+```
+[tray] tunnel device check 2/2: the tunnel's IPv4 routes are gone (dev=asuvpn0, routes4=0, routes6=6)
+[tray] the tunnel is not usable: the tunnel's IPv4 routes are gone
+[tray] the free re-establish was already tried for this incident and traffic did not return
+[tray] signing in again to rebuild the tunnel
 ```
 
-or the menu item **Reconnect automatically if traffic stops**. When on, it is
-rate limited to once every five minutes.
+Every pass logs the decision it took *and* the reason, including the passes
+that decide to do nothing — "holding the free re-establish for another 47s",
+"automatic sign-in is off". A log that shows verdicts but never decisions
+reads as a hang, which is exactly how the first live routes-lost break read.
 
-An automatic reconnect does **not** truncate the session log, so the lines
-explaining why it happened survive it — a connect you asked for still starts a
-fresh log. While the badge shows *not carrying traffic* the menu still offers
-Disconnect and Reconnect, because the tunnel is established, just not usable.
+##### When the tunnel is gone
+
+`openconnect` retries on its own for five minutes and then gives up. Any
+suspend, or any WiFi outage longer than that, ends this way. There is now no
+tunnel to nudge and no device to watch, so the ladder above cannot help — the
+applet signs in again from scratch instead.
+
+```
+[tray] connection dropped
+[tray] rebuilding it shortly
+[tray] rebuilding the dropped tunnel (attempt 1 of 3)
+[tray] ---- reconnecting; the lines above say why ----
+[tray] authenticating to sslvpn.asu.edu via /home/you/.local/bin/openconnect-sso
+```
+
+If the network never comes back, it stops — and says so rather than going
+quiet:
+
+```
+[tray] the tunnel did not come back in 3 attempts; waiting to be asked
+```
+
+Four rules keep that from becoming a nuisance:
+
+- **Only a tunnel that was working gets rebuilt.** If it never came up at all,
+  something is wrong that a second attempt will not fix — a rejected cookie, a
+  dismissed password prompt — and retrying just repeats the browser window and
+  the Duo push.
+- **Three attempts, then it stops** and says so once. A network that is down
+  stays down; spacing the attempts out is not the same as bounding them.
+- **What earns the attempts back is a session that lasted.** A tunnel that
+  outlives the five-minute gap did not flap, so its next death starts with a
+  fresh three. This is the difference between recovering all day from real
+  outages and firing a Duo push every five minutes at a link that comes up and
+  falls straight over.
+- **Anything you do yourself takes over.** Connect, Cancel, or Disconnect —
+  from the menu or the command line — calls off whatever was pending.
+
+While a rebuild is owed, the badge says so and the menu offers **Stop
+reconnecting**, which calls it off without touching your settings:
+
+```console
+$ asuvpn status
+ASU VPN: Not connected (sslvpn.asu.edu) — connection dropped; rebuilding
+$ asuvpn disconnect          # the same thing from the command line
+ASU VPN: Disconnected (sslvpn.asu.edu)
+```
+
+##### Turning it off
+
+```bash
+asuvpn autoreconnect          # show the current setting
+asuvpn autoreconnect off      # or use the menu checkbox
+```
+
+The menu item is **Reconnect automatically if traffic stops**. Off, the applet
+stops at the diagnosis: the badge leaves *Connected*, the notification says
+what was seen, and nothing asks you for a password until you pick Connect or
+Reconnect yourself.
+
+##### Two smaller guarantees
+
+**A sign-in always ends.** `openconnect-sso` opens a browser window and waits
+for a Duo approval. That is fine when you clicked Connect and are watching it;
+it is not fine when the applet started it and nobody is there. `signin-timeout`
+(five minutes, and there is deliberately no way to switch it off) ends one that
+never finishes, so the applet cannot be left stuck in *Signing in…* behind a
+login window nobody is looking at.
+
+**An automatic reconnect does not wipe the log.** The lines explaining *why* it
+happened are the only record of a break that was silent by definition. A
+connect you asked for still starts a fresh log.
 
 ### The control pipe
 
@@ -987,8 +1083,8 @@ the middle one is the point:
 
 | Tier | What it checks |
 | --- | --- |
-| `logic` | Pure functions and the state machine: the option blocklist, interface-name validation, `--interface`/`--script` parsing, the permission rules, state-payload parsing, the transition table driven with real message sequences, and that `openconnect`'s output cannot forge a helper message |
-| `environment` | Our assumptions put to the installed binaries — that `openconnect` exists, that the `vpnc-script` it names is executable and handles every `reason` we send, that our fallback log patterns still appear in its message catalogue, and that nothing the helper runs as root is writable by anyone else |
+| `logic` | Pure functions and the state machine: the option blocklist, interface-name validation, `--interface`/`--script` parsing, the permission rules, state-payload parsing, the transition table driven with real message sequences, the rebuild bounds, the sign-in deadline against a child that would outlive the run, and that `openconnect`'s output cannot forge a helper message |
+| `environment` | Our assumptions put to the installed binaries — that `openconnect` exists, that it *gives up retrying* rather than trying forever (the fact the rebuild rests on, read back out of its own `--help`), that the `vpnc-script` it names is executable and handles every `reason` we send, that our fallback log patterns still appear in its message catalogue, and that nothing the helper runs as root is writable by anyone else |
 | `wiring` | `asuvpn-notify` actually executed: the event arrives with the right token and fields, the real `vpnc-script` still runs with its environment intact, the token is scrubbed before it sees it, and no event can emit more than one line |
 
 The environment tier reads the installed `libopenconnect`'s own strings, so
@@ -1129,13 +1225,14 @@ the measured window.
 The stand-in exercises earlier in this section — the launch races, the exit
 code sweep, the arbitrary-directory installs — predate the committed suite
 and were run with the same fakes before the harness moved into the
-repository; the twelve committed scenarios are the ones tabulated in
+repository; the thirteen committed scenarios are the ones tabulated in
 [tests/sandbox](tests/sandbox/README.md).
 
 What is proven live against the real gateway (full connects and teardowns,
 forced-DPD safety, free recovery through WiFi loss and suspend, the nudge)
-versus only in the sandbox (the full escalation ladder including the opt-in
-sign-in, the shared-group refusal) is kept, with dates and evidence, in
+versus only in the sandbox (the full escalation ladder including the
+unattended sign-in, the shared-group refusal) is kept, with dates and evidence,
+in
 [HANDOVER.md](HANDOVER.md) — that ledger, not this paragraph, is current.
 
 ## License
