@@ -20,7 +20,7 @@ Everything is committed and pushed to `main` at
 | Programs | `asuvpn-tray` (you), `asuvpn-helper` (root, via pkexec), `asuvpn-notify` (root, run by openconnect), `asuvpn-selftest` (you) |
 | Shared | `asuvpn_contract.py` — loaded by explicit path, never imported |
 | Settings | `~/.config/asuvpn/asuvpn.conf`, generated from the contract's schema |
-| Checks | `asuvpn selftest` — 99, in three tiers; scenario suite in [tests/sandbox](tests/sandbox/README.md), every scenario asserting its outcome |
+| Checks | `asuvpn selftest` — 124, in three tiers; scenario suite in [tests/sandbox](tests/sandbox/README.md), every scenario asserting its outcome |
 | Analysers | ruff, pyflakes, pylint, mypy, bandit, vulture, shellcheck — all clean |
 | Tested against | openconnect v9.12-3.3, Ubuntu, GNOME, ASU's `sslvpn.asu.edu` |
 
@@ -78,6 +78,13 @@ not, and each cost a round of rework.
   outlive the whole run. A wait that never returns cannot be observed by
   waiting for it, so `Deadline` takes its kill as an argument and the check
   hangs the suite rather than passing quietly if it ever stops firing.
+- **The helper dying takes openconnect with it** (2026-08-28): `pdeath.sh`
+  SIGKILLs the helper mid-tunnel and asserts the stand-in openconnect dies
+  within five seconds — the kernel parent-death signal proven end to end,
+  where before only the tray-death direction had a scenario.
+- **The nudge's delivery** (2026-08-28): `watchdog-test.sh` now asserts the
+  stand-in's own SIGUSR2 telemetry, not just the tray's intent line — the
+  verb crossing the pipe and becoming a signal was previously unproven.
 - The teardown ladder's **order** (2026-08-24): `stubborn.sh` stages a peer
   that ignores SIGINT and asserts SIGTERM comes only after the full grace and
   SIGKILL not at all. Live teardowns had only ever exercised the first rung.
@@ -308,7 +315,7 @@ others use `abspath`, and the reference copy in the contract says which.
 ## How to work on it
 
 ```bash
-asuvpn selftest                 # 119 checks; run before and after any change
+asuvpn selftest                 # 124 checks; run before and after any change
 tests/sandbox/enter.sh sec.sh   # scenario tests, in a namespace of stand-ins
 ./install.sh                    # copies into ~/.local, runs the self-check
 asuvpn log -f                   # what it is actually doing

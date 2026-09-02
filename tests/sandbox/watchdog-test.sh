@@ -20,7 +20,13 @@ echo "  --- log ---"
 grep -E 'force-dpd|not usable|re-establish|SIGUSR2|tunnel check|healthy again|STATE' \
   "$LOG" | sed 's/^/    /'
 nudges=$(grep -cF '[tray] asked openconnect to re-establish' "$LOG")
+# Delivery, not just intent: the tray logs its line on a successful pipe
+# write, before the helper acts. The stand-in's telemetry proves the verb
+# crossed the pipe, became SIGUSR2, and arrived — with that line absent,
+# the free rung of the ladder is dead and every incident costs a Duo push.
+delivered=$(grep -cF '[stand-in] SIGUSR2 received' "$LOG")
 must_contain "the badge stayed demoted" "$s" "not carrying traffic"
 [ "$nudges" = 1 ] || { echo "  FAIL: expected exactly one nudge, got $nudges" >&2; exit 1; }
-echo "  PASS: demoted on a gone device, one nudge, and demoted it stayed"
+[ "$delivered" -ge 1 ] || { echo "  FAIL: the nudge was logged but never reached openconnect" >&2; exit 1; }
+echo "  PASS: demoted on a gone device, one nudge — delivered — and demoted it stayed"
 exit 0

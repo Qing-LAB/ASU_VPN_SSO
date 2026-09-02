@@ -664,6 +664,11 @@ class StateMachine:
     rebuilds: int
     last_nudge: float
     last_autoreconnect: float
+    # Values, not bare annotations, unlike their neighbours: pylint only
+    # believes a member exists when something assigns it, and these three are
+    # only ever read or bumped inside the machine. Their zeros are also truly
+    # the state of a machine that has not run — every host re-initializes
+    # them anyway.
     helper_generation = 0
     auth_generation = 0
     helper_spoke = False
@@ -864,7 +869,12 @@ class StateMachine:
             return
         message = data["reason"]
         self.log(f"[tray] {message}")
-        self._set_state(FAILED, message)
+        # A failed *rebuild* attempt still owes the next one, and the badge's
+        # promise has to say so between attempts — the rule is "; rebuilding"
+        # while one is owed, and a sign-in that timed out unattended is
+        # exactly the moment nobody is watching the log.
+        self._set_state(FAILED, message + REBUILDING if self.dropped
+                        else message)
         self.notify("Sign-in failed", message)
 
     # -- rows: what the tunnel reports
@@ -887,7 +897,7 @@ class StateMachine:
         self._adopt_tunnel(data["device"], data["address"], data["dns"])
 
     def _tr_link_lost(self, _data):
-        self._announce_link_lost("link lost, retrying")
+        self._announce_link_lost()
 
     def _tr_still_recovering(self, _data):
         # openconnect retries emit attempt-reconnect on every attempt; one
@@ -1245,14 +1255,14 @@ class StateMachine:
         where = f"{self.server} — {address}".strip(" —")
         self.notify("VPN connected" if first else "VPN reconnected", where)
 
-    def _announce_link_lost(self, detail):
+    def _announce_link_lost(self):
         """openconnect has lost the link and is re-establishing it itself.
 
         Worth saying out loud. Nothing else tells the user, a badge changing to
         a spinner is easy to miss, and the reassuring half — that this costs no
         sign-in and no password — is not something a spinner can convey.
         """
-        self._set_state(RECOVERING, detail)
+        self._set_state(RECOVERING, "link lost, retrying")
         self.notify("VPN connection lost",
                     f"{self.server} — reconnecting, no sign-in needed",
                     icon="dialog-warning-symbolic")
@@ -1761,14 +1771,18 @@ class VpnTray(StateMachine):
         explaining *why* are the only record of a breakage that was silent by
         definition.
         """
+        # While a rebuild is owed, even a sign-in that cannot start keeps the
+        # badge's trailing promise: the next attempt is still coming, and
+        # dropping the suffix here read as the applet having given up.
+        owed = REBUILDING if self.dropped else ""
         sso = find_openconnect_sso()
         if not sso:
-            self._set_state(FAILED, "openconnect-sso not found")
+            self._set_state(FAILED, "openconnect-sso not found" + owed)
             self.log("[tray] cannot find openconnect-sso on PATH or in ~/.local/bin")
             self.notify("Cannot start", "openconnect-sso is not installed.")
             return
         if not os.access(HELPER, os.X_OK):
-            self._set_state(FAILED, "helper not executable")
+            self._set_state(FAILED, "helper not executable" + owed)
             self.log(f"[tray] helper is missing or not executable: {HELPER}")
             return
 
@@ -2312,8 +2326,6 @@ class VpnTray(StateMachine):
     # ------------------------------------------------------------ teardown
 
     def _close_helper_stdin(self, proc):
-        if proc is None:
-            return
         # Two teardown paths can arrive together (Disconnect then Quit), and a
         # write to a pipe the other one just closed raises ValueError, not
         # OSError — which would escape and strand the applet mid-teardown.

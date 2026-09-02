@@ -230,6 +230,10 @@ if [ "$INSTALL_DEPS" -eq 1 ]; then
     warn "not a Debian/Ubuntu system; install these yourself, then re-run with --no-deps:"
     printf '        %s\n' "${APT_RUNTIME[@]}" "${APT_BUILD[@]}" "${APT_QT[@]}" \
                           "polkit (pkexec)" "python$PY" >&2
+    # --no-deps changes nothing on the system, by promise — so the extension
+    # toggle it skips has to be somebody's job here:
+    warn "on GNOME, also enable the AppIndicator extension yourself:"
+    warn "    gnome-extensions enable ubuntu-appindicators@ubuntu.com"
     # Everything past here assumes $PYBIN exists, and pipx would fail with a far
     # less useful message than the list just printed.
     die "cannot continue automatically on this distribution"
@@ -256,10 +260,13 @@ if [ "$INSTALL_DEPS" -eq 1 ]; then
   ensure_python
   install_openconnect_sso
   [ -n "$tray_ext" ] && NEEDS_RELOGIN=1
+  # Inside the dependency pass on purpose: this writes a dconf setting, and
+  # the README promises that --no-deps changes nothing on the system — the
+  # binding check below only reads, so it stays outside.
+  enable_extension
 fi
 
 verify_bindings
-enable_extension
 
 say "installing the app, the launcher and the asuvpn command"
 bash "$SRC_DIR/install.sh" --server "$SERVER" "${INSTALL_ARGS[@]+"${INSTALL_ARGS[@]}"}"

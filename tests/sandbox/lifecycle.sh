@@ -18,8 +18,9 @@ s="$("$A" status)"; echo "  after probes : $s"
 await_status "Disconnected" 60 "disconnected on request"
 "$A" quit >/dev/null 2>&1; wait "$T" 2>/dev/null
 echo "  --- anything the watchdog complained about? ---"
-grep -E 'check |not usable|FATAL|previous tunnel|signing in' "$LOG" \
-  | sed 's/^/    /' || echo "    nothing (healthy throughout)"
+complaints=$(grep -E 'check |not usable|FATAL|previous tunnel|signing in' "$LOG")
+if [ -n "$complaints" ]; then printf '%s\n' "$complaints" | sed 's/^/    /'
+else echo "    nothing (healthy throughout)"; fi
 must_contain "still connected across the probe window" "$s" "Connected"
 # A negative grep over a missing file passes vacuously, so the log's
 # existence is asserted first — and the reconnect above rotated it, so the

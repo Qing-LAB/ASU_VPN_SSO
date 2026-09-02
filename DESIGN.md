@@ -196,6 +196,7 @@ stateDiagram-v2
     disconnected --> authenticating: connect, reconnect
     failed --> authenticating: connect, reconnect
     failed --> authenticating: rebuild — a dropped tunnel, autoreconnect on
+    failed --> disconnected: disconnect (also how a pending rebuild is called off)
     authenticating --> connecting: sign-in ok, cookie to the helper
     authenticating --> failed: no saved password, keyring locked, sign-in failed
     authenticating --> failed: sign-in ran past signin-timeout
@@ -228,6 +229,12 @@ state, and so is the tray's own failure-scan sentence (`problem` — built
 from openconnect's output, not sent by the helper). A `cancel` — or a
 `disconnect`, which reaches the same handler — during `authenticating`
 normally ends in `disconnected`: the sign-in has no tunnel to tear down.
+Rows that stay in place (a fresh address while `connected`, a repeat
+link-lost while `recovering`, disconnect while already `disconnected`) are
+not drawn either — the `demoted` self-loop is, because adopting without
+promoting is the rule the diagram exists to show. And a connect that cannot
+even start (no `openconnect-sso` to run) lands straight in `failed`,
+skipping `authenticating`.
 
 `RECOVERING` (openconnect re-establishing its own session) and `DEMOTED`
 (established but not carrying traffic — the watchdog's verdict) used to hide
@@ -829,10 +836,10 @@ where it can be, checked by `asuvpn selftest`.
 | Invariant | Enforced by | Checked by |
 | --- | --- | --- |
 | `openconnect` always gets to run `vpnc-script` on the way out | escalation ladder, output relay, `PR_SET_PDEATHSIG` | teardown scenarios in the sandbox; `stubborn.sh` asserts the ladder's *order* against a peer that ignores `SIGINT` — `SIGTERM` only after the grace, `SIGKILL` not at all |
-| No root process outlives the tray | control pipe, `PR_SET_PDEATHSIG`, no `--background` | `SIGKILL` the tray and look for survivors |
+| No root process outlives the tray | control pipe, `PR_SET_PDEATHSIG`, no `--background` | `SIGKILL` the tray and look for survivors; `pdeath.sh` SIGKILLs the *helper* and asserts openconnect died with it |
 | Only a device this session created is ever deleted | ifindex ownership, free-name selection | `--interface <existing>` is refused (exit 23, wiring tier), and the logic tier drives `verify_teardown` both ways: a foreign ifindex is left alone, our own is deleted |
 | A device name never reaches the filesystem or `ip` unvalidated | `INTERFACE_RE`, checked at both ends — where produced and where consumed | logic + wiring tiers, with traversal and whitespace payloads |
-| `openconnect` cannot forge a helper message | `[vpn] ` prefix on every relayed line | wiring tier, with `\r` and `\n` payloads |
+| `openconnect` cannot forge a helper message | `[vpn] ` prefix on every relayed line | logic tier, with `\r` and `\n` payloads |
 | A state event cannot inject a line or a field | reject impossible device names; collapse every field to one token | wiring tier, with space-and-`=` payloads |
 | Only this user can drive the applet, and only this user's applet answers | `SO_PEERCRED` at both ends, failing closed | `ipc-gate.sh` stages a real second uid: refused with no reply, logged with the uid — and the same poke from our own uid answered, so the refusal is not vacuous |
 | The cookie never reaches a command line or the log | `--cookie-on-stdin` only | grep the log and the journal |
@@ -840,7 +847,7 @@ where it can be, checked by `asuvpn selftest`.
 | A stalled tunnel is noticed rather than shown as connected | `--force-dpd`, plus a watchdog for what DPD cannot see | logic tier, and a sandbox scenario where the device never appears |
 | A tunnel that dies unattended is rebuilt, and a retry never becomes a loop | armed only by an exit that followed real traffic, capped at `MAX_REBUILDS`, sharing the ladder's rate limit | logic tier drives all three bounds on the shipping table, both directions of the setting included |
 | A sign-in always ends | `signin-timeout` kills the process group; the blocking read ends on the closed pipe | logic tier; the setting has no off, so the guarantee has no hole |
-| Recovery never costs a Duo push while a free option remains | `SIGUSR2` first — waited for if rate-limited, never skipped — the sign-in rung is unreachable until the nudge is spent | `escalate.sh` **asserts** exactly one nudge and one sign-in over 100s; the held-nudge rule in the logic tier |
+| Recovery never costs a Duo push while a free option remains | `SIGUSR2` first — waited for if rate-limited, never skipped — the sign-in rung is unreachable until the nudge is spent | `escalate.sh` **asserts** exactly one nudge and one sign-in over 115s; the held-nudge rule in the logic tier |
 | openconnect cannot drive the control channel | it is spawned with its own `stdin` pipe | `fdcheck.sh` asserts `/proc/<pid>/fd/0` of the two are distinct (the child's open mode is printed for the reader) |
 | A refusal is reported as a sentence, not a number | `[helper] FATAL ` marker, set by the helper | wiring tier, by running three refused connects |
 | Everything executed as root is unwritable by a second principal | every loader's bootstrap check, the helper's runtime list (exit 26), `install.sh`'s `go-w` sweep | environment tier, by making each file writable in turn, and end to end for a shared group in the sandbox (`sec.sh` b/b2) |
@@ -848,7 +855,7 @@ where it can be, checked by `asuvpn selftest`.
 
 ## How this is tested
 
-Three tiers in `asuvpn-selftest` (119 checks), plus the scenario sandbox in
+Three tiers in `asuvpn-selftest` (124 checks), plus the scenario sandbox in
 [tests/sandbox](tests/sandbox/README.md).
 
 The shaping constraint: **conventional unit tests would not have caught any of
@@ -947,6 +954,17 @@ breaking the code on purpose:
 | drift the installers' hand-copied server default | the shell installers' server default matches the schema |
 | count the log's size meter in characters again | the log-write-path check, its size-meter half |
 | return the first `--force-dpd` instead of the last | the last `--force-dpd` wins, like every other option reader |
+| drop the badge's rebuilding suffix from a failed sign-in | a failed rebuild attempt keeps the badge's promise |
+| drop the suffix from a sign-in that cannot even start | a rebuild's failed start keeps the badge's promise |
+| delete the stale-attempt guard on the sign-in's success row | a superseded sign-in cannot start a tunnel |
+| delete the stale-attempt guard on its failure row | a superseded failure report changes nothing either |
+| let a clear leave the strike count standing | a clear resets the strike count; blips do not accumulate |
+| gate the failure scan behind the event latch again | a failure sentence is scrubbed — driven with events latched |
+| map every helper message to NOTE, warnings included | a deliberate event-channel close is silent (its kind-counting half) |
+| silence the no-default-route warning after teardown | a teardown that left no default route says so |
+| drop the `preexec_fn` that arms the parent-death signal | `pdeath.sh`: openconnect outlived its dead helper |
+| drop `asuvpn-notify` from the helper's refusal tuple | `sec.sh` (e2): a world-writable notify executed |
+| drop the reconnect verb from the control channel | `watchdog-test.sh`: the nudge was logged but never delivered |
 | revert the interface regex to `$`, so a trailing newline passes | unusable interface names are rejected (twice: the name lists, and the health-path leak check) |
 | drop the probe-port floor from the schema | settings parse by type, and the problems count |
 | widen the config regeneration back to every read error | one setting changes; the rest of the file is the user's |
@@ -1018,9 +1036,12 @@ loop. A command in neither is answered with `unknown command`, which is what a
 CLI-only command such as `selftest` or `log` should be — those are intercepted
 in `main()` before any applet is contacted.
 
-**Blocking another `openconnect` option.** `UNSUPPORTED_OPTIONS` for long forms,
-`BUNDLED_SHORT_RE` already refuses bundles wholesale. Add a case to the
-self-test's `refuse` list.
+**Blocking another `openconnect` option.** Add both spellings to
+`UNSUPPORTED_OPTIONS` — the long form *and* its lone short form, the way
+`-b` sits beside `--background`. `BUNDLED_SHORT_RE` refuses bundles
+wholesale, but a bare short option sails past it, so listing only the long
+form leaves the one-letter door open. Add a case to the self-test's
+`refuse` list.
 
 **Before committing.** `asuvpn selftest`, then the linters listed in the
 README's [Checking it](README.md#checking-it) section. All are expected to be

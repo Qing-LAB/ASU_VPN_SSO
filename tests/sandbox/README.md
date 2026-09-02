@@ -95,15 +95,16 @@ staged HOME, the proven tray start, the assertion helpers) lives in
 
 | Scenario | What it proves | Display needed |
 | --- | --- | --- |
-| `sec.sh` | the permission refusals, on the real helper: world-writable, group-shared, directory, symlink swap — each refused before anything executed, and the normal contrast case NOT refused | no |
+| `sec.sh` | the permission refusals, on the real helper: world-writable, group-shared, directory, symlink swap, and the notify script openconnect itself executes — each refused before anything ran, and the normal contrast case NOT refused | no |
 | `sec2.sh` | staging positive-control: the `chgrp` to a second group really takes | no |
 | `sec3.sh` | negative dpd refused with its documented exit 27; 0 means "leave the server alone"; a normal value reaches openconnect's command line | no |
 | `fdcheck.sh` | openconnect's stdin is not the helper's control pipe, so it cannot inject control verbs (fails if it finds no subject to inspect) | no |
+| `pdeath.sh` | the helper is SIGKILLed mid-tunnel and openconnect must die with it — the kernel parent-death signal, the guard for the one supervisor the control pipe cannot cover | no |
 | `stubborn.sh` | the teardown ladder's *order*, against a stand-in that ignores SIGINT: SIGINT first, SIGTERM only after the full grace, never SIGKILL against a peer that yields — and a clean exit 0 at the end | no |
 | `lifecycle.sh` | connect → reconnect → probes → disconnect → quit, the state asserted at each step, and a healthy tunnel never demoted | yes |
 | `discon.sh` | a demoted tunnel still disconnects cleanly: exit 0 and a Disconnected badge (`FAKE_DEAF=1` ignores nudges) | yes |
 | `escalate.sh` | the watchdog's ladder: exactly one nudge, then — with autoreconnect on — exactly one full sign-in | yes |
-| `watchdog-test.sh` | a gone device: strikes → demotion → exactly one nudge; the reconnect event adopts the tunnel but the badge stays demoted | yes |
+| `watchdog-test.sh` | a gone device: strikes → demotion → exactly one nudge, its *delivery* proven by the stand-in's SIGUSR2 telemetry; the reconnect event adopts the tunnel but the badge stays demoted | yes |
 | `blackhole.sh` | device and routes healthy, probe target silent → demoted with the probe named in the verdict, one nudge, and a badge that stays demoted because only the probe can promote it | yes |
 | `rebuild.sh` | a tunnel that dies outright (`FAKE_DIE_AFTER` models openconnect giving up after its own reconnect timeout) is signed in again unasked — and, because every rebuilt tunnel here dies too, capped at `MAX_REBUILDS` attempts with the give-up said once | yes |
 | `contract-test.sh` | the config file drives the helper (`--force-dpd 45` on the real command line) and the CLI autoreconnect toggle lands back in the file | yes |
@@ -118,8 +119,9 @@ Scenarios still print what happened for a reader; the assertions are what
 make a run mean something. The `sec.sh` assertions are mutation-verified:
 neutering the contract's group predicate makes (b2) fail, and neutering the
 loader's inline check as well makes (b) fail. The `lib.sh` helpers'
-failure paths are exercised too — a `must_contain` miss and an
-`await_status` timeout both exit 1, checked against a stub.
+failure paths were exercised against a stub when they landed — a
+`must_contain` miss and an `await_status` timeout both exit 1 — a one-off
+verification, not a standing check.
 
 ## What a pass here does and does not claim
 

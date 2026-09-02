@@ -2,7 +2,7 @@
 SB="$(cd "$(dirname "$0")" && pwd)"
 # shellcheck source=tests/sandbox/lib.sh
 . "$SB/lib.sh"; sandbox_guard
-export HOME="$SB/home"; mkdir -p "$SB/home"
+export HOME="$SB/home"
 mkfifo "$SB/ctl" 2>/dev/null; exec 9<>"$SB/ctl"
 printf 'FAKECOOKIE\n' >&9
 "$SB/app/asuvpn-helper" --host https://x --fingerprint pin-sha256:x <"$SB/ctl" >/dev/null 2>&1 &

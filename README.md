@@ -105,12 +105,20 @@ openconnect-sso --server sslvpn.asu.edu --authenticate=shell
 
 Launching the app connects straight away:
 
-1. `openconnect-sso` opens a browser window for the ASU sign-in, including Duo.
-2. A polkit dialog asks for **your own** password, because `openconnect` needs
-   root to create the tun device. This replaces the terminal `sudo` prompt you
-   get from `openconnect-sso` on its own — a desktop launcher has no terminal to
-   type into. You are asked once per connect, and never to disconnect.
+1. A browser window opens for the ASU sign-in, Duo push included — that is
+   `openconnect-sso` doing the login.
+2. The system asks for **your own** password, in the same dialog software
+   updates use (polkit). One step of building the tunnel — creating the
+   virtual network device — needs administrator rights, and this dialog is
+   how a desktop app asks for them (a terminal `sudo` prompt would have
+   nowhere to appear). You are asked once per connect, and never to
+   disconnect.
 3. The tunnel stays up in the background.
+
+End to end, a first connect looks like this: click **ASU VPN** → browser
+window appears → sign in and approve the Duo push → browser closes →
+password dialog → a **VPN connected** notification with the address you were
+assigned. From then on, the panel icon is the whole interface.
 
 ### The panel icon
 
@@ -123,8 +131,11 @@ Launching the app connects straight away:
 
 The menu shows only what applies to the current state: **Connect** when down,
 **Disconnect** and **Reconnect** when up, and **Cancel** while signing in or
-connecting. It is not offered during teardown, which must not be interrupted.
-**Show log…** opens a live log window, and **Quit** closes the tunnel first.
+connecting. While the applet is waiting to retry a connection that dropped,
+**Stop reconnecting** appears — it calls the retries off without changing any
+setting. Nothing can be cancelled during teardown, which must not be
+interrupted. **Show log…** opens a live log window, and **Quit** closes the
+tunnel first.
 
 **Start on login (applet only)** puts the icon in your tray at login without
 connecting — so you are not met with a Duo push before you have asked for one.
@@ -142,7 +153,8 @@ matters raises a desktop notification:
 | **VPN not carrying traffic** | the watchdog's free re-establish did not help, or could not be tried | — |
 | **VPN reconnecting** | `openconnect` was nudged to rebuild the tunnel | nothing — same session |
 | **VPN carrying traffic again** | the tunnel recovered | — |
-| **VPN signing in again** | the nudge did not help and automatic reconnection is on | **a Duo push and a password** |
+| **VPN signing in again** | the free fix did not help — or the tunnel died outright and is being rebuilt — and automatic reconnection is on | **a Duo push and a password** |
+| **VPN still not connected** | automatic reconnection gave up after three attempts; it will wait to be asked | — |
 | **VPN disconnected** | the tunnel closed, with the reason if it was not you | — |
 | **Sign-in failed** | the sign-in step itself failed; the text says why | — |
 | **VPN warning** | the helper hit trouble — most seriously, the network may not have been restored after teardown | — |
@@ -167,9 +179,10 @@ with every setting listed at its default and a sentence saying what it does:
 dpd = 30
 ```
 
-Most of it takes effect without reconnecting: the watchdog re-reads the file on
-each check, so changing `health-interval`, `probe`, `probe-target` or the rate
-limits applies within seconds. `dpd` reaches `openconnect` on its command line,
+Most of it takes effect without reconnecting: the built-in health checker
+(the "watchdog" below) re-reads the file on every check, so changing
+`health-interval`, `probe`, `probe-target` or the rate limits applies within
+seconds. `dpd` reaches `openconnect` on its command line,
 so that one needs a reconnect. A malformed line costs that setting its default
 and logs a sentence saying so — a config file is never a reason to be unable to
 connect.
@@ -205,7 +218,7 @@ drives that one rather than starting a second.
 asuvpn                  # same as: asuvpn connect
 asuvpn connect          # sign in and bring the tunnel up
 asuvpn status           # what state is it in
-asuvpn disconnect       # close the tunnel, leave the applet running
+asuvpn disconnect       # close the tunnel (or call off a pending retry)
 asuvpn reconnect        # sign in again and replace the tunnel
 asuvpn log -f           # follow this session's log
 asuvpn quit             # close the tunnel and stop the applet
@@ -230,7 +243,7 @@ Exit codes are meant for scripting:
 | --- | --- |
 | `0` | The request was carried out — and for `status` or `--wait`, connected |
 | `1` | `status` or `--wait`: not connected. `disconnect`: the tunnel did not close. `quit`: still shutting down. `log`: no log yet |
-| `2` | A bad command line (argparse's own code) |
+| `2` | A mis-typed command line (the standard Python argument-parsing code) |
 | `3` | `status` — or a `--wait` the applet vanished under: it is not running |
 | `4` | A different server was asked for than the running applet is using |
 
@@ -252,7 +265,7 @@ so this does not depend on how any of them happen to be worded:
 | `23` | that interface already exists, and it was not created by this session |
 | `24` | no free `asuvpnN` name (a hundred tunnels is not a real scenario) |
 | `25` | an option was passed that would detach `openconnect` from the helper |
-| `26` | the helper, its directory, `asuvpn-notify` or the contract is writable by someone else |
+| `26` | the helper, its directory, `asuvpn-notify` or the shared `asuvpn_contract.py` is writable by someone else |
 | `27` | a negative dead-peer interval was passed |
 
 ```bash
@@ -263,12 +276,13 @@ Other options: `--server HOST` for a different endpoint, `--foreground` to keep
 the applet attached to the terminal, and a bare `--` to pass extra arguments
 through to `openconnect`. Flags may go before or after the command.
 
-Arguments after `--` are checked for options that would take `openconnect` out
-of the helper's supervision — `--background`, `--syslog`, `--pid-file` and
-friends are refused. Bundled short options are refused too, because `getopt`
-reads `-bv` as `-b -v` and working out which letter is an option and which is
-somebody's argument would mean reimplementing `getopt` against a table that
-changes between releases. Write them separately: `-i lo`, not `-ilo`.
+Arguments after `--` are checked for options that would detach `openconnect`
+from its supervisor — `--background`, `--syslog`, `--pid-file` and friends are
+refused, because a detached `openconnect` is a root process nothing can stop.
+Bundled short options are refused too: `openconnect` reads `-bv` as `-b -v`,
+so a bundle could smuggle in a refused option, and picking bundles apart
+reliably would mean tracking its option table across releases. Write them
+separately: `-i lo`, not `-ilo`.
 
 ```bash
 asuvpn --server vpn.other.edu connect
@@ -283,9 +297,10 @@ use, so it also catches the case where `install.sh` was re-run with a new
 
 ## What gets installed, and where
 
-Everything lands under `~/.local`. Nothing is written outside `$HOME`, no system
-files are touched, and no part of the installation needs root. The program is
-**copied**, so the checkout can be moved or deleted afterwards.
+Everything lands in your home directory — the program under `~/.local`, your
+settings under `~/.config/asuvpn`. Nothing is written outside `$HOME`, no
+system files are touched, and no part of the installation needs root. The
+program is **copied**, so the checkout can be moved or deleted afterwards.
 
 | Path | What it is |
 | --- | --- |
@@ -351,19 +366,24 @@ normal user, with no elevation:
 - reads your password **from the login keyring** — see below
 - writes `~/.cache/asuvpn/session.log`
 - writes `~/.config/autostart/…` only when you tick "Start on login (applet only)"
-- binds an abstract Unix socket for the single-instance guard and the CLI.
-  Abstract sockets carry no filesystem permissions, so every connection's peer
-  uid is checked with `SO_PEERCRED` and anything else is refused — otherwise
-  another local user could drop your tunnel, read your assigned VPN address,
-  or call `connect` to raise an admin password prompt on your desktop at will.
-  A squatter binding the name first can only stop the applet starting (it
-  reports "already running"); it cannot impersonate the applet, because the
-  CLI checks the server's uid the same way the applet checks its clients
+- opens a private control channel (an abstract Unix socket) for the
+  single-instance guard and the CLI. That kind of channel has no file
+  permissions of its own, so on every connection the applet asks the kernel
+  who is calling (`SO_PEERCRED`) and refuses any user id but yours —
+  otherwise another local user could drop your tunnel, read your assigned
+  VPN address, or trigger `connect` to raise an admin password prompt on
+  your desktop at will. Someone grabbing the channel's name first can only
+  stop the applet starting (it reports "already running"); they cannot
+  impersonate it, because the CLI checks the server's identity the same way
+  the applet checks its callers
 
 ### What runs as root
 
-Only `asuvpn-helper`, only via `pkexec`, and only after you approve the polkit
-dialog. Once elevated, its whole job is supervision:
+Only the pieces that build the tunnel, and every one of them is reached
+through the same door: `asuvpn-helper` runs via `pkexec` after you approve
+the password dialog, it runs `openconnect`, and at each connection change
+`openconnect` runs `asuvpn-notify`, which reports one status message and
+hands over to the routing script. The helper's whole job is supervision:
 
 1. runs `openconnect` with the session cookie fed on stdin, and stays alive as
    its supervisor for the life of the tunnel — it does not exec and step aside,
@@ -607,10 +627,18 @@ The tray shows the cheap kind as **Connecting… — link lost, retrying**, driv
 by `attempt-reconnect` and `reconnect` events, so `asuvpn status` stops exiting 0
 while traffic is going nowhere.
 
+A concrete example, from a real session: close the laptop lid mid-tunnel and
+reopen it a minute later. The forced dead-peer detection notices the gap, the badge
+flips to *Connecting… — link lost, retrying*, and about eighteen seconds after
+waking the tunnel is back on the same session — no browser, no Duo, no
+password. The only trace is a notification pair: *VPN connection lost*, then
+*VPN reconnected*.
+
 #### Dead peer detection is forced on
 
-That first mechanism only works if dead peer detection is running, and **ASU's
-server turns it off**. A real session logs:
+That first mechanism only works if dead peer detection is running — the
+periodic "are you still there?" exchange between the two ends of the tunnel —
+and **ASU's server turns it off**. A real session logs:
 
 ```
 CSTP connected. DPD 0, Keepalive 0
@@ -668,12 +696,13 @@ definition something that ought to answer through it. The `probe-target`
 setting overrides that derivation if you know better for your network. A VPN
 that pushes no resolver simply gets the device checks.
 
-The probe opens a TCP connection and closes it. **A refusal counts as alive**,
-which is the part worth understanding: measured against a live ASU tunnel, one
-pushed resolver completed the handshake in 29 ms and the other answered with a
-RST in 20 ms — and the RST is just as good an answer, because it proves a packet
-crossed in each direction. Only silence means the tunnel is not carrying
-traffic. Whether the service behind the probe is up is none of our business.
+The probe opens one TCP connection and closes it. **A refusal counts as
+alive**, which is the part worth understanding: measured against a live ASU
+tunnel, one pushed resolver accepted the connection in 29 ms and the other
+answered "nothing is listening here" (a RST packet) in 20 ms — and the refusal
+is just as good an answer, because it proves a packet crossed in each
+direction. Only silence means the tunnel is not carrying traffic. Whether the
+service behind the probe is up is none of our business.
 
 The two sources are tracked separately, so a probe failure is only cleared by a
 successful probe. Letting the device check promote the badge back would flap it
@@ -849,7 +878,7 @@ and gets 15 seconds to run `vpnc-script` before anything harsher is considered.
 | **Closing the terminal** (`SIGHUP`) | Same as Ctrl+C. |
 | **Logging out** (`SIGTERM`) | Same as Ctrl+C. |
 | The applet **crashes** or is `kill -9`ed | The control pipe closes, the helper sees EOF and tears the tunnel down. Nothing is left holding your routes. |
-| The **helper** itself dies (OOM, `kill -9`) | The kernel signals `openconnect` via `PR_SET_PDEATHSIG`, so it still runs `vpnc-script`. |
+| The **helper** itself dies (out of memory, `kill -9`) | The kernel itself notices — the helper registered for that (`PR_SET_PDEATHSIG`) — and signals `openconnect`, so the routing script still runs. |
 
 > [!NOTE]
 > `asuvpn connect` from a terminal puts the applet in its own session and
@@ -871,12 +900,15 @@ is killed outright the script never runs, which is the classic way to end up
 with no working network until you reboot or toggle the interface. Three things
 guard against that:
 
-- **Gentle escalation.** Teardown sends `SIGINT`, waits 15 seconds, then
-  `SIGTERM` for another 10, and only then `SIGKILL`. Both polite signals make
-  `openconnect` run the disconnect script; killing early is precisely what
-  breaks things, so the graces are deliberately generous.
-- **No `SIGPIPE` deaths.** Relaying output keeps `openconnect` alive long enough
-  to finish that script even if the tray is gone.
+- **Gentle escalation.** Teardown sends the polite stop signal (`SIGINT`),
+  waits 15 seconds, sends the firmer one (`SIGTERM`), waits 10 more, and only
+  then force-kills (`SIGKILL`). Both polite signals make `openconnect` run the
+  cleanup script; the force-kill is the one thing that prevents it, which is
+  why the waits are deliberately generous.
+- **No broken-pipe deaths.** The helper relays `openconnect`'s output instead
+  of wiring it straight to the applet, so an applet that vanished cannot make
+  a write fail in a way that kills `openconnect` (`SIGPIPE`) before it has
+  finished cleaning up.
 - **A dead supervisor still triggers teardown.** The control pipe covers the
   tray dying; `PR_SET_PDEATHSIG` covers the helper dying. Without it, killing
   the helper left `openconnect` running as root with nothing able to reach it,
@@ -1032,7 +1064,9 @@ teardown, and logged precisely so a declined action never reads as a hang.
 | `[helper] WARNING … is not executable, so openconnect's own default script is left in place` | The `vpnc-script` this system uses could not be found, so state falls back to reading `openconnect`'s output. Routing is unaffected. Install `vpnc-scripts`. |
 | `Script … returned error 127` | The `vpnc-script` failed, so routes and DNS were never configured. Install `vpnc-scripts`, then `asuvpn selftest`. |
 | `ModuleNotFoundError: No module named 'pkg_resources'` | The `setuptools<71` pin did not take. `pipx inject openconnect-sso 'setuptools<71' --force` — the `--force` is what makes it apply. |
-| Badge says **not carrying traffic** | The watchdog found the tunnel device or its routes gone. It has already nudged `openconnect` once; `asuvpn log` says what it saw. If it does not recover, `asuvpn reconnect`. |
+| Badge says **not carrying traffic** | The watchdog found the tunnel device or its routes gone. It has already nudged `openconnect` once; `asuvpn log` says what it saw. If it does not recover, the automatic sign-in fires (unless turned off) — or `asuvpn reconnect` yourself. |
+| Badge says **…; rebuilding** | The tunnel died on its own and the applet will sign in again shortly, up to three times. **Stop reconnecting** in the menu — or `asuvpn disconnect` — calls it off. |
+| `sign-in did not finish within 300s` | A sign-in sat unanswered — usually a Duo push or browser window with nobody at the keyboard — and was ended by `signin-timeout`. Connect again when you are there to answer it. |
 | Tunnel silently stops working, badge stays green | Should no longer happen: `--force-dpd 30` is passed because ASU negotiates DPD off, and the watchdog covers what DPD cannot see. If it recurs, `asuvpn log` now records every check. |
 | Self-check reports a failure | `asuvpn selftest` prints a detail line under each failure saying what will break and how to fix it. |
 
@@ -1067,8 +1101,9 @@ asuvpn selftest --quiet          # only failures and warnings
 ```
 
 It exits 0 if nothing failed, 1 otherwise. Nothing in it needs privileges or
-talks to the VPN: the real `openconnect` is run only as `openconnect
---version` (asking it for its own script path), and the network is touched
+talks to the VPN: the real `openconnect` is run only to describe itself
+(`--version` for its script path, `--help` for its give-up-retrying default),
+and the network is touched
 only by two probe exercises that cannot leave anything behind — a loopback
 connect, and a SYN to RFC 5737 documentation space, which must never answer.
 
@@ -1142,7 +1177,7 @@ what to update in lockstep when you change something.
 ## Status
 
 Exercised with stand-in `openconnect-sso`, `pkexec` and `openconnect` binaries,
-the last of which models a teardown that takes real time to restore routes:
+the last of which modeled a teardown that took real time to restore routes:
 connect, disconnect, reconnect while connected, quit while connected, Ctrl+C in
 foreground mode, crash safety under `SIGKILL`, a dismissed authorization dialog,
 four simultaneous launches racing for the single-instance guard, every exit code,
@@ -1170,7 +1205,8 @@ filesystem is not modified at all, and is byte-identical afterwards.
 
 The `reason` values the framework depends on were confirmed present in the
 installed `libopenconnect.so.5` rather than assumed. `reconnect` and `connect`
-do not appear in `strings` output because the linker tail-merges them into
+do not appear as separate strings in the binary because the build stores
+them inside the longer word (tail-merging), overlapping them into
 `attempt-reconnect` — they are at `attempt-reconnect`+8 and +10 respectively —
 and the installed `vpnc-script` enumerates exactly those five in its own
 `case` statement.
@@ -1224,8 +1260,8 @@ the measured window.
 
 The stand-in exercises earlier in this section — the launch races, the exit
 code sweep, the arbitrary-directory installs — predate the committed suite
-and were run with the same fakes before the harness moved into the
-repository; the thirteen committed scenarios are the ones tabulated in
+and were run with earlier versions of the same fakes before the harness moved into the
+repository; the fourteen committed scenarios are the ones tabulated in
 [tests/sandbox](tests/sandbox/README.md).
 
 What is proven live against the real gateway (full connects and teardowns,

@@ -1,9 +1,10 @@
 #!/bin/bash
-# Shared plumbing for the scenarios that drive the real tray. Sourced, not
-# executed. Three jobs, each of which every display scenario used to restate:
-# the sandbox guard, a freshly staged HOME, and a tray start that is PROVEN
-# up before any verb is sent — the old readiness loop timed out silently, so
-# a scenario could "pass" against an applet that never started at all.
+# Shared plumbing for the scenarios. Sourced, not executed. The jobs every
+# scenario used to restate: the sandbox guard, a freshly staged HOME, a tray
+# start that is PROVEN up before any verb is sent — the old readiness loop
+# timed out silently, so a scenario could "pass" against an applet that never
+# started at all — and, for the scenarios that drive the helper directly, one
+# runner and one spawn marker instead of a copy in every file.
 
 sandbox_guard() {
     grep -qa SANDBOX-MARKER /usr/bin/pkexec 2>/dev/null && return 0
@@ -65,3 +66,16 @@ must_contain() { # label, haystack, needle
         *) echo "  FAIL: $1 — wanted '$3' in: $2" >&2; exit 1 ;;
     esac
 }
+
+# Run the real helper once, cookie on stdin, output and exit status back.
+# One copy: sec.sh and sec3.sh each carried their own, and a runner that
+# drifts is a scenario that quietly tests something else.
+helper_run() {
+    printf 'COOKIE\n' | timeout 8 "$SB/app/asuvpn-helper" \
+        --host https://x --fingerprint pin-sha256:x "$@" 2>&1
+}
+# The framed pre-spawn line: present means the helper got as far as running
+# openconnect, absent means it refused first. One spelling, shared, so the
+# scenarios that assert both directions cannot drift apart.
+# shellcheck disable=SC2034  # read by the sourcing scenario
+SPAWNED='[helper] NOTE running as uid'

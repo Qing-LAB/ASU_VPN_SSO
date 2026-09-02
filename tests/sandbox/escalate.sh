@@ -9,7 +9,9 @@ export FAKE_DEAF=1
 "$A" autoreconnect on >/dev/null
 start_tray
 "$A" connect >/dev/null 2>&1
-for t in 25 25 25 25; do sleep $t; echo "  $(date +%M:%S)  $("$A" status)"; done
+# Four ticks reach the sign-in at ~80s in the deterministic case; the fifth
+# sleep is margin for timer drift on a loaded machine, not more behaviour.
+for t in 25 25 25 25 15; do sleep $t; echo "  $(date +%M:%S)  $("$A" status)"; done
 "$A" quit >/dev/null 2>&1; wait "$T" 2>/dev/null
 echo "  --- what it did ---"
 grep -E 'not usable|re-establish|SIGUSR2|signing in again|tunnel check|authenticating' \
