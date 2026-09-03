@@ -65,6 +65,118 @@ done
 
 [ -f "$SRC_DIR/asuvpn-tray" ] || die "run this from a checkout of the repository"
 
+# --------------------------------------------------- what is actually needed
+#
+# Asked as capabilities, not as package names, and asked before anything is
+# installed. Two reasons:
+#
+#   1. A machine that already has these needs no packages, and therefore no
+#      password. That is the common case on any GNOME desktop -- python3-gi and
+#      polkit ship with the desktop -- so often the only gap is openconnect, and
+#      sometimes there is no gap at all. "Is it there" is free to ask; "is this
+#      Ubuntu" is not the same question and gets that case wrong.
+#   2. The names differ per distribution and the capability does not. Naming the
+#      capability lets a Fedora user be told `python3-gobject` instead of a
+#      Debian name that means nothing to them.
+#
+# These are the same questions `asuvpn selftest` asks afterwards, so bootstrap
+# and the self-check cannot disagree about whether an install is complete.
+
+have_gtk_bindings() {
+  /usr/bin/python3 - >/dev/null 2>&1 <<'GI_CHECK'
+import gi
+for name, version in (("Gtk", "3.0"), ("AyatanaAppIndicator3", "0.1"),
+                      ("Notify", "0.7")):
+    gi.require_version(name, version)
+GI_CHECK
+}
+have_openconnect() { command -v openconnect >/dev/null 2>&1; }
+have_pkexec()      { command -v pkexec >/dev/null 2>&1; }
+have_sso() {
+  command -v openconnect-sso >/dev/null 2>&1 ||
+    [ -x "$HOME/.local/bin/openconnect-sso" ]
+}
+
+# What provides each capability, per package manager. Reporting only: nothing
+# outside the apt path is installed automatically, because only the apt path is
+# exercised in CI and a wrong package name run through sudo on someone's
+# machine is a worse outcome than a list they paste themselves.
+capability_packages() {          # $1 capability, $2 manager
+  case "$1:$2" in
+    gtk:apt)    echo "python3-gi gir1.2-gtk-3.0 gir1.2-ayatanaappindicator3-0.1 gir1.2-notify-0.7" ;;
+    gtk:dnf)    echo "python3-gobject gtk3 libappindicator-gtk3 libnotify" ;;
+    gtk:pacman) echo "python-gobject gtk3 libappindicator-gtk3 libnotify" ;;
+    gtk:zypper) echo "python3-gobject typelib-1_0-Gtk-3_0 libappindicator3-1 typelib-1_0-Notify-0_7" ;;
+    openconnect:*) echo "openconnect" ;;
+    pkexec:apt) echo "policykit-1" ;;
+    pkexec:*)   echo "polkit" ;;
+    *) echo "" ;;
+  esac
+}
+
+missing_capabilities() {
+  local missing=()
+  have_gtk_bindings || missing+=("gtk")
+  have_openconnect  || missing+=("openconnect")
+  have_pkexec       || missing+=("pkexec")
+  printf '%s\n' "${missing[@]+"${missing[@]}"}"
+}
+
+# apt first, so a Debian derivative carrying another manager still takes the
+# path this project tests.
+detect_manager() {
+  command -v apt-get >/dev/null 2>&1 && { echo apt;    return 0; }
+  command -v dnf     >/dev/null 2>&1 && { echo dnf;    return 0; }
+  command -v pacman  >/dev/null 2>&1 && { echo pacman; return 0; }
+  command -v zypper  >/dev/null 2>&1 && { echo zypper; return 0; }
+  echo ""; return 1
+}
+
+install_command() {              # $1 manager, rest: packages
+  local manager="$1"; shift
+  case "$manager" in
+    dnf)    echo "sudo dnf install $*" ;;
+    pacman) echo "sudo pacman -S --needed $*" ;;
+    zypper) echo "sudo zypper install $*" ;;
+    apt)    echo "sudo apt install $*" ;;
+    *)      echo "install these with your package manager: $*" ;;
+  esac
+}
+
+# What to say on a distribution this script does not install for. Only the gaps
+# are listed: a machine already carrying GTK and polkit should be told about
+# openconnect and nothing else.
+report_missing() {               # $1 manager (may be empty)
+  local manager="$1" cap pkgs all=() split=()
+  warn "this script only installs packages automatically on Debian/Ubuntu."
+  warn "what is missing here, and how to get it:"
+  while read -r cap; do
+    [ -n "$cap" ] || continue
+    pkgs="$(capability_packages "$cap" "${manager:-unknown}")"
+    # Splitting on whitespace is the intent -- capability_packages returns a
+    # space-separated list -- so it is done deliberately rather than by leaving
+    # an expansion unquoted and hoping the reader knows which it was.
+    if [ -n "$pkgs" ]; then
+      read -ra split <<<"$pkgs"
+      all+=("${split[@]}")
+    fi
+    printf "        %-12s %s\n" "$cap" "${pkgs:-<name unknown for this distribution>}" >&2
+  done < <(missing_capabilities)
+  [ ${#all[@]} -gt 0 ] &&
+    warn "  $(install_command "${manager:-unknown}" "${all[@]}")"
+  if ! have_sso; then
+    warn "openconnect-sso is also missing. It needs Python 3.12 -- it pins"
+    warn "lxml<5 and PyQt6-WebEngine<7, and neither builds on 3.13 or newer,"
+    warn "which is what Fedora and Arch ship as their system python. Install a"
+    warn "3.12 however your distribution provides one, then:"
+    warn "  pipx install --python python3.12 'openconnect-sso[full]'"
+    warn "  pipx inject openconnect-sso 'setuptools<71' --force"
+  fi
+  warn "on GNOME, also enable the AppIndicator extension:"
+  warn "    gnome-extensions enable ubuntu-appindicators@ubuntu.com"
+  warn "then re-run this script with --no-deps, which installs only the app."
+}
+
 # --------------------------------------------------------------- apt helpers
 
 apt_known()   { apt-cache show "$1" >/dev/null 2>&1; }
@@ -226,19 +338,27 @@ enable_extension() {
 # ----------------------------------------------------------------------- main
 
 if [ "$INSTALL_DEPS" -eq 1 ]; then
-  if ! command -v apt-get >/dev/null; then
-    warn "not a Debian/Ubuntu system; install these yourself, then re-run with --no-deps:"
-    printf '        %s\n' "${APT_RUNTIME[@]}" "${APT_BUILD[@]}" "${APT_QT[@]}" \
-                          "polkit (pkexec)" "python$PY" >&2
-    # --no-deps changes nothing on the system, by promise — so the extension
-    # toggle it skips has to be somebody's job here:
-    warn "on GNOME, also enable the AppIndicator extension yourself:"
-    warn "    gnome-extensions enable ubuntu-appindicators@ubuntu.com"
-    # Everything past here assumes $PYBIN exists, and pipx would fail with a far
-    # less useful message than the list just printed.
-    die "cannot continue automatically on this distribution"
-  fi
+  MANAGER="$(detect_manager || true)"
 
+  # Before anything reaches for sudo: is there anything to do at all? On a
+  # desktop that already has GTK, polkit and openconnect this is the whole of
+  # the dependency phase, and it costs no password on any distribution. The old
+  # order asked for one first and looked for work second.
+  if [ -z "$(missing_capabilities)" ] && have_sso; then
+    say "every dependency is already present -- nothing to install, no password needed"
+    # Still done, because reaching here used to mean walking the apt block and
+    # arriving at this line with everything already satisfied. It writes a
+    # dconf setting and asks for no password, so skipping it would quietly cost
+    # a user with the extension installed-but-off their tray icon.
+    enable_extension
+    INSTALL_DEPS=0
+  elif [ "$MANAGER" != "apt" ]; then
+    report_missing "$MANAGER"
+    die "cannot install automatically on this distribution"
+  fi
+fi
+
+if [ "$INSTALL_DEPS" -eq 1 ]; then
   # Package metadata has to be current before anything is looked up: on a
   # machine whose lists are empty or stale, apt-cache reports real packages as
   # unknown and pkexec would be silently skipped.

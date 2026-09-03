@@ -52,14 +52,22 @@ configuration:
 - **Another desktop.** The tray icon needs a StatusNotifier host. KDE has one
   built in; GNOME needs the AppIndicator extension, which `bootstrap.sh`
   installs. Untested outside GNOME.
-- **Another distribution.** `bootstrap.sh` is apt-only and will stop with the
-  dependency list rather than guess. The applet itself is plain Python and GTK 3.
+- **Another distribution.** `bootstrap.sh` checks what is *present* rather than
+  which Linux you are on, so a machine that already has GTK, `polkit` and
+  `openconnect` installs with no packages and no password at all. Where
+  something is missing it names the gap and the packages that fill it for
+  `dnf`, `pacman` or `zypper` — then stops, because only the apt path is
+  exercised in CI and running a guessed package name through `sudo` on someone
+  else's machine is worse than a list they can read first. Install those, then
+  `./bootstrap.sh --no-deps`. The applet itself is plain Python and GTK 3.
 
 > [!NOTE]
-> `bootstrap.sh` installs around thirty apt packages including a build
-> toolchain, compiles `lxml` from source, may add the deadsnakes PPA for
-> Python 3.12, and enables a GNOME extension. Read
-> [Requirements](#requirements) first if that matters to you.
+> On a machine that is missing them, `bootstrap.sh` installs around thirty apt
+> packages including a build toolchain, compiles `lxml` from source, may add the
+> deadsnakes PPA for Python 3.12, and enables a GNOME extension. It checks first
+> and installs only what is absent — on a desktop that already has everything it
+> asks for no password — but read [Requirements](#requirements) first if any of
+> that matters to you.
 
 ---
 
