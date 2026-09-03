@@ -30,7 +30,12 @@ if [ -z "$OC" ]; then
   echo "  FAIL: no openconnect child of the helper was found to watch" >&2
   kill -9 "$H" 2>/dev/null; exec 9>&-; rm -f "$SB/ctl"; exit 1
 fi
-kill -0 "$OC" 2>/dev/null || { echo "  FAIL: the subject died before the test began" >&2; exit 1; }
+still_running() {
+    local state
+    state=$(awk '/^State:/{print $2}' "/proc/$1/status" 2>/dev/null) || return 1
+    [ -n "$state" ] && [ "$state" != "Z" ]
+}
+still_running "$OC" || { echo "  FAIL: the subject died before the test began" >&2; exit 1; }
 echo "  helper pid=$H  openconnect pid=$OC — killing the helper with SIGKILL"
 kill -9 "$H"
 # The kernel delivers the death signal immediately; the stand-in's handler
@@ -43,11 +48,6 @@ kill -9 "$H"
 # orphan reaps it promptly differs between machines, which is why this passed
 # here and failed on GitHub's runners for the same code. Ask the kernel what
 # state the process is in instead of whether the pid is addressable.
-still_running() {
-    local state
-    state=$(awk '/^State:/{print $2}' "/proc/$1/status" 2>/dev/null) || return 1
-    [ -n "$state" ] && [ "$state" != "Z" ]
-}
 for _ in $(seq 100); do
     still_running "$OC" || { survived=0; break; }
     survived=1; sleep 0.1

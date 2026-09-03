@@ -81,6 +81,7 @@ C = _contract()
 
 OPENCONNECT_CANDIDATES = ("/usr/sbin/openconnect", "/usr/bin/openconnect")
 PR_SET_PDEATHSIG = 1
+PR_GET_PDEATHSIG = 2
 IP_CANDIDATES = ("/usr/sbin/ip", "/sbin/ip", "/usr/bin/ip")
 TUNNEL_PREFIXES = ("tun", "tap", "vpn")
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -365,6 +366,18 @@ def die_with_parent(parent_pid):
         os.write(2, f"asuvpn: prctl(PR_SET_PDEATHSIG) failed with errno"
                     f" {ctypes.get_errno()}; a helper killed outright would"
                     " leave openconnect running as root\n".encode())
+        return
+    # Read it back. A zero return says the call was accepted, which is not the
+    # same as the guard being armed -- and this is a safety mechanism whose
+    # failure is invisible until the day it matters, so "the exit status said
+    # fine" is not good enough. PR_GET_PDEATHSIG reports what is actually set.
+    check = ctypes.c_int(0)
+    if libc.prctl(PR_GET_PDEATHSIG, ctypes.byref(check)) != 0 \
+            or check.value != int(signal.SIGINT):
+        os.write(2, f"asuvpn: parent-death signal reads back as {check.value},"
+                    f" not SIGINT ({int(signal.SIGINT)}); the guard is not"
+                    " armed and a helper killed outright would leave"
+                    " openconnect running as root\n".encode())
         return
     # The flag is only armed now, so a parent that died during the fork would
     # never be noticed. Comparing against the recorded pid rather than testing
