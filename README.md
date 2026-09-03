@@ -161,9 +161,8 @@ connecting. While the applet is waiting to retry a connection that dropped,
 **Stop reconnecting** appears — it calls the retries off without changing any
 setting. Nothing can be cancelled during teardown, which must not be
 interrupted. **Show log…** opens a live log window, and **Quit** closes the
-tunnel first. The bottom of the menu names the running build (`ASU VPN
-0.9.0`) — the same answer `asuvpn --version` gives, and the applet logs it
-at startup.
+tunnel first. The bottom of the menu names the running build — the same
+answer `asuvpn --version` gives, and the applet logs it once at startup.
 
 **Start on login (applet only)** puts the icon in your tray at login without
 connecting — so you are not met with a Duo push before you have asked for one.
@@ -236,6 +235,27 @@ connect.
 leaving everything else — comments included — as you left it. Most settings
 are re-read on every health check, so a change takes effect within seconds
 rather than at the next connect.
+
+#### If ASU's address ever changes
+
+Nothing here is hardwired to `sslvpn.asu.edu` — it is only the default.
+Three ways to point at a different endpoint, most permanent first:
+
+```bash
+./install.sh --server vpn.other.edu     # or bootstrap.sh --server …
+```
+
+or edit the `server = …` line in `~/.config/asuvpn/asuvpn.conf` (then
+`asuvpn quit` and connect again — the endpoint is fixed for an applet's
+lifetime), or for one run only:
+
+```bash
+asuvpn --server vpn.other.edu connect
+```
+
+A running applet always refuses a *different* server (exit code 4) rather
+than quietly connecting somewhere you did not ask — so the switch is always
+explicit: stop the old applet, start against the new address.
 
 ### The command line
 
