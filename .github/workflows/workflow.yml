@@ -17,7 +17,13 @@ on:
 
 jobs:
   pypi:
-    runs-on: ubuntu-latest
+    # Pinned, like checks.yml and scenarios.yml. `ubuntu-latest` is a label
+    # that moves: GitHub repoints it at the next LTS on its own schedule, and
+    # this is the one job whose run cannot be repeated — a version number is
+    # spent the moment PyPI accepts it. A moving runner under an irreversible
+    # step is the wrong trade even for a pure-Python wheel. When the image is
+    # retired GitHub warns for months; bump it then, deliberately.
+    runs-on: ubuntu-24.04
     environment: pypi
     permissions:
       id-token: write   # what Trusted Publishing authenticates with
