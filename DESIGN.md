@@ -134,7 +134,8 @@ flowchart LR
     HELPER -->|"argv + cookie on stdin;<br/>SIGUSR2 nudge, SIGINT ladder, PDEATHSIG"| OC["openconnect<br/>(root)"]
     OC -->|"runs with reason= in env,<br/>at every transition"| NOTIFY["asuvpn-notify<br/>(root)"]
     NOTIFY -->|"one datagram: token, reason,<br/>dev, addr, dns → /run/asuvpn/…/events"| HELPER
-    NOTIFY -->|"exec, env intact"| VPNC["real vpnc-script<br/>(routes and DNS)"]
+    NOTIFY -->|"resolvectl: scope the link,<br/>its domains, then its servers"| RESOLVED["systemd-resolved<br/>(per-link DNS)"]
+    NOTIFY -->|"exec — env intact except<br/>INTERNAL_IP4_DNS, dropped when<br/>DNS was handled above"| VPNC["real vpnc-script<br/>(routes)"]
 ```
 
 The helper does not `exec` and step aside. It stays as `openconnect`'s parent
@@ -246,6 +247,70 @@ the table maps `connect` there to a reconnect rather than a silent refusal.
 (Making it a real state also surfaced a dead spot: the menu's own Reconnect
 on a demoted tunnel used to be silently refused by the busy-state test — the
 table row fixed what the flag had hidden.)
+
+### The table as built
+
+Every row, from `TRANSITIONS` at the top of `asuvpn-tray`. This is the
+as-built table, not a proposal: `asuvpn selftest` reads the code's dictionary
+and this section and fails if they disagree, so a row added, removed or
+re-pointed without touching this list is caught rather than silently leaving
+the documentation describing a program that no longer exists. `any` is the
+`ANY` wildcard — the row applies in every state.
+
+| State | Message | Handler | What the row is for |
+| --- | --- | --- | --- |
+| `disconnected` | `connect` | `_tr_start_signin` | Rotate the log, open the browser sign-in. |
+| `failed` | `connect` | `_tr_start_signin` | Same, and it clears a pending rebuild's promise. |
+| `demoted` | `connect` | `_tr_connect_means_reconnect` | Connect on an established session means Reconnect — there is a tunnel to tear down first. |
+| `disconnected` | `reconnect` | `_tr_start_signin` | Nothing to tear down; it is just a connect. |
+| `failed` | `reconnect` | `_tr_start_signin` | Same, keeping the log that explains the failure. |
+| `connected` | `reconnect` | `_tr_teardown_reconnect` | Tear the tunnel down, then sign in again — a Duo push and a password. |
+| `demoted` | `reconnect` | `_tr_teardown_reconnect` | The expensive rung of the ladder, reached by hand or by autoreconnect. |
+| `disconnected` | `disconnect` | `_tr_already_disconnected` | Idempotent: say so rather than guessing. |
+| `failed` | `disconnect` | `_tr_already_disconnected` | Also how a pending rebuild is called off. |
+| `authenticating` | `disconnect` | `_tr_cancel_attempt` | Kill the sign-in; nothing is established yet. |
+| `connecting` | `disconnect` | `_tr_cancel_attempt` | Terminate pkexec, and tear down if a helper already lives. |
+| `connected` | `disconnect` | `_tr_teardown_disconnect` | The ordinary teardown, through the signal ladder. |
+| `recovering` | `disconnect` | `_tr_teardown_disconnect` | Stop openconnect retrying and close the session. |
+| `demoted` | `disconnect` | `_tr_teardown_disconnect` | A demoted tunnel still closes cleanly — the `discon.sh` scenario. |
+| `authenticating` | `cancel` | `_tr_cancel_attempt` | Abandon an attempt in flight. |
+| `connecting` | `cancel` | `_tr_cancel_attempt` | Same, plus teardown when a helper exists. |
+| `recovering` | `cancel` | `_tr_cancel_attempt` | openconnect owns the retry; cancelling abandons the attempt. |
+| `any` | `quit` | `_tr_quit_everything` | From any state: tear down, then exit. |
+| `authenticating` | `auth-ok` | `_tr_start_tunnel` | Spawn the helper under pkexec and feed it the cookie on stdin. |
+| `authenticating` | `auth-failed` | `_tr_signin_failed` | Keep the sentence; the badge says why. |
+| `connecting` | `tunnel-up` | `_tr_tunnel_came_up` | Adopt device, address and resolver; announce **connected**. |
+| `recovering` | `tunnel-up` | `_tr_tunnel_came_up` | Adopt and announce **reconnected** — no sign-in was needed. |
+| `connected` | `tunnel-up` | `_tr_refresh_address` | Only refresh the address if the tunnel was re-addressed. |
+| `demoted` | `tunnel-up` | `_tr_adopt_only` | Adopt, but do **not** promote: openconnect asserting connected is what it asserted before the watchdog disagreed. |
+| `connected` | `link-lost` | `_tr_link_lost` | openconnect is re-establishing; say so, it costs nothing. |
+| `recovering` | `link-lost` | `_tr_still_recovering` | Already announced; a line per retry would spam a long outage. |
+| `connected` | `check` | `_tr_weigh_check` | Weigh a device, probe or DNS verdict; strike or clear. |
+| `recovering` | `check` | `_tr_weigh_check` | Verdicts are set aside — openconnect owns its own recovery. |
+| `demoted` | `check` | `_tr_weigh_check` | Only the demoting source can clear the demotion. |
+| `any` | `device-named` | `_tr_remember_device` | Remember the tunnel device, re-validated on the way in. |
+| `any` | `fatal` | `_tr_remember_fatal` | The helper refused before openconnect started; keep its sentence. |
+| `any` | `problem` | `_tr_remember_problem` | A failure pattern matched in openconnect's output. |
+| `any` | `warning` | `_tr_helper_warning` | Raise a desktop notification — most seriously, routing not restored. |
+| `any` | `helper-exited` | `_tr_helper_exited` | The one place a tunnel's death is judged, and a rebuild armed. |
+| `disconnecting` | `teardown-finished` | `_tr_teardown_finished` | Straight into the sign-in for a reconnect; no momentary DISCONNECTED. |
+| `disconnecting` | `teardown-timeout` | `_tr_teardown_timed_out` | Refuse to start a second tunnel over a live one. |
+| `failed` | `rebuild` | `_tr_rebuild_dropped` | Only for a tunnel that had carried traffic, capped at MAX_REBUILDS. |
+
+A pair not in this table is dropped and the drop is logged. That is deliberate
+and it is the reason the list is worth reading in full: the rows that are
+*absent* carry as much meaning as the ones present. There is no
+`(disconnecting, check)` row, so a watchdog verdict landing mid-teardown cannot
+rewrite a requested disconnect — which it once did. There is no
+`(connected, auth-ok)` row, so a sign-in that finished too late cannot start a
+second tunnel over a live one.
+
+The rebuild that produced this machine had a plan of record,
+`STATE-MACHINE-PLAN.md`, which proposed the shape above and listed what must
+not be lost. Every decision in it was made and every item in it became a row
+here, an invariant below, or a check — so it was removed rather than left in
+the tree proposing something that already exists. Git has it if the archaeology
+is ever wanted; a proposal sitting beside the design is read as the design.
 
 ### What the menu offers, and why that list
 
@@ -390,6 +455,22 @@ is skipped, the `/sbin/resolvconf` branch is skipped too (it is a symlink to
 `systemd-resolved` rewrites at the next link change. DNS works, then silently
 stops, and every check in this project passes throughout. That is what the
 resolver check below exists for, and this is what stops it happening.
+
+```mermaid
+flowchart TD
+    START["reason=connect<br/>or reconnect"] --> ON{"helper set<br/>ASUVPN_DNS_DOMAINS?<br/>(dns = on)"}
+    ON -->|no| STOCK["leave INTERNAL_IP4_DNS set:<br/>the real vpnc-script does<br/>whatever it always did"]
+    ON -->|yes| RESOLVECTL{"resolvectl present<br/>and resolved answering?"}
+    RESOLVECTL -->|no| STOCK
+    RESOLVECTL -->|yes| SCOPE["default-route no<br/>domain &lt;dev&gt; &lt;domains&gt;<br/>dns &lt;dev&gt; &lt;servers&gt;"]
+    SCOPE -->|any call fails| REVERT["revert the link"] --> STOCK
+    SCOPE -->|all succeed| OWN["drop INTERNAL_IP4_DNS<br/>from the child's env"]
+    OWN --> EXEC["exec the real vpnc-script:<br/>routes only, both its DNS<br/>branches now guarded off"]
+    STOCK --> EXEC2["exec the real vpnc-script:<br/>routes and DNS, as before"]
+```
+
+The two exits are the whole design: DNS has exactly one owner on either path,
+and the path that fails is the one this project did not write.
 
 `asuvpn-notify` configures the link instead, in this order, which is the order
 that is never briefly wrong:
@@ -681,6 +762,21 @@ Only the resolver is asserted, not the domains beside it. It is the whole of
 what makes the link resolve anything, it is the one value that reached the tray
 from the tunnel itself, and a check that tests less is a check that cannot be
 wrong about what it tests.
+
+Both ends have to be comparing the same thing, and two ways they might not were
+found by re-reading this after it was written. The helper took the probe target
+straight off `INTERNAL_IP4_DNS.split()[0]` while `asuvpn-notify` installed
+whatever `split_resolvers` accepted — so a gateway whose list led with something
+that is not an address had the tray hunting the link for it forever. And
+`split_resolvers` returned addresses as the gateway spelled them, while
+`resolvectl` echoes back systemd's spelling, so an IPv6 resolver pushed as
+`2001:0db8::1` and reported as `2001:db8::1` would read as missing. Each would
+have demoted a healthy tunnel every twenty seconds and walked the ladder to an
+unattended sign-in. Both are fixed at the source rather than at the comparison:
+one function, canonical output, used by both ends. `parse_link_dns` takes
+`addr#servername` — a DNS-over-TLS server — by its address for the same reason,
+and is a separate function so the parsing can be tested without a resolvectl to
+run.
 
 Because it is cheap and local it runs on **every** check rather than every
 `probe-every` cycle; there is nothing to ration when no packet leaves the
@@ -980,13 +1076,13 @@ where it can be, checked by `asuvpn selftest`.
 | The version the programs print is the version the wheel carries | `VERSION` in the contract is read at runtime by the menu, the log, `--version` and the self-test, and at build time by hatchling out of the same line; the release workflow refuses a tag that disagrees with it | logic tier applies hatchling's own configured pattern and compares, and refuses a literal version in `pyproject.toml` — mutation-verified by planting one |
 | Every check says what it pins, and every assertion says what breaks | convention, and the suite parses itself to enforce it | logic tier walks its own AST: no `check_*` without a docstring, no `r.check` without a failure detail — mutation-verified in both halves |
 | Both PyPI console scripts run something that is actually packaged | one payload script each, force-included in `pyproject.toml` | logic tier reads the entry points, the module and the force-include list together |
-| No source, test or document names a real address or internal host | RFC 5737 / RFC 3849 space for every example; the only name under the endpoint's own domain is the shipped default | logic tier scans every shipping source, test and document — mutation-verified by planting a real resolver and a real hostname and watching both rules fail |
+| No source, test or document names a real address or internal host | RFC 5737 / RFC 3849 space for every example; the only name under the endpoint's own domain is the shipped default | logic tier **walks the tree** rather than listing files — an explicit list already missed five tracked ones the day it was written. Mutation-verified by planting a real resolver in `pyproject.toml` and a real hostname in a CI workflow, both of which the list-based version let through |
 | A domain from a gateway never reaches a root command line unvalidated | `DOMAIN_RE`, applied where the list is parsed | logic tier, with option-like, shell-punctuation and single-label payloads |
 | `openconnect-sso` can still import `pkg_resources` | `setuptools<71` pinned with `pipx inject --force` | environment tier, by importing it |
 
 ## How this is tested
 
-Three tiers in `asuvpn-selftest` (163 checks), plus the scenario sandbox in
+Three tiers in `asuvpn-selftest`, plus the scenario sandbox in
 [tests/sandbox](tests/sandbox/README.md).
 
 The shaping constraint: **conventional unit tests would not have caught any of
@@ -1050,8 +1146,11 @@ breaking the code on purpose:
 | test `v4 == 0 and v6 == 0` again, so an unreadable family hides an empty table | an empty table is a verdict even where IPv6 cannot be read |
 | refund the rebuild count when a tunnel merely reaches connected | a flapping tunnel cannot outrun the rebuild limit |
 | arm the rebuild on any exit, not only one that followed real traffic | a tunnel that never came up is not rebuilt |
-| plant the real resolver's address in a source file | no source, test or document names a real address |
-| plant a real internal hostname in a source file | no source or test file names an internal host |
+| have the helper read `INTERNAL_IP4_DNS` with `str.split()` again | the resolver the tray is told is one the link could really hold |
+| plant the real resolver's address in `pyproject.toml` | no source, test or document names a real address |
+| plant a real internal hostname in a CI workflow | no source or test file names an internal host |
+| return resolvers as the gateway spelled them, not canonically | resolvers come back canonical, so both ends can compare them |
+| keep the `#servername` suffix on a DNS-over-TLS server | a DNS-over-TLS server is recognised by its address |
 | put a literal `version = "9.9.9"` in `pyproject.toml` | the packaging states no version of its own |
 | delete a `check_*` docstring | every check says what it pins |
 | drop a `r.check` failure detail | every assertion says what breaks when it fails |

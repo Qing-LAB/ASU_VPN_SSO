@@ -608,6 +608,14 @@ Note that a **drop already costs you nothing** — `openconnect` re-establishes
 using the same session, and the applet's nudge goes down a pipe that is already
 open, needing no privilege at all. Only a fresh connect prompts.
 
+### Reporting a problem
+
+Found something that crosses a privilege or user boundary? Please report it
+privately rather than in an issue — [`SECURITY.md`](SECURITY.md) says how, what
+is in scope, and what belongs upstream with `openconnect` instead. It also asks
+you to keep real hostnames and addresses out of the report, for the same reason
+none appear anywhere in this repository.
+
 ### Things worth knowing before you trust it
 
 - **The helper lives in your home directory.** Anything able to write
@@ -1298,8 +1306,9 @@ teardown, and logged precisely so a declined action never reads as a hang.
 | [`tests/sandbox/`](tests/sandbox/README.md) | Scenario tests: the real programs run whole lifetimes against stand-ins, in a namespace. |
 | [`DESIGN.md`](DESIGN.md) | Internals: state machine, concurrency, invariants, how it is tested. |
 | [`HANDOVER.md`](HANDOVER.md) | What is proven and what is not, the lessons behind the design, and what to do next. |
-| [`STATE-MACHINE-PLAN.md`](STATE-MACHINE-PLAN.md) | The state-machine rebuild's plan of record: the rationale and the decisions. The as-built table is in DESIGN.md. |
 | [`ruff.toml`](ruff.toml) | Lint config. Its `ignore` list records which rules are off and why. |
+| [`DESIGN.md`](DESIGN.md) | How the code works: the state machine and its full as-built transition table, who owns DNS, the invariants, and how it is all tested. |
+| [`SECURITY.md`](SECURITY.md) | How to report a vulnerability privately, what is in scope, and what belongs upstream. |
 | [`pyproject.toml`](pyproject.toml) + [`asuvpn_dist/`](asuvpn_dist/install.py) | The PyPI delivery channel: a wheel carrying these same files, plus `asuvpn-bootstrap` and `asuvpn-install`, which run the bundled `bootstrap.sh` and `install.sh`. No second installer. |
 | [`.github/workflows/`](.github/workflows) | CI: the self-test and analysers on every push and PR; the scenario sandbox on main; PyPI publishing on a `v*` tag. |
 | [`LICENSE`](LICENSE) | MIT. |

@@ -12,15 +12,20 @@ This file is what you need to know *before* changing any of it.
 ## Where it stands
 
 Everything is committed and pushed to `main` at
-**https://github.com/Qing-LAB/ASU_VPN_SSO**, and the installed copy in
-`~/.local/share/asuvpn` matches `HEAD` exactly.
+**https://github.com/Qing-LAB/ASU_VPN_SSO**, and released to PyPI as `asuvpn`
+on a `v*` tag.
+
+The installed copy under `~/.local/share/asuvpn` is a **copy**, so it lags
+`HEAD` until `./install.sh` (or `asuvpn-install`) is run again — `asuvpn
+--version` against the contract's `VERSION` is how to tell. Worth checking
+before believing a bug report from your own desktop.
 
 | | |
 | --- | --- |
 | Programs | `asuvpn-tray` (you), `asuvpn-helper` (root, via pkexec), `asuvpn-notify` (root, run by openconnect), `asuvpn-selftest` (you) |
 | Shared | `asuvpn_contract.py` — loaded by explicit path, never imported |
 | Settings | `~/.config/asuvpn/asuvpn.conf`, generated from the contract's schema |
-| Checks | `asuvpn selftest` — 124, in three tiers; scenario suite in [tests/sandbox](tests/sandbox/README.md), every scenario asserting its outcome |
+| Checks | `asuvpn selftest` — three tiers, count in its own summary line; scenario suite in [tests/sandbox](tests/sandbox/README.md), every scenario asserting its outcome |
 | Analysers | ruff, pyflakes, pylint, mypy, bandit, vulture, shellcheck — all clean |
 | Tested against | openconnect v9.12-3.3, Ubuntu, GNOME, ASU's `sslvpn.asu.edu` |
 
@@ -266,7 +271,8 @@ others use `abspath`, and the reference copy in the contract says which.
 
 1. **Live-verify the routes-lost fix** — now also the state machine's first
    live outing. The rebuild landed 2026-08-23 (eight states, one transition
-   table — see DESIGN's state-machine section; STATE-MACHINE-PLAN.md records
+   table — see DESIGN's state-machine section, which now carries the full
+   as-built table (the self-check holds it to the code); git history records
    the rationale and the user's decisions). It is suite- and sandbox-proven;
    live confidence accrues with use, and the flush test doubles as its trial. The break was staged live on
    2026-08-23 (`sudo ip route flush dev asuvpn0`) and defeated the ladder as
@@ -315,7 +321,7 @@ others use `abspath`, and the reference copy in the contract says which.
 ## How to work on it
 
 ```bash
-asuvpn selftest                 # 163 checks; run before and after any change
+asuvpn selftest                 # run before and after any change; it prints its own tally
 tests/sandbox/enter.sh sec.sh   # scenario tests, in a namespace of stand-ins
 ./install.sh                    # copies into ~/.local, runs the self-check
 asuvpn log -f                   # what it is actually doing

@@ -412,6 +412,27 @@ RESOLVECTL_PATHS = ("/usr/bin/resolvectl", "/bin/resolvectl")
 RESOLVECTL_TIMEOUT = 5
 
 
+def parse_link_dns(text):
+    """The resolver addresses in one `resolvectl dns <link>` answer.
+
+    "Link 9 (asuvpn0): 192.0.2.53 2001:db8::1", or nothing after the colon when
+    the link has none. Split on the first colon only, because an IPv6 address
+    is full of them.
+
+    A server configured for DNS-over-TLS prints as "addr#servername", so the
+    suffix is dropped: the address is what was asked about, and comparing the
+    decorated form would report a resolver missing that is sitting right there.
+    Nothing this applet installs carries one -- it sets plain addresses -- but
+    the link is not exclusively ours to configure.
+
+    Separate from link_resolvers so it can be tested against real output
+    without a resolvectl to run; the half that can be got wrong quietly is the
+    parsing, not the subprocess.
+    """
+    _, sep, rest = text.partition(":")
+    return [word.split("#", 1)[0] for word in rest.split()] if sep else []
+
+
 def link_resolvers(device):
     """The resolvers systemd-resolved has on this link, or None if unanswerable.
 
@@ -435,12 +456,7 @@ def link_resolvers(device):
         return None
     if done.returncode != 0:
         return None
-    # "Link 9 (asuvpn0): 192.0.2.53 2001:db8::1", or nothing after the colon
-    # when the link has none. Partitioned on the first colon only, because an
-    # IPv6 resolver is full of them.
-    text = done.stdout.decode("utf-8", "replace")
-    _, sep, rest = text.partition(":")
-    return rest.split() if sep else []
+    return parse_link_dns(done.stdout.decode("utf-8", "replace"))
 
 
 def resolv_conf_lists(resolver):

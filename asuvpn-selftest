@@ -2038,48 +2038,106 @@ DOCUMENTATION_NETS = (
 ADDRESS_RE = re.compile(r"\b(?:[0-9]{1,3}(?:\.[0-9]{1,3}){3}"
                         r"|[0-9A-Fa-f]{0,4}(?::[0-9A-Fa-f]{0,4}){2,7})\b")
 
-SCANNED_SOURCES = ("asuvpn_contract.py", "asuvpn-tray", "asuvpn-helper",
-                   "asuvpn-notify", "asuvpn-selftest", "install.sh",
-                   "bootstrap.sh")
+# Never walked: build output, caches, and the sandbox staging that enter.sh
+# restages on every run. They ship to nobody and hold whatever the last run
+# produced, so reporting them would be reporting this machine back to itself.
+UNSCANNED_DIRS = frozenset({
+    ".git", "__pycache__", "dist", "build", ".venv", ".ruff_cache",
+    ".mypy_cache", "app", "rbin", "home",
+})
+UNSCANNED_SUFFIXES = frozenset({".png", ".jpg", ".jpeg", ".ico", ".gz",
+                                ".whl", ".pyc", ".woff", ".woff2"})
+# A file bigger than this in a source tree is data, not something a person
+# wrote an address into.
+SCAN_MAX_BYTES = 2 * 1024 * 1024
 
-# Held to the address rule as well, and for a better reason than tidiness: an
-# address in a document was pasted from a live session by definition. The
-# hostname rule does not reach here -- this is an ASU tool and its prose says
-# so on nearly every page.
-SCANNED_DOCS = ("README.md", "DESIGN.md", "HANDOVER.md")
 
+def shipped_files():
+    """Every text file in the tree, as (label, text, is_prose).
 
-def read_siblings(names):
-    """Each of these files beside us that exists, as (label, text)."""
+    Walked rather than listed. The first version of this named seven files and
+    already missed five tracked ones -- pyproject.toml, the three workflows and
+    STATE-MACHINE-PLAN.md -- which is what an explicit list does after the
+    commit that writes it. Walking also means the rule covers a file nobody has
+    written yet, which is the only way a rule like this stays true.
+
+    `is_prose` marks Markdown. Addresses are held to the same rule everywhere,
+    because an address in a document was pasted from a live session by
+    definition; the hostname rule is not applied to prose, because this is an
+    ASU tool and its documentation says so on nearly every page.
+    """
     out = []
-    for name in names:
-        path = os.path.join(HERE, name)
-        try:
-            with open(path, encoding="utf-8", errors="replace") as fh:
-                out.append((name, fh.read()))
-        except OSError:
-            continue  # an installed copy has no installers beside it
-    return out
-
-
-def scannable_sources():
-    """Every source and test file that ships, as (label, text)."""
-    out = read_siblings(SCANNED_SOURCES)
-    sandbox = os.path.join(HERE, "tests", "sandbox")
-    for root, dirs, files in os.walk(sandbox):
-        # app/, rbin/ and home/ are gitignored staging that enter.sh restages
-        # on every run; they hold whatever the last run produced, they ship to
-        # nobody, and walking them would report this machine's own leftovers as
-        # if they were checked-in fixtures.
-        dirs[:] = [d for d in sorted(dirs) if d not in ("app", "rbin", "home")]
-        for name in sorted(files):
+    for root, dirs, names in os.walk(HERE):
+        dirs[:] = sorted(d for d in dirs if d not in UNSCANNED_DIRS
+                         and not d.endswith(".egg-info"))
+        for name in sorted(names):
             path = os.path.join(root, name)
+            if os.path.splitext(name)[1].lower() in UNSCANNED_SUFFIXES:
+                continue
             try:
+                if os.path.getsize(path) > SCAN_MAX_BYTES:
+                    continue
                 with open(path, encoding="utf-8", errors="replace") as fh:
-                    out.append((os.path.relpath(path, HERE), fh.read()))
+                    text = fh.read()
             except OSError:
                 continue
+            out.append((os.path.relpath(path, HERE), text,
+                        name.lower().endswith(".md")))
     return out
+
+
+def check_documented_transitions(tray, r):
+    """DESIGN.md's transition table is the one the code actually runs.
+
+    The table is the design: it is the only place the whole of the applet's
+    behaviour is visible at once, and the README sends people to it. A table
+    that has drifted is worse than none, because it is read and believed --
+    and it drifts silently, since nothing about adding a row to a dict makes
+    anyone open a Markdown file.
+
+    So the document is held to the dict, both ways: every row the code has must
+    be written down, and every row written down must exist. The handler name is
+    compared too, because a row re-pointed at a different handler is a
+    behaviour change that leaves the pair looking untouched.
+    """
+    try:
+        with open(os.path.join(HERE, "DESIGN.md"), encoding="utf-8") as fh:
+            design = fh.read()
+    except OSError:
+        return  # an installed copy carries no design notes
+
+    section = design.partition("### The table as built")[2]
+    if not section:
+        r.fail("DESIGN.md documents the transition table the code runs",
+               "no '### The table as built' section — the README sends readers"
+               " there for the as-built rows")
+        return
+    documented = {
+        (state, message): handler
+        for state, message, handler in re.findall(
+            r"^\|\s*`([^`]+)`\s*\|\s*`([^`]+)`\s*\|\s*`_tr_([^`]+)`",
+            section, re.M)}
+    actual = {("any" if state == tray.ANY else state, message): handler
+              for (state, message), handler in tray.TRANSITIONS.items()}
+
+    undocumented = sorted(set(actual) - set(documented))
+    r.check("every transition the code runs is written down",
+            not undocumented,
+            f"{undocumented} are in TRANSITIONS and not in DESIGN.md — the"
+            " table is where the whole of the behaviour is visible at once")
+    invented = sorted(set(documented) - set(actual))
+    r.check("every transition written down still exists",
+            not invented,
+            f"{invented} are in DESIGN.md and not in TRANSITIONS — a documented"
+            " row that does not exist is read and believed")
+    mismatched = sorted(f"{pair}: doc says _tr_{documented[pair]},"
+                        f" code runs _tr_{actual[pair]}"
+                        for pair in set(documented) & set(actual)
+                        if documented[pair] != actual[pair])
+    r.check("every documented row names the handler the code runs",
+            not mismatched,
+            f"{mismatched} — a row re-pointed at another handler changes"
+            " behaviour while the pair looks untouched")
 
 
 def check_source_addresses(C, r):
@@ -2099,14 +2157,14 @@ def check_source_addresses(C, r):
     """
     import ipaddress
 
-    sources = scannable_sources()
+    sources = shipped_files()
     if not sources:
         r.warn("no source or test file names a real address", "nothing to scan")
         return
 
     allowed = [ipaddress.ip_network(net) for net in DOCUMENTATION_NETS]
     strays = []
-    for label, text in sources + read_siblings(SCANNED_DOCS):
+    for label, text, _is_prose in sources:
         for candidate in set(ADDRESS_RE.findall(text)):
             try:
                 address = ipaddress.ip_address(candidate)
@@ -2128,7 +2186,8 @@ def check_source_addresses(C, r):
                " sources are not checked against it")
         return
     pattern = re.compile(r"[A-Za-z0-9_.-]*" + re.escape(home))
-    leaked = sorted({f"{label}: {found}" for label, text in sources
+    leaked = sorted({f"{label}: {found}"
+                     for label, text, is_prose in sources if not is_prose
                      for found in pattern.findall(text)
                      if found != default_server})
     r.check("no source or test file names an internal host",
@@ -2322,6 +2381,14 @@ def check_split_dns(C, r):
             resolvers == ["192.0.2.53", "192.0.2.54", "2001:db8::1"],
             f"got {resolvers} — the first is asked first, and is the probe"
             " target too")
+    canonical = C.split_resolvers("2001:0db8::1 2001:db8:0:0:0:0:0:1",
+                                  "192.0.2.53")
+    r.check("resolvers come back canonical, so both ends can compare them",
+            canonical == ["2001:db8::1", "192.0.2.53"],
+            f"got {canonical} — resolvectl echoes systemd's spelling of an"
+            " IPv6 address, so a gateway's spelling would have the tray"
+            " reporting a resolver missing that is sitting right there;"
+            " the two spellings must also dedup to one")
     r.check("a gateway's own name yields the domain it serves",
             C.parent_domain("vpn.example.com") == "example.com",
             f"got {C.parent_domain('vpn.example.com')!r}")
@@ -2359,6 +2426,22 @@ def check_resolver_health(tray, r):
         reason, _ = tray.resolver_health("asuvpn0", "192.0.2.53")
         r.check("a link holding somebody else's resolver is a verdict",
                 reason is not None, f"got {reason!r}")
+
+        # The parsing half of the same question. link_resolvers feeds every
+        # case above, and the half that can be got wrong quietly is how one
+        # line of resolvectl output is read -- not the subprocess around it.
+        parsed = tray.parse_link_dns(
+            "Link 9 (asuvpn0): 192.0.2.53#dns.example.com 2001:db8::1\n")
+        r.check("a DNS-over-TLS server is recognised by its address",
+                parsed == ["192.0.2.53", "2001:db8::1"],
+                f"got {parsed} — resolvectl decorates a DoT server with the"
+                " name it validates against, and the #suffix must not make a"
+                " resolver that is sitting right there look absent")
+        empty = tray.parse_link_dns("Link 9 (asuvpn0):\n")
+        r.check("a link with no resolvers parses as none, not as unanswerable",
+                empty == [],
+                f"got {empty} — [] is the verdict-bearing case; None would"
+                " mean the question could not be asked")
 
         tray.link_resolvers = lambda device: None
         reason, _ = tray.resolver_health("asuvpn0", "192.0.2.53")
@@ -2655,7 +2738,7 @@ def check_event_translation(helper, tray, C, r):
     and a space would quietly add a second one.
     """
     token = "a" * 32
-    expected_lines = 3
+    expected_lines = 4
     emitted: list[str] = []
     original = helper.emit
     helper.emit = emitted.append
@@ -2701,6 +2784,19 @@ def check_event_translation(helper, tray, C, r):
                                            "TUNDEV": "asuvpn0",
                                            "INTERNAL_IP4_ADDRESS":
                                                "203.0.113.99 addr=203.0.113.66\nmore"}),
+                    # A resolver list that leads with something that is not an
+                    # address. The tray is told this value and then holds the
+                    # tunnel to it -- it is the probe target and it is what the
+                    # DNS check hunts for on the link -- while what actually
+                    # gets installed is whatever asuvpn-notify's split_resolvers
+                    # accepted. Reading the variable a second way here is how
+                    # the two ends come to disagree, and the tunnel that pays
+                    # for it is a working one.
+                    C.encode_event(token, {"reason": "connect",
+                                           "TUNDEV": "asuvpn0",
+                                           "INTERNAL_IP4_ADDRESS": "192.0.2.7",
+                                           "INTERNAL_IP4_DNS":
+                                               "--listen 192.0.2.53"}),
                 ):
                     client.sendto(datagram, path)
             finally:
@@ -2733,6 +2829,12 @@ def check_event_translation(helper, tray, C, r):
             any(m and "impossible device name" in m[1] for m in decoded)
             and not any("evil" in p for p in accepted),
             f"got {emitted}")
+    r.check("the resolver the tray is told is one the link could really hold",
+            any("addr=192.0.2.7 dns=192.0.2.53" in p for p in accepted)
+            and not any("--listen" in p for p in accepted),
+            f"got {accepted} — the tray probes this value and asserts it is"
+            " configured on the link, so it has to be the same one"
+            " asuvpn-notify would install, not the raw first word")
     r.check("no event can emit more than one line",
             all(ln.count("\n") == 1 and ln.endswith("\n") for ln in emitted),
             f"got {emitted}")
@@ -2801,6 +2903,7 @@ def main():
         guarded(check_option_parsing, helper, r)
         guarded(check_reason_contract, C, r)
         guarded(check_split_dns, C, r)
+        guarded(check_documented_transitions, tray, r)
         guarded(check_source_addresses, C, r)
         guarded(check_version_is_stated_once, C, r)
         guarded(check_console_scripts, r)

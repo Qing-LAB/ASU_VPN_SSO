@@ -67,6 +67,7 @@ packages = ["asuvpn_dist"]
 include = [
     "asuvpn-tray", "asuvpn-helper", "asuvpn-notify", "asuvpn-selftest",
     "asuvpn_contract.py", "install.sh", "bootstrap.sh", "asuvpn.svg",
-    "asuvpn_dist", "README.md", "DESIGN.md", "HANDOVER.md", "LICENSE",
+    "asuvpn_dist", "README.md", "DESIGN.md", "HANDOVER.md", "SECURITY.md",
+    "LICENSE",
     "ruff.toml",
 ]

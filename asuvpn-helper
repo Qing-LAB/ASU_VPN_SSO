@@ -252,7 +252,16 @@ def serve_events(server, token, ifname, owned):
         reason = event["reason"]
         device = event["TUNDEV"]
         ip4, ip6 = event["INTERNAL_IP4_ADDRESS"], event["INTERNAL_IP6_ADDRESS"]
-        resolvers = event["INTERNAL_IP4_DNS"].split()
+        # Through the contract's own parser, not str.split(), because the tray
+        # is told this value and then holds the tunnel to it: it is the probe
+        # target, and it is what the DNS check looks for on the link. What
+        # actually gets installed there is whatever asuvpn-notify's
+        # split_resolvers accepted, so reading the variable a second way here
+        # is how the two ends come to disagree -- a gateway whose list leads
+        # with something that is not an address would have the tray hunting
+        # for it forever, demoting a working tunnel every twenty seconds and
+        # walking the ladder to an unattended sign-in.
+        resolvers = C.split_resolvers(event["INTERNAL_IP4_DNS"])
         dns = resolvers[0] if resolvers else ""
         state = C.REASON_STATES.get(reason)
         if state is None:

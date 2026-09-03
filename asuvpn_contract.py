@@ -313,6 +313,14 @@ def split_resolvers(*values):
     dropped. A scoped IPv6 address (fe80::1%asuvpn0) passes, which is right --
     resolvectl takes those, and the scope is part of the address.
 
+    **Returned in canonical form, not as the gateway spelled it.** An IPv6
+    address has many spellings and resolvectl echoes back systemd's, so a
+    gateway pushing 2001:0db8::1 would have the tray hunting the link for that
+    string while resolvectl reported 2001:db8::1 -- a resolver that is present
+    and correct, reported missing, every twenty seconds, on a working tunnel.
+    Normalising here fixes it for both ends at once: this is also the form
+    asuvpn-notify installs. It makes the dedup below exact for the same reason.
+
     Order matters: the first resolver is the one asked first, and it is also
     the one the tray takes as its liveness probe target.
     """
@@ -322,11 +330,11 @@ def split_resolvers(*values):
     for value in values:
         for word in str(value or "").replace(",", " ").split():
             try:
-                ipaddress.ip_address(word)
+                address = str(ipaddress.ip_address(word))
             except ValueError:
                 continue
-            if word not in out:
-                out.append(word)
+            if address not in out:
+                out.append(address)
     return out[:MAX_DNS_DOMAINS]
 
 
