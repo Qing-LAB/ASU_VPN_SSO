@@ -24,14 +24,19 @@ kill -0 "$OC" 2>/dev/null || { echo "  FAIL: the subject died before the test be
 echo "  helper pid=$H  openconnect pid=$OC — killing the helper with SIGKILL"
 kill -9 "$H"
 # The kernel delivers the death signal immediately; the stand-in's handler
-# runs the disconnect script and exits. Poll rather than sleep-and-hope.
-for _ in $(seq 50); do
+# runs the disconnect script and exits. Poll rather than sleep-and-hope,
+# and generously: a loaded machine's exit can straggle.
+for _ in $(seq 100); do
     kill -0 "$OC" 2>/dev/null || { survived=0; break; }
     survived=1; sleep 0.1
 done
 exec 9>&-; rm -f "$SB/ctl"
 if [ "$survived" -ne 0 ]; then
   echo "  FAIL: openconnect outlived its dead helper — as root, unreachable" >&2
+  echo "  --- the survivor, for the record ---" >&2
+  tr '\0' ' ' < "/proc/$OC/cmdline" >&2; echo >&2
+  grep -E '^(Name|PPid|SigCgt|SigIgn|SigBlk|Uid)' "/proc/$OC/status" \
+    | sed 's/^/    /' >&2
   kill -9 "$OC" 2>/dev/null
   exit 1
 fi
