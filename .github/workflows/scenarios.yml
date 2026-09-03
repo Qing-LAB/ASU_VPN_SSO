@@ -1,0 +1,78 @@
+# The slow gate: the whole scenario sandbox, on every push to main and on
+# demand. Separate from checks.yml because it installs the full desktop
+# stack, needs user namespaces un-restricted, and takes tens of minutes.
+#
+# Two runner-specific accommodations, both explained inline: Ubuntu 24.04
+# restricts unprivileged user namespaces by default (the sandbox is built on
+# them), and lib.sh pins DISPLAY=:0, so the virtual X server must be :0.
+# blackhole.sh pre-checks that RFC 5737 space actually black-holes from this
+# network and fails with an explanation if the datacenter answers it.
+name: scenarios
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+jobs:
+  sandbox:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: system packages, a display server, and a session bus
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            openconnect vpnc-scripts policykit-1 \
+            python3-gi gir1.2-gtk-3.0 gir1.2-ayatanaappindicator3-0.1 \
+            gir1.2-notify-0.7 xvfb xauth dbus uidmap \
+            build-essential libxml2-dev libxslt1-dev zlib1g-dev libffi-dev \
+            libssl-dev pkg-config
+
+      - name: let unprivileged user namespaces exist again
+        run: |
+          # Ubuntu 24.04 restricts them by default; the sandbox is built on
+          # them (that is what makes its isolation structural).
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          # --map-auto needs a subordinate id block for this user; the runner
+          # image usually has one, but the sandbox must not depend on that.
+          grep -q "^$(id -un):" /etc/subuid || \
+            echo "$(id -un):200000:65536" | sudo tee -a /etc/subuid
+          grep -q "^$(id -un):" /etc/subgid || \
+            echo "$(id -un):200000:65536" | sudo tee -a /etc/subgid
+
+      - name: cache the openconnect-sso venv (lxml compiles from source)
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.local/share/pipx/venvs/openconnect-sso
+            ~/.local/bin/openconnect-sso
+          key: ${{ runner.os }}-openconnect-sso-v1
+
+      - name: openconnect-sso (enter.sh refuses to stage without the real one)
+        run: |
+          command -v openconnect-sso >/dev/null || \
+            pipx install --python python3 'openconnect-sso[full]'
+          pipx inject openconnect-sso 'setuptools<71' --force >/dev/null
+
+      - name: the headless scenarios
+        run: |
+          for s in sec.sh sec2.sh sec3.sh fdcheck.sh stubborn.sh pdeath.sh; do
+            echo "::group::$s"
+            tests/sandbox/enter.sh "$s"
+            echo "::endgroup::"
+          done
+
+      - name: the display scenarios, under a virtual X server at :0
+        run: |
+          # fresh_home pins DISPLAY=:0 (the real desktop's display), so the
+          # virtual server has to be :0 as well — no -a auto-numbering.
+          for s in lifecycle.sh discon.sh watchdog-test.sh escalate.sh \
+                   blackhole.sh rebuild.sh contract-test.sh ipc-gate.sh; do
+            echo "::group::$s"
+            xvfb-run --server-num=0 -s '-screen 0 1280x800x24' \
+              tests/sandbox/enter.sh "$s"
+            echo "::endgroup::"
+          done

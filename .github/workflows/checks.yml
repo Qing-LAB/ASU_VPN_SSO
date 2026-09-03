@@ -1,0 +1,76 @@
+# The fast gate: every push and pull request runs the full self-test (all
+# three tiers, openconnect-sso included so the environment tier checks the
+# whole install) and the seven analysers, exactly as README "Checking it"
+# lists them — the README is the contract; this file just executes it. The
+# scenario sandbox is the separate, slower workflow (scenarios.yml).
+name: checks
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  selftest-and-analysers:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: system packages the applet needs (README Requirements)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            openconnect vpnc-scripts policykit-1 \
+            python3-gi gir1.2-gtk-3.0 gir1.2-ayatanaappindicator3-0.1 \
+            gir1.2-notify-0.7 \
+            build-essential libxml2-dev libxslt1-dev zlib1g-dev libffi-dev \
+            libssl-dev pkg-config
+
+      - name: cache the openconnect-sso venv (lxml compiles from source)
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.local/share/pipx/venvs/openconnect-sso
+            ~/.local/bin/openconnect-sso
+          key: ${{ runner.os }}-openconnect-sso-v1
+
+      - name: openconnect-sso, so the self-test checks a complete install
+        run: |
+          command -v openconnect-sso >/dev/null || \
+            pipx install --python python3 'openconnect-sso[full]'
+          # --force is load-bearing; bootstrap.sh says why at length.
+          pipx inject openconnect-sso 'setuptools<71' --force >/dev/null
+
+      - name: the whole self-test, all three tiers
+        run: /usr/bin/python3 -I asuvpn-selftest
+
+      - name: the analysers (README "Checking it", verbatim)
+        run: |
+          mkdir -p /tmp/asuvpn-lint
+          cp ruff.toml asuvpn_contract.py /tmp/asuvpn-lint/
+          cp asuvpn-tray     /tmp/asuvpn-lint/asuvpn_tray.py
+          cp asuvpn-helper   /tmp/asuvpn-lint/asuvpn_helper.py
+          cp asuvpn-selftest /tmp/asuvpn-lint/asuvpn_selftest.py
+          cp asuvpn-notify   /tmp/asuvpn-lint/asuvpn_notify.py
+          cp asuvpn_dist/install.py /tmp/asuvpn-lint/asuvpn_dist_install.py
+          pipx run ruff check /tmp/asuvpn-lint
+          pipx run pyflakes /tmp/asuvpn-lint/*.py
+          pipx run pylint --disable=all --enable=E \
+            --ignored-modules=gi,gi.repository /tmp/asuvpn-lint/*.py
+          pipx run bandit -q -r /tmp/asuvpn-lint -ll
+          pipx run vulture --min-confidence 70 /tmp/asuvpn-lint/*.py
+          pipx run mypy --ignore-missing-imports /tmp/asuvpn-lint/*.py
+          pipx run --spec shellcheck-py shellcheck -S style \
+            bootstrap.sh install.sh tests/sandbox/*.sh \
+            tests/sandbox/bin/pkexec tests/sandbox/bin/sso-python \
+            tests/sandbox/bin/vpnc-script
+
+      - name: the wheel builds, installs, and the installed copy self-checks
+        run: |
+          pipx run build
+          python3 -m venv /tmp/wheel-venv
+          /tmp/wheel-venv/bin/pip -q install dist/*.whl
+          # A throwaway HOME: the same install.sh the repo ships runs from
+          # the wheel's payload and ends with the installed self-check.
+          HOME=/tmp/wheel-home /tmp/wheel-venv/bin/asuvpn-install

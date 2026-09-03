@@ -18,3 +18,7 @@ tests/sandbox/xauth
 tests/sandbox/tray.err
 tests/sandbox/evil_contract.py
 tests/sandbox/ctl
+
+# packaging build output
+dist/
+build/

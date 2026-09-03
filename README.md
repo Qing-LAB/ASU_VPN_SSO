@@ -1,5 +1,8 @@
 # ASU VPN SSO
 
+[![checks](https://github.com/Qing-LAB/ASU_VPN_SSO/actions/workflows/checks.yml/badge.svg)](https://github.com/Qing-LAB/ASU_VPN_SSO/actions/workflows/checks.yml)
+[![scenarios](https://github.com/Qing-LAB/ASU_VPN_SSO/actions/workflows/scenarios.yml/badge.svg)](https://github.com/Qing-LAB/ASU_VPN_SSO/actions/workflows/scenarios.yml)
+
 **Click-to-connect for the ASU VPN on Linux.** A GNOME panel applet and an
 `asuvpn` command line client for Arizona State University's SSL VPN
 (`sslvpn.asu.edu`), wrapping [`openconnect`](https://www.infradead.org/openconnect/)
@@ -100,6 +103,29 @@ openconnect-sso --server sslvpn.asu.edu --authenticate=shell
 
 `--authenticate=shell` matters: without it, `openconnect-sso` goes on to run
 `sudo openconnect` itself and leaves a foreground tunnel you have to Ctrl-C.
+
+### From PyPI instead
+
+The same app is on PyPI as a delivery channel — the package carries this
+repository's programs and its own `install.sh`, and installs them exactly the
+way a checkout does (same files, same places, same self-check at the end):
+
+```bash
+pipx install asuvpn
+asuvpn-install                  # accepts install.sh's flags, e.g. --server
+```
+
+What PyPI cannot carry is the system half — the GTK bindings, `openconnect`,
+`pkexec`, the GNOME tray extension. On Ubuntu/Debian, one line covers them
+(this is what `bootstrap.sh` automates, minus the Python 3.12 story in
+[Requirements](#requirements)):
+
+```bash
+sudo apt install openconnect vpnc-scripts policykit-1 python3-gi \
+  gir1.2-gtk-3.0 gir1.2-ayatanaappindicator3-0.1 gir1.2-notify-0.7
+```
+
+Updating later is `pipx upgrade asuvpn && asuvpn-install`.
 
 ## Using it
 
@@ -1087,6 +1113,8 @@ teardown, and logged precisely so a declined action never reads as a hang.
 | [`HANDOVER.md`](HANDOVER.md) | What is proven and what is not, the lessons behind the design, and what to do next. |
 | [`STATE-MACHINE-PLAN.md`](STATE-MACHINE-PLAN.md) | The state-machine rebuild's plan of record: the rationale and the decisions. The as-built table is in DESIGN.md. |
 | [`ruff.toml`](ruff.toml) | Lint config. Its `ignore` list records which rules are off and why. |
+| [`pyproject.toml`](pyproject.toml) + [`asuvpn_dist/`](asuvpn_dist/install.py) | The PyPI delivery channel: a wheel carrying these same files, and `asuvpn-install`, which runs the bundled `install.sh`. |
+| [`.github/workflows/`](.github/workflows) | CI: the self-test and analysers on every push and PR; the scenario sandbox on main; PyPI publishing on a `v*` tag. |
 | [`LICENSE`](LICENSE) | MIT. |
 
 ### Checking it
@@ -1140,6 +1168,7 @@ cp asuvpn-tray     /tmp/asuvpn-lint/asuvpn_tray.py
 cp asuvpn-helper   /tmp/asuvpn-lint/asuvpn_helper.py
 cp asuvpn-selftest /tmp/asuvpn-lint/asuvpn_selftest.py
 cp asuvpn-notify   /tmp/asuvpn-lint/asuvpn_notify.py
+cp asuvpn_dist/install.py /tmp/asuvpn-lint/asuvpn_dist_install.py
 
 ruff check /tmp/asuvpn-lint
 pyflakes   /tmp/asuvpn-lint/*.py
@@ -1154,7 +1183,10 @@ shellcheck -S style bootstrap.sh install.sh tests/sandbox/*.sh \
 
 All of these are expected to be clean. None of them need installing: `pipx run
 <tool>` runs each from pipx's own cache and touches nothing else (the last one
-as `pipx run --spec shellcheck-py shellcheck`). mypy's `--ignore-missing-imports`
+as `pipx run --spec shellcheck-py shellcheck`). CI runs this same list plus
+the full self-test on every push and pull request
+([checks.yml](.github/workflows/checks.yml)), and the whole scenario sandbox
+on pushes to main ([scenarios.yml](.github/workflows/scenarios.yml)). mypy's `--ignore-missing-imports`
 is for `gi`, which ships no stubs.
 
 The plain mypy run exits 0; the few `annotation-unchecked` notes it prints are
