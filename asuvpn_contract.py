@@ -29,6 +29,13 @@ import os
 import re
 import stat
 
+# The release version, stated once. pyproject.toml reads it from this line at
+# build time (hatchling's version pattern), `asuvpn --version` prints it, the
+# applet logs it at startup and shows it at the bottom of its menu, and the
+# self-test banner reports it. Distinct from CONTRACT_VERSION below, which
+# tracks the wire format and moves only when the programs must agree anew.
+VERSION = "0.9.0"
+
 # Bumped when the wire format changes in a way the programs must agree on.
 # `asuvpn selftest` reports it, and the header of a generated config file
 # records the version that wrote it. It cannot catch a half-updated install by

@@ -1463,6 +1463,13 @@ class VpnTray(StateMachine):
         except OSError:
             pass  # an unwritable cache dir costs the log, not the applet
 
+        # Which build wrote this log: the applet announces itself once, at
+        # startup. (Connecting rotates the log, so on a long-lived applet
+        # this line lives in the rotated generations rather than the
+        # current file — `asuvpn --version` asks the running code directly.)
+        self.log(f"[tray] {APP_NAME} {C.VERSION}"
+                 f" (contract {C.CONTRACT_VERSION}) starting")
+
         Notify.init(APP_NAME)
         self.indicator = AppIndicator.Indicator.new(
             APP_ID, ICONS[DISCONNECTED], AppIndicator.IndicatorCategory.SYSTEM_SERVICES
@@ -1549,6 +1556,13 @@ class VpnTray(StateMachine):
         quit_item = Gtk.MenuItem(label="Quit")
         quit_item.connect("activate", lambda _w: self.quit())
         self.menu.append(quit_item)
+
+        # Which build answered — support's first question, so it is one
+        # glance away rather than a terminal away. Insensitive, like the
+        # status line; the same string `asuvpn --version` prints.
+        version_item = Gtk.MenuItem(label=f"{APP_NAME} {C.VERSION}")
+        version_item.set_sensitive(False)
+        self.menu.append(version_item)
 
         self.menu.show_all()
         self.indicator.set_menu(self.menu)
@@ -2787,6 +2801,11 @@ def main():
     )
     # Left as None so we can tell "not given" from "same as the default", which
     # decides whether a mismatch with a running applet is worth complaining about.
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"asuvpn {C.VERSION} (contract {C.CONTRACT_VERSION})",
+    )
     parser.add_argument(
         "--server",
         default=None,

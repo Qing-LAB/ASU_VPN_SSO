@@ -2270,8 +2270,9 @@ def main():
 
     if "environment" in tiers:
         r.section("environment — our assumptions, put to the installed binaries")
-        r.info(f"the contract is version {C.CONTRACT_VERSION}; every program"
-               " loaded the one beside itself")
+        r.info(f"this is asuvpn {C.VERSION}, contract version"
+               f" {C.CONTRACT_VERSION}; every program loaded the one copy"
+               " beside itself")
         binary = guarded(check_openconnect, helper, r)
         guarded(check_gives_up, helper, r, binary)
         guarded(check_default_script, helper, C, binary, r)

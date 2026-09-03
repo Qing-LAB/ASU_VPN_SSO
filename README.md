@@ -161,7 +161,9 @@ connecting. While the applet is waiting to retry a connection that dropped,
 **Stop reconnecting** appears — it calls the retries off without changing any
 setting. Nothing can be cancelled during teardown, which must not be
 interrupted. **Show log…** opens a live log window, and **Quit** closes the
-tunnel first.
+tunnel first. The bottom of the menu names the running build (`ASU VPN
+0.9.0`) — the same answer `asuvpn --version` gives, and the applet logs it
+at startup.
 
 **Start on login (applet only)** puts the icon in your tray at login without
 connecting — so you are not met with a Duo push before you have asked for one.
@@ -298,9 +300,10 @@ so this does not depend on how any of them happen to be worded:
 asuvpn status >/dev/null || asuvpn connect --wait
 ```
 
-Other options: `--server HOST` for a different endpoint, `--foreground` to keep
-the applet attached to the terminal, and a bare `--` to pass extra arguments
-through to `openconnect`. Flags may go before or after the command.
+Other options: `--server HOST` for a different endpoint, `--foreground` to
+keep the applet attached to the terminal, `--version` to print the release
+and wire-contract versions, and a bare `--` to pass extra arguments through
+to `openconnect`. Flags may go before or after the command.
 
 Arguments after `--` are checked for options that would detach `openconnect`
 from its supervisor — `--background`, `--syslog`, `--pid-file` and friends are
@@ -1103,7 +1106,7 @@ teardown, and logged precisely so a declined action never reads as a hang.
 | [`asuvpn-tray`](asuvpn-tray) | The applet and the `asuvpn` CLI. Runs as you, on the system `python3`. |
 | [`asuvpn-helper`](asuvpn-helper) | The root side, run under `pkexec`. Owns `openconnect`'s lifetime. |
 | [`asuvpn-notify`](asuvpn-notify) | The `vpnc-script` wrapper. Reports state, then chains to the real script. |
-| [`asuvpn_contract.py`](asuvpn_contract.py) | What the programs agree on: wire format, control verbs, event fields, and the settings schema. Loaded, not run. |
+| [`asuvpn_contract.py`](asuvpn_contract.py) | What the programs agree on: wire format, control verbs, event fields, the settings schema — and the release version, stated once and read by everything including the build. Loaded, not run. |
 | [`asuvpn-selftest`](asuvpn-selftest) | Checks the install against the machine. Run by `install.sh`, and by `asuvpn selftest`. |
 | [`bootstrap.sh`](bootstrap.sh) | Installs dependencies, then calls `install.sh`. |
 | [`install.sh`](install.sh) | Copies the app into `~/.local` and registers it. No system changes. |

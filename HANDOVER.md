@@ -324,8 +324,10 @@ asuvpn log -f                   # what it is actually doing
 Analysers (all expected clean) are listed in the README's
 [Checking it](README.md#checking-it) section; CI runs them plus the full
 self-test on every push (`checks.yml`) and the scenario sandbox on main
-(`scenarios.yml`). Releases: push a `v*` tag and `release.yml` publishes to
-PyPI via Trusted Publishing — configured once on pypi.org (project `asuvpn`,
+(`scenarios.yml`). Releases: bump `VERSION` in
+`asuvpn_contract.py` (the single source — the build, `--version`, the menu
+and the startup log all read it), commit, then push a matching `v*` tag and
+`release.yml` publishes to PyPI via Trusted Publishing — configured once on pypi.org (project `asuvpn`,
 repo `Qing-LAB/ASU_VPN_SSO`, workflow `release.yml`, environment `pypi`);
 until then the upload step fails harmlessly. `DESIGN.md` has the invariants
 table and a "Changing things" section saying what to update in lockstep.
