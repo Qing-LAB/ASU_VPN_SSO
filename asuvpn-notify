@@ -7,8 +7,33 @@ alongside TUNDEV and INTERNAL_IP4_ADDRESS. That is a documented, versioned
 contract (openconnect.org/vpnc-script.html), inherited from vpnc and unchanged
 across the v7 to v8 rename that silently broke log-message matching.
 
-This forwards one datagram to asuvpn-helper and then execs the real
-vpnc-script, so routing and DNS are configured exactly as they would have been.
+This forwards one datagram to asuvpn-helper, configures DNS itself, and then
+execs the real vpnc-script, so routing is configured exactly as it would have
+been.
+
+DNS is the one thing not left to the real script, and only where
+systemd-resolved is running. The stock vpnc-script decides how to install a
+resolver by grepping /etc/nsswitch.conf for `resolve`; on a machine using
+systemd-resolved through its stub -- Ubuntu's default, where nss-resolve is not
+installed -- that grep fails, the script falls all the way through to its
+generic branch, and the generic branch writes the tunnel's resolver into
+/etc/resolv.conf. That path is a symlink to a file systemd-resolved owns, so the
+change survives only until resolved next rewrites it, which it does at any link
+change. The tunnel then keeps carrying traffic while internal names quietly stop
+resolving, and nothing about the tunnel looks wrong -- which is exactly how this
+went unnoticed for hours at a time.
+
+So this configures the resolver where it belongs: on the link, through
+systemd-resolved's own interface, with the tunnel's domains routed to it and
+every other name left on the resolver the machine already had. That is what a
+split tunnel needs and what a single global resolver list cannot express. Having
+done it, this removes INTERNAL_IP4_DNS from the environment the real script
+inherits, because the real script guards both its DNS branches on that variable
+being set -- so the handover is total and there are two owners of nothing.
+
+If any of that does not work, the variable stays and the real script does
+whatever it would have done. Falling back to the old behaviour is always better
+than half-configuring DNS.
 
 Reporting is best effort and never fatal: a failure here must not stop the
 tunnel being configured. Isolated (-I) for the same reason as the helper — this
@@ -70,17 +95,220 @@ def report():
         client.close()
 
 
+# systemd's own tool, and the same one the stock vpnc-script reaches for on a
+# machine where it does detect resolved. Absolute paths, and no PATH lookup:
+# this runs as root, and the environment it runs in came from openconnect.
+RESOLVECTL_PATHS = ("/usr/bin/resolvectl", "/bin/resolvectl")
+
+# Generous for a call that answers in milliseconds, and the point is only that
+# there is a bound at all. openconnect waits for this script, so a resolved that
+# has wedged must cost the connection a few seconds, not hang it.
+RESOLVECTL_TIMEOUT = 5
+
+
+def note(message):
+    """Say what was done with DNS, on the stream openconnect relays.
+
+    Not silent even when it works. The failure this whole path exists to fix was
+    invisible -- a tunnel that looked perfect while name resolution was quietly
+    wrong -- so the log gets a line saying which resolver went on which link and
+    which names were pointed at it, every time.
+    """
+    try:
+        sys.stderr.write(f"asuvpn: {message}\n")
+        sys.stderr.flush()
+    except OSError:
+        pass
+
+
+def resolvectl_path():
+    """Where resolvectl is, or None if this machine has none."""
+    for path in RESOLVECTL_PATHS:
+        if os.access(path, os.X_OK):
+            return path
+    return None
+
+
+def resolvectl(binary, *argv, quiet=False):
+    """Run one resolvectl subcommand. True if it worked; never raises.
+
+    No shell, an explicit argument list, and every value already checked against
+    the contract's own patterns before it gets here -- a domain the gateway sent
+    is about to be an argument to a program running as root.
+
+    `quiet` is for the reverts. A revert either tidies up after a failure that
+    has already been reported, or runs on the way out against a link that is
+    usually gone by then -- and "no such device" on every clean disconnect is
+    noise that would teach the reader to skim these lines.
+    """
+    import subprocess
+
+    try:
+        done = subprocess.run([binary, *argv], stdin=subprocess.DEVNULL,
+                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                              timeout=RESOLVECTL_TIMEOUT, check=False)
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        if not quiet:
+            note(f"resolvectl {argv[0]} failed: {exc}")
+        return False
+    if done.returncode != 0:
+        if not quiet:
+            detail = done.stdout.decode("utf-8", "replace").strip().replace("\n", "; ")
+            note(f"resolvectl {argv[0]} exited {done.returncode}: {detail}")
+        return False
+    return True
+
+
+def tunnel_resolvers(env):
+    """The resolvers the gateway pushed, IPv4 first, as resolvectl wants them.
+
+    Both families come out of INTERNAL_IP4_DNS despite its name: openconnect
+    merges every resolver the gateway pushed into that one variable, IPv6
+    included, and does not set INTERNAL_IP6_DNS at all (verified against the
+    installed library by `asuvpn selftest`). Reading INTERNAL_IP6_DNS as well
+    costs nothing and is what the documented contract says vpnc sets. This is
+    also why the addresses are validated as addresses of either family rather
+    than as IPv4 -- holding them to the variable's name would throw away
+    working resolvers.
+
+    Validated on the way through, like the domains: a gateway chose these and
+    they are about to be arguments to a program running as root.
+    """
+    return C.split_resolvers(env.get("INTERNAL_IP4_DNS"),
+                             env.get("INTERNAL_IP6_DNS"))
+
+
+def tunnel_domains(env):
+    """Which names belong behind this tunnel, and where that was decided.
+
+    The gateway's own answer wins: CISCO_DEF_DOMAIN and CISCO_SPLIT_DNS are it
+    saying which names it serves, and nothing local should overrule that. Only
+    when it says nothing does the helper's value apply -- the user's setting, or
+    the domain derived from the gateway's own address.
+    """
+    pushed = C.split_domains(env.get("CISCO_DEF_DOMAIN"),
+                             env.get("CISCO_SPLIT_DNS"))
+    if pushed:
+        return pushed, "pushed by the gateway"
+    return C.split_domains(env.get(C.DNS_DOMAINS_VAR)), "configured locally"
+
+
+def apply_dns(env, device, binary):
+    """Put the tunnel's resolver on the tunnel's link. True if DNS is now ours.
+
+    False means nothing was changed and the caller must leave the real script's
+    DNS handling alone. Every failure returns False, and any failure after the
+    first change reverts the link first: a link holding servers but not the
+    domains that scope them is worse than one holding neither, because
+    systemd-resolved would then treat the tunnel as a candidate for every
+    lookup on the machine.
+
+    `binary` is passed in rather than looked up here so that the tool is
+    resolved once per run, and so `asuvpn selftest` can drive this against a
+    stand-in and check the calls it makes. The lookup itself stays in
+    handle_dns, hardcoded: this runs as root and must not take the path to a
+    program it executes from anything openconnect could have set.
+    """
+    servers = tunnel_resolvers(env)
+    if not servers:
+        return False  # nothing was pushed; there is nothing to install
+    domains, source = tunnel_domains(env)
+
+    # Ordered so the link is never briefly wrong. Scope first, servers last: a
+    # link with domains and no servers resolves nothing, which is harmless,
+    # while a link with servers and no scope catches every query on the machine.
+    if domains:
+        # Explicit, though listing any domain already implies it. Saying so
+        # costs one call and removes the need to know the implication.
+        resolvectl(binary, "default-route", device, "no")
+        if not resolvectl(binary, "domain", device, *domains):
+            resolvectl(binary, "revert", device, quiet=True)
+            return False
+    else:
+        # The gateway named no domains and none could be derived. Scoping to
+        # nothing would mean resolving nothing, so the link takes every query
+        # instead -- which is what the script this replaces would have done, and
+        # is never worse than it. Named as the compromise it is.
+        resolvectl(binary, "default-route", device, "yes")
+        note(f"no domains for {device}: every lookup may go to the tunnel's"
+             " resolver. Set dns-domains to scope it.")
+    if not resolvectl(binary, "dns", device, *servers):
+        resolvectl(binary, "revert", device, quiet=True)
+        return False
+
+    where = " ".join(domains) if domains else "all names"
+    note(f"DNS for {where} on {device} via {' '.join(servers)}"
+         f" ({source}); /etc/resolv.conf left alone")
+    return True
+
+
+def revert_dns(device, binary):
+    """Drop whatever this put on the link, on the way out.
+
+    Unconditional and quiet: the link is usually gone by now, reverting one that
+    was never configured does nothing, and there is no outcome here worth a line
+    in the log.
+
+    INTERNAL_IP4_DNS is deliberately *not* removed on the way out, however this
+    turns out. If a previous connect fell back, the real script has a
+    /etc/resolv.conf backup to put back and needs that variable set to do it --
+    and its restore is already a no-op when there is no backup, so letting it
+    run always is the only choice that is right in both cases.
+    """
+    resolvectl(binary, "revert", device, quiet=True)
+
+
+def handle_dns(environ, binary=None):
+    """Take DNS over for this transition, if it is ours to take.
+
+    The helper sets DNS_DOMAINS_VAR whenever the user has this turned on, so its
+    presence -- not its value, which is empty whenever no fallback domain could
+    be worked out -- is the switch. Absent means the user turned it off, or this
+    is being run as a vpnc-script by hand; either way the real script keeps the
+    job it has always had.
+    """
+    if C.DNS_DOMAINS_VAR not in environ:
+        return
+    binary = resolvectl_path() if binary is None else binary
+    if binary is None:
+        return  # no systemd-resolved on this machine; nothing to hand it
+    device = environ.get("TUNDEV", "")
+    if not C.INTERFACE_RE.match(device):
+        # About to be an argument to a root command. The helper checks this too;
+        # a rule that guards a privileged call is checked where the call is.
+        note(f"not touching DNS: {device!r} cannot be a device name")
+        return
+    reason = environ.get("reason", "")
+    if reason == "disconnect":
+        revert_dns(device, binary)
+    elif reason in ("connect", "reconnect") and apply_dns(environ, device, binary):
+        # The real script guards both its DNS branches on this one variable
+        # (vpnc-script: `if [ -n "$INTERNAL_IP4_DNS" ]`), so removing it is how
+        # it is told the job is done -- routing untouched, DNS entirely ours.
+        environ.pop("INTERNAL_IP4_DNS", None)
+    # attempt-reconnect and pre-init are left alone on purpose. The link is
+    # coming back, `reconnect` will configure it again, and tearing the resolver
+    # down in between would only send lookups meant for the tunnel out over the
+    # public resolver instead.
+
+
 def main():
     try:
         report()
     except Exception:  # reporting must never break routing
         pass
 
-    # Hand over with the environment intact; the real script needs every var
-    # openconnect set. --script is a shell command line, not a path, so this
-    # goes through sh exactly as openconnect would have run it. The fallback is
-    # only reached when this is run as a vpnc-script by hand: in normal use the
-    # helper always sets the real script, derived from `openconnect --version`.
+    try:
+        handle_dns(os.environ)
+    except Exception as exc:  # DNS must never break routing either
+        note(f"leaving DNS to the real script: {exc.__class__.__name__}: {exc}")
+
+    # Hand over with the environment otherwise intact; the real script needs
+    # every var openconnect set. --script is a shell command line, not a path,
+    # so this goes through sh exactly as openconnect would have run it. The
+    # fallback is only reached when this is run as a vpnc-script by hand: in
+    # normal use the helper always sets the real script, derived from
+    # `openconnect --version`.
     script = os.environ.get(C.REAL_SCRIPT_VAR) or C.FALLBACK_VPNC_SCRIPT
     for var in C.EVENT_VARS:
         os.environ.pop(var, None)

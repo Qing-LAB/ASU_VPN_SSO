@@ -152,6 +152,37 @@ ICONS = {
 
 BUSY_STATES = (AUTHENTICATING, CONNECTING, RECOVERING, DEMOTED, DISCONNECTING)
 
+# The independent things that can find a tunnel unusable. Strikes are counted
+# per source, never pooled: they fail for unrelated reasons and each has to
+# clear on its own evidence (see _check_clear).
+#
+#   device  the kernel's view -- the device, its incarnation, its routes
+#   probe   whether anything actually answers through the tunnel
+#   dns     whether the resolver the VPN pushed is still configured on its link
+#
+# DEMOTED means "established but not usable", and the three are not usable in
+# different ways, so each brings its own wording rather than sharing one that
+# would be a lie for two of them. A tunnel whose DNS has been taken off the link
+# is carrying traffic perfectly; what it cannot do is resolve the names that
+# traffic is for.
+CHECK_SOURCES = ("device", "probe", "dns")
+DEMOTION_TEXT = {
+    "device": "not carrying traffic",
+    "probe": "not carrying traffic",
+    "dns": "DNS not configured",
+}
+
+
+def fresh_strikes():
+    """A clean strike count for every source.
+
+    One function because this was written out three times and gained a source
+    in none of them -- a new check would have raised KeyError on its first bad
+    verdict, in a thread, at the moment it had something to report.
+    """
+    return dict.fromkeys(CHECK_SOURCES, 0)
+
+
 # RECOVERING and DEMOTED keep the wording users already know; the detail line
 # ("link lost, retrying" / "not carrying traffic — …") is what distinguishes
 # them, exactly as before they were real states.
@@ -371,6 +402,101 @@ def probe_tunnel(address, port, timeout):
         # be resolved at all -- equally inconclusive, and letting it raise
         # would kill the probe thread and wedge probing for good.
         return None, f"{address}: {exc.__class__.__name__}"
+
+
+# The tray reads systemd-resolved; it never writes it. Configuring a link needs
+# root, and asuvpn-notify already does it at the only moment it can be done
+# correctly. What is left here is the question nothing else was asking: is the
+# configuration it installed still there?
+RESOLVECTL_PATHS = ("/usr/bin/resolvectl", "/bin/resolvectl")
+RESOLVECTL_TIMEOUT = 5
+
+
+def link_resolvers(device):
+    """The resolvers systemd-resolved has on this link, or None if unanswerable.
+
+    None is not a verdict. No resolvectl, resolved not running, the device
+    already gone -- none of those is evidence that DNS is wrong, and the device
+    checks give a far better diagnosis of the last one.
+
+    Reading needs no privilege: this is a query over resolved's bus, and the
+    per-link state files under /run/systemd/resolve/netif are 0700 to
+    systemd-resolve, so the tool is the only way in from an ordinary account.
+    """
+    binary = next((path for path in RESOLVECTL_PATHS if os.access(path, os.X_OK)),
+                  None)
+    if binary is None or not device:
+        return None
+    try:
+        done = subprocess.run([binary, "dns", device], stdin=subprocess.DEVNULL,
+                              stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                              timeout=RESOLVECTL_TIMEOUT, check=False)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+    if done.returncode != 0:
+        return None
+    # "Link 9 (asuvpn0): 192.0.2.53 2620:d8::1", or nothing after the colon
+    # when the link has none. Partitioned on the first colon only, because an
+    # IPv6 resolver is full of them.
+    text = done.stdout.decode("utf-8", "replace")
+    _, sep, rest = text.partition(":")
+    return rest.split() if sep else []
+
+
+def resolv_conf_lists(resolver):
+    """Is this resolver named in /etc/resolv.conf?
+
+    Only ever asked as a second opinion. asuvpn-notify hands DNS back to the
+    stock vpnc-script whenever it cannot configure the link itself, and the
+    stock script's fallback writes /etc/resolv.conf -- so a resolver that is not
+    on the link may still be perfectly in force, installed the old way. Missing
+    that would demote a working tunnel every twenty seconds and walk the
+    recovery ladder up to an unattended sign-in, which is a Duo push every five
+    minutes for a tunnel with nothing wrong with it.
+    """
+    try:
+        with open("/etc/resolv.conf", encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                fields = line.split("#", 1)[0].split()
+                if len(fields) >= 2 and fields[0] == "nameserver" \
+                        and fields[1] == resolver:
+                    return True
+    except OSError:
+        pass
+    return False
+
+
+def resolver_health(device, expected):
+    """Why the tunnel's resolver is not in force anywhere, or None. Third check.
+
+    This is the failure the other two cannot see, and the reason it needed its
+    own source: the device is up, the routes are installed, packets cross the
+    tunnel in both directions -- and internal names resolve to whatever the
+    public internet says, because something took the resolver back off the link.
+    systemd-resolved rewriting its own stub file does exactly that, and every
+    other check passes throughout.
+
+    The question is deliberately "is this resolver in force", not "is it on the
+    link". Which mechanism installed it is asuvpn-notify's business and it has
+    two; asserting the one it prefers would demote a tunnel using the other.
+
+    Only the resolver is asserted, not the domains beside it. It is the whole of
+    what makes the link resolve anything, it is the one value that reached here
+    from the tunnel itself, and a check that tests less is a check that cannot
+    be wrong about what it tests.
+    """
+    if not device or not expected:
+        return None, "nothing to check"
+    servers = link_resolvers(device)
+    if servers is None:
+        return None, "systemd-resolved did not answer"
+    if expected in servers:
+        return None, f"{expected} is still on {device}"
+    if resolv_conf_lists(expected):
+        return None, f"{expected} is in /etc/resolv.conf, not on {device}"
+    return ("the resolver the VPN pushed is no longer in force",
+            f"{device} has {' '.join(servers) or 'no resolvers'} and"
+            f" /etc/resolv.conf does not name {expected} either")
 
 
 def read_ifindex(device):
@@ -1161,8 +1287,12 @@ class StateMachine:
         # every forty seconds is its own fault.
         first = self.state != DEMOTED
         self.log(f"[tray] the tunnel is not usable: {reason}")
-        self.strikes = {"device": 0, "probe": 0}
-        self._set_state(DEMOTED, f"not carrying traffic — {reason}")
+        self.strikes = fresh_strikes()
+        # demoted_by was set by the caller immediately before this; it is the
+        # source whose verdict got us here, and different sources mean
+        # different things by "not usable".
+        headline = DEMOTION_TEXT.get(self.demoted_by, "not usable")
+        self._set_state(DEMOTED, f"{headline} — {reason}")
 
         now = time.monotonic()
         # One nudge per incident. An incident no longer ends at the reconnect
@@ -1187,8 +1317,8 @@ class StateMachine:
         # that looked promising did not stick.
         if not self.failure_notified:
             self.failure_notified = True
-            self.notify("VPN not carrying traffic", reason,
-                        icon="dialog-warning-symbolic")
+            self.notify(f"VPN {DEMOTION_TEXT.get(self.demoted_by, 'not usable')}",
+                        reason, icon="dialog-warning-symbolic")
 
         # From here on, every path logs the decision it took and why. A log
         # that shows verdicts but no decisions reads as a hang: on 2026-08-23
@@ -1329,7 +1459,7 @@ class StateMachine:
         callers and a third divergent copy is how the tunnel-state reset
         went wrong once (see _reset_tunnel_state).
         """
-        self.strikes = {"device": 0, "probe": 0}
+        self.strikes = fresh_strikes()
         self.demoted_by = None
         self.nudge_spent = False
         self.failure_notified = False
@@ -1423,6 +1553,7 @@ class VpnTray(StateMachine):
         self._reset_tunnel_state()
         self.probe_cycle = 0
         self.probe_in_flight = False
+        self.dns_check_in_flight = False
         self._setting_problems = []
         self._health_interval = SETTINGS["health-interval"]
         # -inf, not 0: time.monotonic() counts from boot, so a zero here would
@@ -2038,6 +2169,11 @@ class VpnTray(StateMachine):
             C.AC_VERSION,
         ]
         command += ["--dpd", str(SETTINGS["dpd"])]
+        if SETTINGS["dns"]:
+            # Presence is the switch. The value may well be empty -- that only
+            # says no fallback domain was configured, and the helper derives
+            # one from the server address in that case.
+            command += ["--dns-domains", SETTINGS["dns-domains"]]
         if self.extra_args:
             command += ["--", *self.extra_args]
 
@@ -2219,11 +2355,55 @@ class VpnTray(StateMachine):
             # openconnect owning its own recovery.
             return True
 
+        # Every check, not every third like the probe: this asks the local
+        # resolver daemon a question instead of sending a packet down the
+        # tunnel, so there is nothing to ration. Gated on the setting because a
+        # user who left DNS to vpnc-script has nothing here worth asserting,
+        # and on tunnel_dns because a VPN that pushed no resolver never had one
+        # installed to lose.
+        if (SETTINGS["dns"] and self.tunnel_dns
+                and not self.dns_check_in_flight):
+            self._start_dns_check()
+
         self.probe_cycle += 1
         if (SETTINGS["probe"] and self._probe_target() and not self.probe_in_flight
                 and self.probe_cycle % max(1, SETTINGS["probe-every"]) == 0):
             self._start_probe()
         return True
+
+    def _start_dns_check(self):
+        """Off the main loop, for the same reason the probe is.
+
+        resolvectl answers in milliseconds, but it is a subprocess and a bus
+        round trip, and a resolved that has wedged would otherwise freeze the
+        applet for RESOLVECTL_TIMEOUT with the menu open.
+        """
+        self.dns_check_in_flight = True
+        device, expected = self.tunnel_device, self.tunnel_dns
+        generation = self.helper_generation
+
+        def work():
+            try:
+                reason, detail = resolver_health(device, expected)
+            except Exception as exc:
+                # The reply has to arrive whatever happened: the in-flight flag
+                # is cleared only in _dns_check_result, so a thread that died
+                # here would disable this check for the applet's lifetime.
+                reason, detail = None, f"dns check error: {exc.__class__.__name__}"
+            GLib.idle_add(self._dns_check_result, reason, detail, generation)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _dns_check_result(self, reason, detail, generation):
+        self.dns_check_in_flight = False
+        if self.quitting or generation != self.helper_generation:
+            return False  # an answer about a tunnel that is no longer the live one
+        # A verdict like any other. The table weighs it, and stands aside in
+        # RECOVERING -- openconnect is rebuilding the link, and the resolver
+        # goes back on it when `reconnect` runs asuvpn-notify again, which is
+        # also precisely how a demotion from here gets repaired.
+        self.dispatch(MSG_CHECK, source="dns", reason=reason, detail=detail)
+        return False
 
     def _probe_target(self):
         """Where to probe: what the user configured, else what the VPN pushed."""

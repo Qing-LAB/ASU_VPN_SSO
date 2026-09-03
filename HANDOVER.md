@@ -315,7 +315,7 @@ others use `abspath`, and the reference copy in the contract says which.
 ## How to work on it
 
 ```bash
-asuvpn selftest                 # 124 checks; run before and after any change
+asuvpn selftest                 # 154 checks; run before and after any change
 tests/sandbox/enter.sh sec.sh   # scenario tests, in a namespace of stand-ins
 ./install.sh                    # copies into ~/.local, runs the self-check
 asuvpn log -f                   # what it is actually doing

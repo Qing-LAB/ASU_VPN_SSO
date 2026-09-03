@@ -209,8 +209,8 @@ dpd = 30
 Most of it takes effect without reconnecting: the built-in health checker
 (the "watchdog" below) re-reads the file on every check, so changing
 `health-interval`, `probe`, `probe-target` or the rate limits applies within
-seconds. `dpd` reaches `openconnect` on its command line,
-so that one needs a reconnect. A malformed line costs that setting its default
+seconds. `dpd`, `dns` and `dns-domains` reach `openconnect` and its script on
+the command line, so those three need a reconnect. A malformed line costs that setting its default
 and logs a sentence saying so — a config file is never a reason to be unable to
 connect.
 
@@ -219,6 +219,8 @@ connect.
 | `server` | `sslvpn.asu.edu` | The endpoint. Set by `install.sh --server`. |
 | `autoreconnect` | `on` | Let the applet sign in again by itself — both when a stalled tunnel cannot be freed and when one has died outright. It is always the last thing tried, never the first, and it costs a Duo push and a password when it fires. |
 | `dpd` | `30` | Dead-peer probe interval, forced on. **`0` leaves the server's choice alone** — the escape hatch if forcing it ever misbehaves. |
+| `dns` | `on` | Put the resolver the VPN pushes on the tunnel's own link, through `systemd-resolved`, instead of letting `vpnc-script` rewrite `/etc/resolv.conf`. This is what makes internal names resolve *and keep resolving*. See [DNS, and why it is not written to `/etc/resolv.conf`](#dns-and-why-it-is-not-written-to-etcresolvconf). |
+| `dns-domains` | *(empty)* | Which names to resolve through the tunnel when the gateway names none itself. Empty derives one from `server` — `sslvpn.asu.edu` gives `asu.edu`. What the gateway pushes always wins over both. |
 | `health-interval` | `20` | Seconds between checks. **`0` turns the watchdog off** — the config file is still re-read at the default cadence, so turning it back on needs no restart. |
 | `health-strikes` | `2` | Consecutive bad checks before the badge stops claiming Connected. |
 | `probe` | `on` | Ask the network whether traffic still flows. The only check that catches a tunnel that looks perfect and delivers nothing. |
@@ -610,9 +612,12 @@ environment — `reason` is one of `pre-init`, `connect`, `disconnect`,
 from vpnc; the log wording is neither.
 
 [`asuvpn-notify`](asuvpn-notify) is installed as that script. It forwards one
-datagram to the helper and then `exec`s the real `vpnc-script`, so routing and
-DNS are configured exactly as they would have been. If you pass your own
-`--script`, it is chained rather than discarded.
+datagram to the helper, configures the tunnel's DNS on the tunnel's own link,
+and then `exec`s the real `vpnc-script`, so routing is configured exactly as it
+would have been. DNS is the one thing it keeps — see
+[DNS, and why it is not written to `/etc/resolv.conf`](#dns-and-why-it-is-not-written-to-etcresolvconf)
+for why leaving it to the real script silently stops working on Ubuntu. If you
+pass your own `--script`, it is chained rather than discarded.
 
 Which script it chains to is **asked of `openconnect`**, not assumed:
 `openconnect --version` reports its own compiled-in default, which is
@@ -744,6 +749,22 @@ everything else uses. Whatever this tunnel says to resolve against is by
 definition something that ought to answer through it. The `probe-target`
 setting overrides that derivation if you know better for your network. A VPN
 that pushes no resolver simply gets the device checks.
+
+There is a third check, and it catches something the other two cannot: the
+tunnel is up, the routes are installed, packets cross in both directions — and
+internal names still resolve to whatever the public internet says, because the
+resolver the VPN pushed is no longer configured on the tunnel's link. Every
+20 seconds the applet asks `systemd-resolved` whether that resolver is still
+in force — on the tunnel's link, or in `/etc/resolv.conf` if the handover fell
+back to `vpnc-script`; either counts, because either works. It only reads;
+putting it back needs root, and the free re-establish does exactly that by
+running the script again. If `systemd-resolved` does not
+answer — a machine that does not run it never had this configured — that is not
+a verdict, and nothing is demoted over it.
+
+This one is not hypothetical. It is the failure that prompted the whole
+mechanism, and it ran for hours at a time looking perfectly healthy. See
+[DNS, and why it is not written to `/etc/resolv.conf`](#dns-and-why-it-is-not-written-to-etcresolvconf).
 
 The probe opens one TCP connection and closes it. **A refusal counts as
 alive**, which is the part worth understanding: measured against a live ASU
@@ -895,6 +916,85 @@ login window nobody is looking at.
 **An automatic reconnect does not wipe the log.** The lines explaining *why* it
 happened are the only record of a break that was silent by definition. A
 connect you asked for still starts a fresh log.
+
+### DNS, and why it is not written to `/etc/resolv.conf`
+
+A split tunnel wants split DNS. ASU routes only its own prefixes down the
+tunnel and leaves everything else on your own connection; DNS should have the
+same shape. Names that live behind the tunnel — `sol.asu.edu` and the rest —
+have to be resolved by ASU's resolver, and every other name should stay on the
+resolver your machine already had.
+
+**The stock `vpnc-script` cannot do that here, and fails in a way that looks
+like nothing at all.** It decides how to install a resolver by grepping
+`/etc/nsswitch.conf` for `resolve`. On Ubuntu that word is absent — the
+`libnss-resolve` package is not installed by default, and `systemd-resolved` is
+reached through its stub listener at `127.0.0.53` instead. The grep fails, the
+script concludes there is no resolver manager to talk to, and falls all the way
+through its chain to the generic branch, which writes the VPN's resolver
+straight into `/etc/resolv.conf`.
+
+That file is a symlink to `/run/systemd/resolve/stub-resolv.conf`, which
+belongs to `systemd-resolved`. The write lands, DNS works — and then
+`systemd-resolved` rewrites its own file at the next link change and the VPN's
+resolver is silently gone. The tunnel is still up. The routes are still
+installed. Traffic still crosses. `ssh sol.asu.edu` resolves to Cloudflare's
+public edge and hangs, and reconnecting the VPN is the only thing that fixes
+it — until the next rewrite.
+
+So this applet configures DNS itself, on the tunnel's own link, through
+`systemd-resolved`'s own interface:
+
+```
+resolvectl default-route asuvpn0 no        # this link is not for every name
+resolvectl domain        asuvpn0 asu.edu   # these names, though, are its own
+resolvectl dns           asuvpn0 192.0.2.53
+```
+
+Three properties come out of that, and none of them is available from a global
+resolver list:
+
+- **It is scoped.** A domain listed on a link both completes single-label names
+  and routes matching queries there, so `asu.edu` goes to ASU and nothing else
+  does. `/etc/resolv.conf` is one flat list and cannot express this at all — the
+  reason the obvious fix (installing `libnss-resolve` so the stock script takes
+  its `systemd-resolved` branch) is still the worse answer: that branch sets no
+  routing domain unless the gateway pushes one, and a link with servers and no
+  domains becomes a candidate for **every** lookup on the machine.
+- **It has the right lifetime.** Link configuration dies with the link. No
+  backup file, no restore step, and nothing to lose a race with.
+- **Nobody else owns it.** `systemd-resolved` rewriting its stub file cannot
+  disturb per-link configuration, because that is where it keeps its own.
+
+**Which names count as the tunnel's** is the gateway's call first:
+`CISCO_DEF_DOMAIN` and `CISCO_SPLIT_DNS`, which `openconnect` passes to the
+script, are it saying which names it serves. The `CISCO_` prefix is historical
+and not a limitation — it comes from vpnc, and `openconnect` funnels every
+protocol it speaks (AnyConnect, Juniper/Pulse, GlobalProtect, Fortinet, Array)
+into those same two variables, so this works the same against any of them. Only when it says nothing does the
+local answer apply — the `dns-domains` setting, or, empty, the domain derived
+from the server address (`sslvpn.asu.edu` → `asu.edu`). Nothing is hardcoded;
+point the applet at a different VPN and it derives that one's domain instead.
+If no domain can be worked out at all, the link takes every lookup rather than
+none — never worse than the behaviour being replaced — and the log says so and
+names the setting that would narrow it.
+
+**The handover is total, and it fails safe.** The real `vpnc-script` guards
+both its DNS branches on `INTERNAL_IP4_DNS` being set, so once the link is
+configured that variable is removed from the environment the script inherits.
+Routing is handed over untouched; DNS has exactly one owner. If any part of it
+does not work — no `resolvectl`, `systemd-resolved` not running, a call that
+fails — the variable stays, the link is reverted rather than left half
+configured, and the stock script does whatever it would have done. Falling back
+to the old behaviour beats half-configuring DNS.
+
+Every connect logs what was done:
+
+```
+15:38:44  [vpn] asuvpn: DNS for asu.edu on asuvpn0 via 192.0.2.53 (pushed by the gateway); /etc/resolv.conf left alone
+```
+
+`dns = off` turns the whole thing off and gives `vpnc-script` its old job back.
 
 ### The control pipe
 
@@ -1113,7 +1213,9 @@ teardown, and logged precisely so a declined action never reads as a hang.
 | `[helper] WARNING … is not executable, so openconnect's own default script is left in place` | The `vpnc-script` this system uses could not be found, so state falls back to reading `openconnect`'s output. Routing is unaffected. Install `vpnc-scripts`. |
 | `Script … returned error 127` | The `vpnc-script` failed, so routes and DNS were never configured. Install `vpnc-scripts`, then `asuvpn selftest`. |
 | `ModuleNotFoundError: No module named 'pkg_resources'` | The `setuptools<71` pin did not take. `pipx inject openconnect-sso 'setuptools<71' --force` — the `--force` is what makes it apply. |
-| Badge says **not carrying traffic** | The watchdog found the tunnel device or its routes gone. It has already nudged `openconnect` once; `asuvpn log` says what it saw. If it does not recover, the automatic sign-in fires (unless turned off) — or `asuvpn reconnect` yourself. |
+| Badge says **not carrying traffic** | The watchdog found the tunnel device or its routes gone, or nothing answering through it. It has already nudged `openconnect` once; `asuvpn log` says what it saw. If it does not recover, the automatic sign-in fires (unless turned off) — or `asuvpn reconnect` yourself. |
+| Badge says **DNS not configured** | The resolver the VPN pushed is no longer on the tunnel's link, so internal names resolve to whatever public DNS says. The applet asks `openconnect` to re-establish, which reconfigures it. `resolvectl dns asuvpn0` shows the live state. |
+| `ssh sol.asu.edu` hangs while the VPN is up | The name is resolving to Cloudflare's public edge instead of ASU's internal address — `resolvectl query sol.asu.edu` says which. Check `resolvectl dns asuvpn0` lists the VPN's resolver; if it is empty, `asuvpn log` will say why the handover did not take. With `dns = off` this is the stock `vpnc-script` behaviour and is expected to come back. |
 | Badge says **…; rebuilding** | The tunnel died on its own and the applet will sign in again shortly, up to three times. **Stop reconnecting** in the menu — or `asuvpn disconnect` — calls it off. |
 | `sign-in did not finish within 300s` | A sign-in sat unanswered — usually a Duo push or browser window with nobody at the keyboard — and was ended by `signin-timeout`. Connect again when you are there to answer it. |
 | Tunnel silently stops working, badge stays green | Should no longer happen: `--force-dpd 30` is passed because ASU negotiates DPD off, and the watchdog covers what DPD cannot see. If it recurs, `asuvpn log` now records every check. |
@@ -1125,7 +1227,7 @@ teardown, and logged precisely so a declined action never reads as a hang.
 | --- | --- |
 | [`asuvpn-tray`](asuvpn-tray) | The applet and the `asuvpn` CLI. Runs as you, on the system `python3`. |
 | [`asuvpn-helper`](asuvpn-helper) | The root side, run under `pkexec`. Owns `openconnect`'s lifetime. |
-| [`asuvpn-notify`](asuvpn-notify) | The `vpnc-script` wrapper. Reports state, then chains to the real script. |
+| [`asuvpn-notify`](asuvpn-notify) | The `vpnc-script` wrapper. Reports state, configures the tunnel's DNS on its own link, then chains to the real script for routing. |
 | [`asuvpn_contract.py`](asuvpn_contract.py) | What the programs agree on: wire format, control verbs, event fields, the settings schema — and the release version, stated once and read by everything including the build. Loaded, not run. |
 | [`asuvpn-selftest`](asuvpn-selftest) | Checks the install against the machine. Run by `install.sh`, and by `asuvpn selftest`. |
 | [`bootstrap.sh`](bootstrap.sh) | Installs dependencies, then calls `install.sh`. |
@@ -1169,9 +1271,9 @@ the middle one is the point:
 
 | Tier | What it checks |
 | --- | --- |
-| `logic` | Pure functions and the state machine: the option blocklist, interface-name validation, `--interface`/`--script` parsing, the permission rules, state-payload parsing, the transition table driven with real message sequences, the rebuild bounds, the sign-in deadline against a child that would outlive the run, and that `openconnect`'s output cannot forge a helper message |
-| `environment` | Our assumptions put to the installed binaries — that `openconnect` exists, that it *gives up retrying* rather than trying forever (the fact the rebuild rests on, read back out of its own `--help`), that the `vpnc-script` it names is executable and handles every `reason` we send, that our fallback log patterns still appear in its message catalogue, and that nothing the helper runs as root is writable by anyone else |
-| `wiring` | `asuvpn-notify` actually executed: the event arrives with the right token and fields, the real `vpnc-script` still runs with its environment intact, the token is scrubbed before it sees it, and no event can emit more than one line |
+| `logic` | Pure functions and the state machine: the option blocklist, interface-name validation, `--interface`/`--script` parsing, the permission rules, state-payload parsing, the transition table driven with real message sequences, the rebuild bounds, the sign-in deadline against a child that would outlive the run, that `openconnect`'s output cannot forge a helper message, the split-DNS domain rules against option-like and shell-punctuation payloads, and every verdict the resolver check can reach |
+| `environment` | Our assumptions put to the installed binaries — that `openconnect` exists, that it *gives up retrying* rather than trying forever (the fact the rebuild rests on, read back out of its own `--help`), that the `vpnc-script` it names is executable and handles every `reason` we send, that our fallback log patterns still appear in its message catalogue, that the split-DNS variables the handover reads are still named what we think, and that nothing the helper runs as root is writable by anyone else |
+| `wiring` | `asuvpn-notify` actually executed: the event arrives with the right token and fields, the real `vpnc-script` still runs with its environment intact, the token is scrubbed before it sees it, no event can emit more than one line — and the DNS handover driven against a stand-in `resolvectl`, asserting the call order, the revert on every failure path, and that a failure always leaves the stock script its DNS job |
 
 The environment tier reads the installed `libopenconnect`'s own strings, so
 `asuvpn selftest` is what tells you the fallback patterns have gone stale on

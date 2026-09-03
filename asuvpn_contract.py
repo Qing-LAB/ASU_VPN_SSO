@@ -41,7 +41,7 @@ VERSION = "0.9.0"
 # records the version that wrote it. It cannot catch a half-updated install by
 # itself — every program loads the one copy beside it, so within one install
 # there is nothing to disagree with.
-CONTRACT_VERSION = 1
+CONTRACT_VERSION = 2
 
 
 # --------------------------------------------------------------- permissions
@@ -159,10 +159,24 @@ def decode_control(line):
 EVENT_SOCKET_VAR = "ASUVPN_EVENT_SOCKET"
 EVENT_TOKEN_VAR = "ASUVPN_EVENT_TOKEN"
 REAL_SCRIPT_VAR = "ASUVPN_REAL_SCRIPT"
-EVENT_VARS = (EVENT_SOCKET_VAR, EVENT_TOKEN_VAR, REAL_SCRIPT_VAR)
+# Which domains to route to the tunnel's resolver when the gateway names none
+# itself. Computed by the helper, which is the only part of this that knows the
+# gateway's name and the user's setting; asuvpn-notify only applies it. Carried
+# in the environment rather than on the event socket because it travels the
+# other way -- helper to script, not script to helper.
+DNS_DOMAINS_VAR = "ASUVPN_DNS_DOMAINS"
+EVENT_VARS = (EVENT_SOCKET_VAR, EVENT_TOKEN_VAR, REAL_SCRIPT_VAR,
+              DNS_DOMAINS_VAR)
 
 # The environment variables openconnect itself sets, in the order they travel.
 # `reason` is lower case because that is what the vpnc-script contract calls it.
+#
+# CISCO_DEF_DOMAIN and CISCO_SPLIT_DNS -- the gateway's own answer to which
+# names live behind this tunnel -- are deliberately *not* here. asuvpn-notify is
+# the only thing that needs them and it reads them from the environment it was
+# run in; putting them on the wire as well would add two fields nothing at the
+# receiving end reads, which is how a contract starts describing something other
+# than what its programs do.
 EVENT_ENV = ("reason", "TUNDEV", "INTERNAL_IP4_ADDRESS", "INTERNAL_IP6_ADDRESS",
              "INTERNAL_IP4_DNS")
 EVENT_FIELDS = ("token", *EVENT_ENV)
@@ -238,6 +252,104 @@ AC_VERSION = "4.7.00136"
 FALLBACK_VPNC_SCRIPT = "/usr/share/vpnc-scripts/vpnc-script"
 
 
+# ------------------------------------------------------------------ split DNS
+#
+# A split tunnel wants split DNS: the names that live behind the tunnel are
+# resolved by the tunnel's resolver, and every other name stays on whatever
+# resolver the machine already had. systemd-resolved expresses that as per-link
+# configuration -- servers on the link, plus the domains that route to it -- and
+# a domain listed on a link both completes single-label names and routes
+# matching queries there, which is the whole of what is needed.
+#
+# The alternative, which is what the stock vpnc-script falls back to on a
+# machine without nss-resolve, is rewriting /etc/resolv.conf. That file cannot
+# express "these names here, the rest there" at all -- it is one flat global
+# list -- and where it is systemd-resolved's own stub it belongs to another
+# daemon, which rewrites it again at the next link change and silently takes the
+# tunnel's resolver back out. See README, "DNS, and why it is not written to
+# /etc/resolv.conf", and DESIGN, "Who owns DNS".
+
+# A domain name, as strictly as is useful. These are about to become arguments
+# to a program run as root, so the rule is a whitelist and not a blacklist: no
+# leading dash (which would parse as an option), no whitespace, no shell
+# punctuation, nothing but the characters a hostname may contain. The trailing
+# dot of a fully qualified name is accepted and stripped by split_domains.
+DOMAIN_RE = re.compile(r"^[A-Za-z0-9]([A-Za-z0-9-]{0,62}[A-Za-z0-9])?"
+                       r"(\.[A-Za-z0-9]([A-Za-z0-9-]{0,62}[A-Za-z0-9])?)+\Z")
+
+# Enough for a gateway that pushes a long split-DNS list, few enough that a
+# hostile one cannot make the command line unbounded.
+MAX_DNS_DOMAINS = 32
+
+
+def split_domains(*values):
+    """Domain names from any mix of comma- and space-separated lists, deduped.
+
+    openconnect hands CISCO_DEF_DOMAIN as a single domain and CISCO_SPLIT_DNS as
+    a comma-separated list, but the two have been seen to arrive in each other's
+    form, so both separators are accepted from both. Order is preserved because
+    the first search domain is the one a single-label name is tried in first.
+
+    Anything DOMAIN_RE does not accept is dropped rather than escaped. A domain
+    that cannot be a domain has no business reaching a root command line, and
+    there is nothing useful to do with it besides leave it out.
+    """
+    out = []
+    for value in values:
+        for word in str(value or "").replace(",", " ").split():
+            domain = word.strip().rstrip(".").lower()
+            if DOMAIN_RE.match(domain) and domain not in out:
+                out.append(domain)
+    return out[:MAX_DNS_DOMAINS]
+
+
+def split_resolvers(*values):
+    """Resolver addresses from space-separated lists, deduped, order kept.
+
+    Held to the same rule as the domains beside them, and for the same reason:
+    these become arguments to a program run as root, and a gateway that pushed
+    "--something" would otherwise have handed it an option. ip_address is the
+    check because it is exact: anything that is not a literal address is
+    dropped. A scoped IPv6 address (fe80::1%asuvpn0) passes, which is right --
+    resolvectl takes those, and the scope is part of the address.
+
+    Order matters: the first resolver is the one asked first, and it is also
+    the one the tray takes as its liveness probe target.
+    """
+    import ipaddress
+
+    out = []
+    for value in values:
+        for word in str(value or "").replace(",", " ").split():
+            try:
+                ipaddress.ip_address(word)
+            except ValueError:
+                continue
+            if word not in out:
+                out.append(word)
+    return out[:MAX_DNS_DOMAINS]
+
+
+def parent_domain(host):
+    """The domain a gateway's own name sits in: sslvpn.asu.edu -> asu.edu.
+
+    The last resort for "which names belong to this VPN" when the gateway names
+    none. It is a guess, but a well-founded one -- a university's VPN endpoint
+    lives in the domain whose private names it exists to reach -- and it is
+    derived from the endpoint the user actually configured rather than written
+    into the source, so this file holds no opinion about whose VPN this is.
+
+    A bare hostname or a public-suffix-length name yields nothing: better no
+    routing domain, and DNS that plainly does not resolve, than a domain so
+    broad that every query on the machine is sent down the tunnel.
+    """
+    labels = split_domains(str(host or "").strip().strip("."))
+    if not labels:
+        return ""
+    parts = labels[0].split(".")
+    return ".".join(parts[1:]) if len(parts) > 2 else ""
+
+
 def one_token(value):
     """Collapse a value to a single whitespace-free token."""
     return re.sub(r"\s+", "_", str(value).strip())[:64]
@@ -310,6 +422,22 @@ SETTINGS = (
             "Seconds between dead-peer probes, forced on because some servers"
             " negotiate detection off and then a dropped tunnel looks connected."
             " 0 leaves the server's choice alone."),
+    Setting("dns", "bool", True,
+            "Hand the resolver the VPN pushes to systemd-resolved as per-link"
+            " DNS, with the tunnel's domains routed to it and everything else"
+            " left on the resolver this machine already had. This is what makes"
+            " a split tunnel resolve internal names without sending every"
+            " lookup on the machine to the VPN. Turn it off to leave DNS to the"
+            " stock vpnc-script, which on a machine without nss-resolve"
+            " rewrites /etc/resolv.conf -- and loses the change again the next"
+            " time systemd-resolved rewrites its own file. Ignored where"
+            " systemd-resolved is not running; there is nothing to hand it."),
+    Setting("dns-domains", "text", "",
+            "Domains to resolve through the tunnel, space or comma separated,"
+            " when the gateway names none itself. Empty means derive one from"
+            " the server address -- sslvpn.asu.edu gives asu.edu -- which is"
+            " right wherever the endpoint lives in the domain it serves. What"
+            " the gateway does push always wins over both."),
     Setting("health-interval", "int", 20,
             "Seconds between checks of the tunnel device and its routes."
             " 0 turns the watchdog off; this file is still re-read at the"

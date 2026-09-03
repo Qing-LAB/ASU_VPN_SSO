@@ -374,6 +374,75 @@ interpose at all** — no `--script` is passed, openconnect keeps its own defaul
 and state falls back to log matching. Losing state precision is a fair trade;
 losing the routing table is not.
 
+### Who owns DNS
+
+Routing is the chained script's. DNS is not — and it is the one thing taken
+away from it, because on this platform it gets it wrong in a way nothing
+notices.
+
+`vpnc-script` picks a resolver manager by grepping `/etc/nsswitch.conf` for
+`resolve`. Ubuntu does not install `libnss-resolve`, so that word is absent
+even though `systemd-resolved` is running and owns `/etc/resolv.conf` through
+its stub. The grep fails, `RESOLVEDENABLED` stays `0`, the `resolvectl` branch
+is skipped, the `/sbin/resolvconf` branch is skipped too (it is a symlink to
+`resolvectl`, which that branch explicitly declines), and the chain lands on
+`modify_resolvconf_generic` — which writes the tunnel's resolver into a file
+`systemd-resolved` rewrites at the next link change. DNS works, then silently
+stops, and every check in this project passes throughout. That is what the
+resolver check below exists for, and this is what stops it happening.
+
+`asuvpn-notify` configures the link instead, in this order, which is the order
+that is never briefly wrong:
+
+| Call | Why here |
+| --- | --- |
+| `resolvectl default-route <dev> no` | scope before servers; a link with servers and no scope is a candidate for **every** lookup on the machine |
+| `resolvectl domain <dev> <domains>` | a domain on a link both completes single-label names and routes matching queries to it — search and routing in one |
+| `resolvectl dns <dev> <servers>` | last, when the link is already scoped |
+
+Then `INTERNAL_IP4_DNS` is removed from the environment the real script
+inherits. That is not a trick: `vpnc-script` guards **both** its DNS branches
+on that one variable (`if [ -n "$INTERNAL_IP4_DNS" ]`, at the modify and the
+restore alike), so removing it is how the script is told the job is done. The
+guard being symmetric is what makes the handover safe in both directions.
+
+Three rules keep it from being worse than what it replaces:
+
+- **Fail back, never half.** No `resolvectl`, `systemd-resolved` not running, a
+  call that fails — the variable stays and the stock script does what it always
+  did. A failure after the first change reverts the link first, because servers
+  without scope is the one state worse than doing nothing.
+- **Never strip on the way out.** `disconnect` reverts the link but always
+  leaves `INTERNAL_IP4_DNS` set. A previous connect may have fallen back and
+  left a `/etc/resolv.conf` backup that only the stock restore can put back —
+  and that restore is already a no-op when there is no backup, so letting it
+  run always is the only choice correct in both cases.
+- **The gateway decides which names are its own.** `CISCO_DEF_DOMAIN` and
+  `CISCO_SPLIT_DNS` first. The `CISCO_` prefix is historical, inherited from
+  vpnc long before openconnect spoke anything but Cisco: openconnect normalises
+  **every** protocol it speaks — AnyConnect, Juniper/Pulse, GlobalProtect,
+  Fortinet, Array — into these same two names rather than one set per gateway
+  type, because `vpnc-script` is a fixed contract that predates all of them. So
+  there is nothing protocol-specific to add, and the environment tier asserts
+  the names are still in the installed library so a future rename cannot narrow
+  split DNS silently. Only if the gateway names none does the local answer apply —
+  the `dns-domains` setting, or the domain derived from the server address. The
+  derivation is why nothing here is ASU-specific. If no domain can be found at
+  all the link takes every lookup, which is what the replaced behaviour did, and
+  the log says so.
+
+The domains reach the script as one environment variable computed once by the
+helper (`DNS_DOMAINS_VAR`), for the same reason the settings do: the helper runs
+as root, the setting belongs to the user side, and the value cannot change
+between transitions. Its **presence** is the switch — an empty value still means
+"take DNS over", and says only that no fallback domain was configured. Absent
+means the user set `dns = off`, or this is being run as a `vpnc-script` by hand;
+either way the stock script keeps the job.
+
+Every domain is matched against `DOMAIN_RE` before it becomes an argument, and
+anything that fails is dropped rather than escaped. These are values a gateway
+chose, about to reach a command line running as root.
+
 ### Framing
 
 `openconnect`'s output and the helper's own messages share one pipe, so
@@ -555,10 +624,10 @@ because the device checks already diagnose that better.
 | timeout | **not carrying traffic** |
 | other `OSError` | inconclusive; the device checks own it |
 
-The two sources keep separate strike counters, and a demotion is only undone by
-the source that caused it. Sharing one counter would let the device check —
-which still passes perfectly during a black hole — promote the badge back every
-twenty seconds and flap it indefinitely.
+The sources keep separate strike counters, and a demotion is only undone by the
+source that caused it. Sharing one counter would let the device check — which
+still passes perfectly during a black hole, and during a DNS failure too —
+promote the badge back every twenty seconds and flap it indefinitely.
 
 That rule holds against openconnect's own word too. The `reconnect` event a
 nudge produces adopts the tunnel — address, device, ifindex — but does **not**
@@ -568,6 +637,61 @@ source's own next pass (at most one probe cycle away) is what promotes.
 Taking the event's word flapped the badge every two minutes against a live
 tunnel whose routes were gone, refired the once-per-incident notification each
 cycle, and kept the sign-in branch permanently out of reach.
+
+### The resolver check, for the failure that passes everything
+
+The device checks and the probe share one more blind spot, and it is not a
+blind spot they share with each other: **DNS can be wrong while the tunnel is
+perfect**. The device is up, the routes are installed, the probe's packet
+crosses and comes back — and internal names resolve to whatever public DNS
+says, because the resolver the VPN pushed is no longer on the tunnel's link.
+
+This is not hypothetical; it is the failure that produced this section. A live
+session ran for hours with `resolvectl dns asuvpn0` empty, every check passing,
+`ssh sol.asu.edu` resolving to Cloudflare's public edge, and reconnecting the
+VPN as the only known remedy. See [Who owns DNS](#who-owns-dns) for the cause.
+
+So a third source asks `systemd-resolved`, on every health check, whether the
+resolver this tunnel pushed is still configured on this tunnel's link. It runs
+on a worker thread for the same reason the probe does — it is a subprocess and
+a bus round trip, and a wedged `resolved` would otherwise freeze the applet.
+
+| Outcome | Verdict |
+| --- | --- |
+| the pushed resolver is on the link | healthy |
+| not on the link, but named in `/etc/resolv.conf` | healthy — the fallback is in force |
+| in neither place | **DNS not configured** |
+| `resolvectl` missing, `resolved` silent, device gone | inconclusive; not a verdict |
+| the VPN pushed no resolver | nothing to check |
+
+The question is "is this resolver in force", not "is it on the link". Which
+mechanism installed it is `asuvpn-notify`'s business and it has two: when the
+handover falls back, the stock script writes `/etc/resolv.conf` and the link
+stays empty. Asserting only the preferred mechanism would demote a working
+tunnel every twenty seconds and walk the ladder to an unattended sign-in — a
+Duo push every five minutes for a tunnel with nothing wrong with it.
+
+It **reads only**. Configuring a link needs root, and `asuvpn-notify` already
+does it at the only moment it can be done correctly — which is also why the
+ordinary ladder repairs this: the free re-establish runs the script again with
+`reason=reconnect`, and the link is reconfigured. The expensive rung is never
+reached for this failure in practice.
+
+Only the resolver is asserted, not the domains beside it. It is the whole of
+what makes the link resolve anything, it is the one value that reached the tray
+from the tunnel itself, and a check that tests less is a check that cannot be
+wrong about what it tests.
+
+Because it is cheap and local it runs on **every** check rather than every
+`probe-every` cycle; there is nothing to ration when no packet leaves the
+machine.
+
+Demotion wording follows the source. `DEMOTED` means "established but not
+usable", and the three sources are unusable in different ways — a tunnel whose
+DNS was taken off the link is carrying traffic perfectly, so saying it is not
+would be a lie. `DEMOTION_TEXT` keeps one phrase per source, and
+`asuvpn selftest` holds the two maps to the same key set so a fourth source
+cannot be added without one.
 
 ### Escalating, cheapest first
 
@@ -839,6 +963,7 @@ where it can be, checked by `asuvpn selftest`.
 | No root process outlives the tray | control pipe, `PR_SET_PDEATHSIG`, no `--background` | `SIGKILL` the tray and look for survivors; `pdeath.sh` SIGKILLs the *helper* and asserts openconnect died with it |
 | Only a device this session created is ever deleted | ifindex ownership, free-name selection | `--interface <existing>` is refused (exit 23, wiring tier), and the logic tier drives `verify_teardown` both ways: a foreign ifindex is left alone, our own is deleted |
 | A device name never reaches the filesystem or `ip` unvalidated | `INTERFACE_RE`, checked at both ends — where produced and where consumed | logic + wiring tiers, with traversal and whitespace payloads |
+| The variables the DNS handover reads still exist upstream | nothing enforces this; it is asserted rather than assumed | environment tier reads `CISCO_DEF_DOMAIN`, `CISCO_SPLIT_DNS` and `INTERNAL_IP4_DNS` out of the installed `libopenconnect`'s own strings |
 | `openconnect` cannot forge a helper message | `[vpn] ` prefix on every relayed line | logic tier, with `\r` and `\n` payloads |
 | A state event cannot inject a line or a field | reject impossible device names; collapse every field to one token | wiring tier, with space-and-`=` payloads |
 | Only this user can drive the applet, and only this user's applet answers | `SO_PEERCRED` at both ends, failing closed | `ipc-gate.sh` stages a real second uid: refused with no reply, logged with the uid — and the same poke from our own uid answered, so the refusal is not vacuous |
@@ -851,11 +976,13 @@ where it can be, checked by `asuvpn selftest`.
 | openconnect cannot drive the control channel | it is spawned with its own `stdin` pipe | `fdcheck.sh` asserts `/proc/<pid>/fd/0` of the two are distinct (the child's open mode is printed for the reader) |
 | A refusal is reported as a sentence, not a number | `[helper] FATAL ` marker, set by the helper | wiring tier, by running three refused connects |
 | Everything executed as root is unwritable by a second principal | every loader's bootstrap check, the helper's runtime list (exit 26), `install.sh`'s `go-w` sweep | environment tier, by making each file writable in turn, and end to end for a shared group in the sandbox (`sec.sh` b/b2) |
+| The VPN's resolver stays in force for the life of the tunnel | per-link configuration through `systemd-resolved`, never `/etc/resolv.conf`; a third watchdog source asserts it every check and the ladder reconfigures it | logic tier drives every `resolver_health` verdict; the wiring tier drives `asuvpn-notify` against a stand-in `resolvectl` and asserts the call order, the revert on every failure, and that `INTERNAL_IP4_DNS` survives each one |
+| A domain from a gateway never reaches a root command line unvalidated | `DOMAIN_RE`, applied where the list is parsed | logic tier, with option-like, shell-punctuation and single-label payloads |
 | `openconnect-sso` can still import `pkg_resources` | `setuptools<71` pinned with `pipx inject --force` | environment tier, by importing it |
 
 ## How this is tested
 
-Three tiers in `asuvpn-selftest` (124 checks), plus the scenario sandbox in
+Three tiers in `asuvpn-selftest` (154 checks), plus the scenario sandbox in
 [tests/sandbox](tests/sandbox/README.md).
 
 The shaping constraint: **conventional unit tests would not have caught any of

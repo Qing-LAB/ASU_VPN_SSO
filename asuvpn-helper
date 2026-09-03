@@ -40,6 +40,7 @@ import syslog
 import tempfile
 import threading
 import time
+import urllib.parse
 
 # Set before the contract is loaded, and this is the reason: loading it writes
 # a __pycache__ into the directory beside us -- the one the helper runs out of
@@ -659,6 +660,23 @@ def watch_control_channel(tunnel):
         tunnel.shutdown()
 
 
+def host_domain(url):
+    """The domain a gateway's own name sits in: https://sslvpn.asu.edu/ -> asu.edu.
+
+    Only ever a fallback, for a gateway that pushes no domains of its own. The
+    parsing is here rather than in the contract because this is the one place
+    that holds the gateway as a URL; by the time the contract sees it, it is a
+    hostname like any other. A --host given without a scheme is still a host:
+    urlsplit reads a bare name as a path, so one is added when it is missing.
+    """
+    text = str(url or "").strip()
+    split = urllib.parse.urlsplit(text if "//" in text else "//" + text)
+    try:
+        return C.parent_domain(split.hostname or "")
+    except ValueError:  # a malformed netloc; nothing to derive, and not fatal
+        return ""
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--host", required=True, help="VPN URL from openconnect-sso")
@@ -672,6 +690,15 @@ def main():
                         default=C.SETTINGS_BY_NAME["dpd"].default,
                         help="dead peer detection interval; 0 leaves the"
                              " server's choice alone")
+    # Presence is the switch, not the value: an empty string still means "do
+    # it", and says only that no fallback domain was configured. The tray omits
+    # the option entirely when the user has turned DNS handling off, and a
+    # direct caller who says nothing gets the stock script's DNS behaviour --
+    # which is the right default for someone driving the helper by hand.
+    parser.add_argument("--dns-domains",
+                        help="domains to resolve through the tunnel when the"
+                             " gateway names none; empty derives one from"
+                             " --host. Omit to leave DNS to vpnc-script")
     parser.add_argument("extra", nargs=argparse.REMAINDER)
     args = parser.parse_args()
 
@@ -775,6 +802,17 @@ def main():
         script_env[C.EVENT_SOCKET_VAR] = event_path
         script_env[C.EVENT_TOKEN_VAR] = token
         script_env[C.REAL_SCRIPT_VAR] = chained
+        if args.dns_domains is not None:
+            # Resolved here, once, rather than at every transition: the script
+            # runs several times per tunnel and this answer cannot change
+            # between them. What the gateway pushes still wins over it -- this
+            # is only what to use when the gateway pushes nothing.
+            domains = C.split_domains(args.dns_domains) or \
+                C.split_domains(host_domain(args.host))
+            script_env[C.DNS_DOMAINS_VAR] = " ".join(domains)
+            fallback = " ".join(domains) or "nothing (set dns-domains)"
+            log("DNS goes on the tunnel's own link, not in /etc/resolv.conf;"
+                f" for whichever names the gateway claims, else {fallback}")
         extra = list(strip_script_option(extra))
         extra = [*extra, "--script", NOTIFY]
 

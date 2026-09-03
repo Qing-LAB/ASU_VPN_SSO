@@ -492,7 +492,7 @@ def machine_stub(tray):
             self.state_events = False
             self.quitting = False
             self.demoted_by = None
-            self.strikes = {"device": 0, "probe": 0}
+            self.strikes = tray.fresh_strikes()
             self.nudge_spent = self.failure_notified = False
             self.routes_seen = {"routes4": False, "routes6": False}
             self.tunnel_device = None
@@ -1834,6 +1834,39 @@ def check_standin_catalogue(binary, r):
              f" {len(telemetry)} marked [stand-in]")
 
 
+def check_script_variables(binary, r):
+    """The vpnc-script variables the DNS handover reads, in the installed binary.
+
+    The same reasoning as the message catalogue next door, and the same failure
+    it exists to prevent: an assumption about openconnect that quietly stops
+    holding. The `CISCO_` prefix is historical -- inherited from vpnc, long
+    before openconnect spoke anything but Cisco -- and openconnect normalises
+    every protocol it speaks into these same names rather than inventing one
+    set per gateway type. If a future release ever stops doing that, split DNS
+    silently narrows to the derived fallback domain and nobody finds out; this
+    is what says so instead.
+    """
+    catalogue, libs = read_catalogue(binary)
+    if not catalogue:
+        r.warn("the vpnc-script variables the DNS handover reads",
+               "no binary to read; skipped")
+        return
+    wanted = ("CISCO_DEF_DOMAIN", "CISCO_SPLIT_DNS", "INTERNAL_IP4_DNS")
+    missing = [name for name in wanted if name.encode() not in catalogue]
+    r.check("openconnect still names the domains a split tunnel serves",
+            not missing,
+            f"missing {missing} from {libs or binary} — without these the"
+            " gateway's own split-DNS list cannot be read, and scoping falls"
+            " back to the domain derived from the server address")
+    # Not an assertion, because openconnect merging both families into
+    # INTERNAL_IP4_DNS is correct and expected; it is recorded because the
+    # variable's name says IPv4 and the values are not all IPv4.
+    if b"INTERNAL_IP6_DNS" not in catalogue:
+        r.info("this openconnect sets no INTERNAL_IP6_DNS: every resolver,"
+               " both families, arrives in INTERNAL_IP4_DNS — which is why"
+               " they are validated as addresses, not as IPv4 addresses")
+
+
 def check_desktop_stack(tray, r):
     if tray.GUI_ERROR is None:
         r.ok("GTK, AppIndicator and libnotify bindings are importable")
@@ -1966,6 +1999,123 @@ def check_installed_permissions(C, r):
 # -------------------------------------------------------------------- wiring
 
 
+def check_split_dns(C, r):
+    """The rules that decide which names go down the tunnel.
+
+    These feed a command line run as root, so the interesting cases are the
+    hostile ones: a domain that would parse as an option, one carrying shell
+    punctuation, one that is really a whole flag. Every one of them has to be
+    dropped rather than escaped -- and a domain so broad it would capture the
+    whole internet has to be refused even when it is well formed.
+    """
+    r.check("comma and space separated domain lists both parse",
+            C.split_domains("a.asu.edu,b.asu.edu", "c.asu.edu") ==
+            ["a.asu.edu", "b.asu.edu", "c.asu.edu"],
+            f"got {C.split_domains('a.asu.edu,b.asu.edu', 'c.asu.edu')}")
+    r.check("domains are deduped and case folded, order kept",
+            C.split_domains("ASU.edu asu.EDU b.asu.edu") ==
+            ["asu.edu", "b.asu.edu"],
+            f"got {C.split_domains('ASU.edu asu.EDU b.asu.edu')}"
+            " — the first search domain is tried first, so order is meaning")
+    hostile = C.split_domains("-x.asu.edu", "a;b.asu.edu", "$(id).asu.edu",
+                              "a|b.asu.edu", "--dns=x", "..", "asu..edu",
+                              "a`id`.asu.edu", "*.asu.edu", "a/b.asu.edu")
+    r.check("anything that cannot be a domain is dropped, not escaped",
+            hostile == [],
+            f"got {hostile} — these become argv for a program run as root")
+    r.check("a single label is not a domain",
+            C.split_domains("localhost", "asu") == [],
+            f"got {C.split_domains('localhost', 'asu')}")
+    r.check("the domain list is bounded",
+            len(C.split_domains(" ".join(f"h{i}.asu.edu" for i in range(200))))
+            == C.MAX_DNS_DOMAINS,
+            "a gateway must not be able to make the command line unbounded")
+    hostile = C.split_resolvers("--listen", "10.0.0.53; id", "not-an-ip",
+                                "999.1.1.1", "")
+    r.check("a resolver that is not an address is dropped, not escaped",
+            hostile == [],
+            f"got {hostile} — these become argv for a program run as root,"
+            " and a leading dash would be read as an option")
+    r.check("real resolvers survive, both families, order and dedup kept",
+            C.split_resolvers("10.0.0.53 10.0.0.53 10.0.0.54", "2620:d8::1") ==
+            ["10.0.0.53", "10.0.0.54", "2620:d8::1"],
+            f"got {C.split_resolvers('10.0.0.53 10.0.0.53 10.0.0.54', '2620:d8::1')}"
+            " — the first is asked first, and is the probe target too")
+    r.check("a gateway's own name yields the domain it serves",
+            C.parent_domain("sslvpn.asu.edu") == "asu.edu",
+            f"got {C.parent_domain('sslvpn.asu.edu')!r}")
+    r.check("a two-label name yields nothing rather than a public suffix",
+            C.parent_domain("asu.edu") == "" and C.parent_domain("host") == "",
+            f"got {C.parent_domain('asu.edu')!r} and {C.parent_domain('host')!r}"
+            " — routing '.edu' to the tunnel would send half the internet"
+            " down it")
+
+
+def check_resolver_health(tray, r):
+    """The third check: is the resolver the VPN pushed still on its link?
+
+    The failure it exists for passes every other check -- device up, routes
+    installed, packets crossing -- so the verdicts have to be exact. In
+    particular "resolved did not answer" is not a verdict at all: a machine
+    without systemd-resolved never had this configured, and demoting a healthy
+    tunnel over an unanswerable question is worse than not asking it.
+    """
+    original = tray.link_resolvers
+    try:
+        tray.link_resolvers = lambda device: ["192.0.2.53"]
+        reason, _ = tray.resolver_health("asuvpn0", "192.0.2.53")
+        r.check("a link still holding the pushed resolver is healthy",
+                reason is None, f"got {reason!r}")
+
+        tray.link_resolvers = lambda device: []
+        reason, detail = tray.resolver_health("asuvpn0", "192.0.2.53")
+        r.check("a link the resolver was taken off is a verdict",
+                reason is not None and "no resolvers" in detail,
+                f"got {reason!r} / {detail!r} — this is the exact state"
+                " systemd-resolved rewriting its stub file leaves behind")
+
+        tray.link_resolvers = lambda device: ["198.51.100.1"]
+        reason, _ = tray.resolver_health("asuvpn0", "192.0.2.53")
+        r.check("a link holding somebody else's resolver is a verdict",
+                reason is not None, f"got {reason!r}")
+
+        tray.link_resolvers = lambda device: None
+        reason, _ = tray.resolver_health("asuvpn0", "192.0.2.53")
+        r.check("an unanswerable question is not a verdict",
+                reason is None, f"got {reason!r}")
+
+        original_conf = tray.resolv_conf_lists
+        try:
+            tray.link_resolvers = lambda device: []
+            tray.resolv_conf_lists = lambda resolver: True
+            reason, _ = tray.resolver_health("asuvpn0", "192.0.2.53")
+            r.check("a resolver in force the old way is still in force",
+                    reason is None,
+                    f"got {reason!r} — asuvpn-notify hands DNS back to"
+                    " vpnc-script whenever it cannot configure the link, and"
+                    " demoting that tunnel would walk the ladder to a Duo push"
+                    " every five minutes with nothing wrong")
+        finally:
+            tray.resolv_conf_lists = original_conf
+
+        tray.link_resolvers = lambda device: []
+        reason, _ = tray.resolver_health("asuvpn0", "")
+        r.check("a VPN that pushed no resolver is not judged for losing one",
+                reason is None, f"got {reason!r}")
+    finally:
+        tray.link_resolvers = original
+
+    r.check("every check source has its own demotion wording",
+            set(tray.DEMOTION_TEXT) == set(tray.CHECK_SOURCES)
+            and tray.DEMOTION_TEXT["dns"] != tray.DEMOTION_TEXT["probe"],
+            f"{tray.DEMOTION_TEXT} — a tunnel whose DNS was taken off the link"
+            " is carrying traffic perfectly; saying it is not would be a lie")
+    r.check("a fresh strike count covers every source",
+            set(tray.fresh_strikes()) == set(tray.CHECK_SOURCES),
+            f"got {tray.fresh_strikes()} — a source missing here raises"
+            " KeyError in a worker thread on its first bad verdict")
+
+
 def check_notify_roundtrip(C, r):
     """Run asuvpn-notify for real: does the event arrive, and does chaining work?
 
@@ -2044,6 +2194,123 @@ def check_notify_roundtrip(C, r):
         r.check("the event token is scrubbed before the real script sees it",
                 got[1:2] == ["scrubbed"],
                 f"the chained script saw the token: {got[1:2]}")
+
+
+def check_dns_takeover(notify, C, r):
+    """Drive the DNS handover against a stand-in resolvectl.
+
+    The real one is found at a hardcoded absolute path, which is what a program
+    running as root should do and also what makes it unstubbable from outside --
+    so this reaches in and passes the stand-in, exercising the calls and the
+    decisions rather than the lookup.
+
+    What matters here is not that the happy path works. It is that every way it
+    can fail leaves the old behaviour intact: the real vpnc-script guards both
+    its DNS branches on INTERNAL_IP4_DNS, so that variable surviving is the
+    whole of "we did not take this over, carry on as before".
+    """
+    with tempfile.TemporaryDirectory() as d:
+        os.chmod(d, 0o700)
+        log = os.path.join(d, "calls")
+        faildir = os.path.join(d, "fail")
+        os.mkdir(faildir)
+        stub = os.path.join(d, "resolvectl")
+        with open(stub, "w", encoding="utf-8") as fh:
+            fh.write("#!/bin/sh\n"
+                     f'printf "%s\\n" "$*" >> {log}\n'
+                     f'[ -e {faildir}/"$1" ] && exit 1\n'
+                     "exit 0\n")
+        os.chmod(stub, 0o700)
+
+        def run(env_extra, reason="connect"):
+            for path in (log,):
+                if os.path.exists(path):
+                    os.remove(path)
+            env = {
+                "reason": reason,
+                "TUNDEV": "asuvpn0",
+                "INTERNAL_IP4_DNS": "10.0.0.53 10.0.0.54",
+                C.DNS_DOMAINS_VAR: "asu.edu",
+            }
+            env.update(env_extra)
+            notify.handle_dns(env, binary=stub)
+            try:
+                with open(log, encoding="utf-8") as fh:
+                    calls = [line.strip() for line in fh if line.strip()]
+            except OSError:
+                calls = []
+            return calls, env
+
+        calls, env = run({})
+        r.check("a connect scopes the link before it gives it any resolver",
+                calls[:3] == ["default-route asuvpn0 no",
+                              "domain asuvpn0 asu.edu",
+                              "dns asuvpn0 10.0.0.53 10.0.0.54"],
+                f"got {calls} — servers before scope would make the tunnel a"
+                " candidate for every lookup on the machine, briefly")
+        r.check("a link this configured is handed over completely",
+                "INTERNAL_IP4_DNS" not in env,
+                "the real vpnc-script would still rewrite /etc/resolv.conf,"
+                " and lose the change at the next link change")
+
+        calls, env = run({"CISCO_DEF_DOMAIN": "ad.asu.edu",
+                          "CISCO_SPLIT_DNS": "sol.asu.edu,rc.asu.edu"})
+        r.check("what the gateway pushes beats what was configured locally",
+                "domain asuvpn0 ad.asu.edu sol.asu.edu rc.asu.edu" in calls,
+                f"got {calls} — the gateway is the authority on which names"
+                " live behind it")
+
+        calls, env = run({C.DNS_DOMAINS_VAR: ""})
+        r.check("a tunnel with no domains at all takes every lookup, not none",
+                "default-route asuvpn0 yes" in calls
+                and "dns asuvpn0 10.0.0.53 10.0.0.54" in calls,
+                f"got {calls} — scoping to nothing would resolve nothing,"
+                " which is worse than the behaviour being replaced")
+
+        open(os.path.join(faildir, "domain"), "w", encoding="utf-8").close()
+        calls, env = run({})
+        r.check("a link that cannot be scoped is reverted, not left half done",
+                "revert asuvpn0" in calls,
+                f"got {calls} — servers without scope is the one state worse"
+                " than doing nothing")
+        r.check("a failed handover leaves the real script its DNS job",
+                "INTERNAL_IP4_DNS" in env,
+                "falling back to the old behaviour is always better than"
+                " half-configuring DNS")
+        os.remove(os.path.join(faildir, "domain"))
+
+        open(os.path.join(faildir, "dns"), "w", encoding="utf-8").close()
+        calls, env = run({})
+        r.check("a link whose resolver will not take is reverted too",
+                "revert asuvpn0" in calls and "INTERNAL_IP4_DNS" in env,
+                f"got {calls}")
+        os.remove(os.path.join(faildir, "dns"))
+
+        calls, env = run({}, reason="disconnect")
+        r.check("a disconnect reverts the link",
+                calls == ["revert asuvpn0"], f"got {calls}")
+        r.check("a disconnect never strips INTERNAL_IP4_DNS",
+                "INTERNAL_IP4_DNS" in env,
+                "a previous connect may have fallen back, and the real"
+                " script needs this set to put /etc/resolv.conf back")
+
+        calls, env = run({}, reason="attempt-reconnect")
+        r.check("a retry in progress leaves the resolver where it is",
+                calls == [],
+                f"got {calls} — the link is coming back and reconnect will"
+                " configure it again; tearing it down in between would send"
+                " tunnel lookups out over the public resolver")
+
+        env = {"reason": "connect", "TUNDEV": "asuvpn0",
+               "INTERNAL_IP4_DNS": "10.0.0.53"}
+        notify.handle_dns(env, binary=stub)
+        r.check("DNS is left alone entirely when the user turned it off",
+                "INTERNAL_IP4_DNS" in env and not os.path.exists(log),
+                "the helper omits the option, and its absence is the switch")
+
+        calls, env = run({"TUNDEV": "not a device"})
+        r.check("a device name that cannot name a device reaches no root command",
+                calls == [] and "INTERNAL_IP4_DNS" in env, f"got {calls}")
 
 
 def check_fatal_reporting(r):
@@ -2221,6 +2488,7 @@ def main():
         C = load("asuvpn_contract", "asuvpn_contract.py")
         helper = load("asuvpn_helper", "asuvpn-helper")
         tray = load("asuvpn_tray", "asuvpn-tray")
+        notify = load("asuvpn_notify", "asuvpn-notify")
     except Exception as exc:  # nothing else can run either
         print(f"cannot load the installed programs from {HERE}: {exc}",
               file=sys.stderr)
@@ -2249,6 +2517,7 @@ def main():
         guarded(check_interface_names, C, r)
         guarded(check_option_parsing, helper, r)
         guarded(check_reason_contract, C, r)
+        guarded(check_split_dns, C, r)
         guarded(check_permission_rules, C, r)
         guarded(check_state_payload, tray, r)
         guarded(check_log_scrubbing, tray, r)
@@ -2263,6 +2532,7 @@ def main():
         guarded(check_log_rotation, tray, r)
         guarded(check_config_editing, tray, r)
         guarded(check_liveness_probe, tray, r)
+        guarded(check_resolver_health, tray, r)
         guarded(check_notifications, tray, r)
         guarded(check_output_framing, helper, r)
         guarded(check_closing_flag, helper, r)
@@ -2278,6 +2548,7 @@ def main():
         guarded(check_default_script, helper, C, binary, r)
         guarded(check_message_catalogue, tray, binary, r)
         guarded(check_standin_catalogue, binary, r)
+        guarded(check_script_variables, binary, r)
         guarded(check_desktop_stack, tray, r)
         guarded(check_installed_permissions, C, r)
         guarded(check_install_scripts, C, r)
@@ -2286,6 +2557,7 @@ def main():
     if "wiring" in tiers:
         r.section("wiring — asuvpn-notify executed end to end")
         guarded(check_notify_roundtrip, C, r)
+        guarded(check_dns_takeover, notify, C, r)
         guarded(check_event_translation, helper, tray, C, r)
         guarded(check_fatal_reporting, r)
 
