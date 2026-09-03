@@ -36,8 +36,20 @@ kill -9 "$H"
 # The kernel delivers the death signal immediately; the stand-in's handler
 # runs the disconnect script and exits. Poll rather than sleep-and-hope,
 # and generously: a loaded machine's exit can straggle.
+# `kill -0` was the wrong question. It succeeds for a *zombie* — a process
+# that has already exited but has not been reaped — and a zombie is exactly
+# what this scenario manufactures: it kills the parent, so when the child
+# exits there is nobody left to reap it. Whether the process that adopts an
+# orphan reaps it promptly differs between machines, which is why this passed
+# here and failed on GitHub's runners for the same code. Ask the kernel what
+# state the process is in instead of whether the pid is addressable.
+still_running() {
+    local state
+    state=$(awk '/^State:/{print $2}' "/proc/$1/status" 2>/dev/null) || return 1
+    [ -n "$state" ] && [ "$state" != "Z" ]
+}
 for _ in $(seq 100); do
-    kill -0 "$OC" 2>/dev/null || { survived=0; break; }
+    still_running "$OC" || { survived=0; break; }
     survived=1; sleep 0.1
 done
 exec 9>&-; rm -f "$SB/ctl"
@@ -56,7 +68,7 @@ if [ "$survived" -ne 0 ]; then
   sed 's/^/    /' "$HLOG" >&2 || true
   echo "  --- the survivor, for the record ---" >&2
   tr '\0' ' ' < "/proc/$OC/cmdline" >&2; echo >&2
-  grep -E '^(Name|PPid|SigCgt|SigIgn|SigBlk|Uid)' "/proc/$OC/status" \
+  grep -E '^(Name|State|PPid|SigCgt|SigIgn|SigBlk|Uid)' "/proc/$OC/status" \
     | sed 's/^/    /' >&2
   kill -9 "$OC" 2>/dev/null
   exit 1
