@@ -65,14 +65,21 @@ jobs:
             echo "::endgroup::"
           done
 
-      - name: the display scenarios, under a virtual X server at :0
+      - name: the display scenarios, under one virtual X server at :0
         run: |
-          # fresh_home pins DISPLAY=:0 (the real desktop's display), so the
-          # virtual server has to be :0 as well — no -a auto-numbering.
+          # One Xvfb for the whole step: per-scenario xvfb-run on a fixed
+          # display number races its own teardown's lock file and eventually
+          # reports "Xvfb failed to start". fresh_home pins DISPLAY=:0 (the
+          # real desktop's display), so the server must be :0 — and with no
+          # -auth file Xvfb accepts local connections, which is all the
+          # sandbox ever makes.
+          Xvfb :0 -screen 0 1280x800x24 >/dev/null 2>&1 &
+          XVFB=$!
+          trap 'kill $XVFB 2>/dev/null' EXIT
+          sleep 1
           for s in lifecycle.sh discon.sh watchdog-test.sh escalate.sh \
                    blackhole.sh rebuild.sh contract-test.sh ipc-gate.sh; do
             echo "::group::$s"
-            xvfb-run --server-num=0 -s '-screen 0 1280x800x24' \
-              tests/sandbox/enter.sh "$s"
+            tests/sandbox/enter.sh "$s"
             echo "::endgroup::"
           done
