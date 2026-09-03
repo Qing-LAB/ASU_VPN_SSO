@@ -17,6 +17,11 @@ printf 'FAKECOOKIE\n' >&9
 # this scenario fails. Throwing it away is why an earlier failure could only
 # be answered with "poll longer".
 HLOG="$SB/pdeath.helper.log"; : > "$HLOG"
+# The stand-in's own log, on disk rather than down the pipe it shares with the
+# helper. After the kill that pipe is dead, so this file is the only way to
+# tell "the kernel never delivered the signal" from "it arrived and the
+# shutdown stalled" — the two failures this scenario could not distinguish.
+export FAKE_LOG="$SB/pdeath.standin.log"; : > "$FAKE_LOG"
 "$A/asuvpn-helper" --host https://x --fingerprint pin-sha256:x \
     <"$SB/ctl" >"$HLOG" 2>&1 &
 H=$!; sleep 1.5
@@ -38,6 +43,15 @@ done
 exec 9>&-; rm -f "$SB/ctl"
 if [ "$survived" -ne 0 ]; then
   echo "  FAIL: openconnect outlived its dead helper — as root, unreachable" >&2
+  # The verdict, from evidence rather than from the absence of a corpse.
+  if grep -q "signal .* received" "$FAKE_LOG" 2>/dev/null; then
+    echo "  the death signal WAS delivered — the shutdown itself stalled" >&2
+  else
+    echo "  the death signal was NEVER delivered — the kernel did not act on" >&2
+    echo "  PR_SET_PDEATHSIG, even though the helper armed it without error" >&2
+  fi
+  echo "  --- what the stand-in recorded (survives the dead pipe) ---" >&2
+  sed 's/^/    /' "$FAKE_LOG" >&2 || true
   echo "  --- what the helper said on its way up ---" >&2
   sed 's/^/    /' "$HLOG" >&2 || true
   echo "  --- the survivor, for the record ---" >&2

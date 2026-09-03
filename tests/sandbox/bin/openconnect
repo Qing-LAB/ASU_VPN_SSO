@@ -27,6 +27,18 @@ script = opt("--script") or "/usr/share/vpnc-scripts/vpnc-script"
 dev = opt("--interface") or "tun0"
 sys.stdin.readline()
 def say(m): print(m, flush=True)
+# Both of this process's output channels are one pipe back to the helper
+# (Popen: stdout=PIPE, stderr=STDOUT). The moment the helper dies that pipe is
+# dead, so say() reaches nobody -- which is precisely the window pdeath.sh
+# examines, and why every diagnostic printed there came back blank. FAKE_LOG
+# is a file, so it outlives the supervisor and the test can assert on it
+# instead of inferring from a corpse.
+FAKE_LOG = os.environ.get("FAKE_LOG")
+def trace(m):
+    if not FAKE_LOG: return
+    try:
+        with open(FAKE_LOG, "a") as fh: fh.write(f"{time.monotonic():.3f} {m}\n")
+    except OSError: pass
 def run_script(reason, addr="192.0.2.31"):
     env = dict(os.environ)
     env.update({"reason":reason,"TUNDEV":os.environ.get("FAKE_TUNDEV", dev),
@@ -35,7 +47,7 @@ def run_script(reason, addr="192.0.2.31"):
                 "INTERNAL_IP4_DNS":os.environ.get("FAKE_DNS","")})
     subprocess.call(["/bin/sh","-c",script], env=env)
 state = {"stop":False,"nudges":0}
-def on_stop(_s,_f): state["stop"]=True
+def on_stop(s,_f): trace(f"signal {s} received -> stopping"); state["stop"]=True
 def on_usr2(_s,_f):
     state["nudges"] += 1
     say("[stand-in] SIGUSR2 received, re-establishing")  # the real binary reconnects on SIGUSR2 but logs no line for it
@@ -49,6 +61,7 @@ if os.environ.get("FAKE_STUBBORN"):
     signal.signal(signal.SIGINT, lambda *_: say("[stand-in] SIGINT ignored (stubborn mode)"))
 else:
     signal.signal(signal.SIGINT, on_stop)
+trace(f"pid {os.getpid()} armed handlers; parent is {os.getppid()}")
 signal.signal(signal.SIGTERM,on_stop)
 signal.signal(signal.SIGUSR2, (lambda *_: say("[stand-in] SIGUSR2 ignored (deaf mode)")) if os.environ.get("FAKE_DEAF") else on_usr2)
 say("Connected to 192.0.2.4:443")
@@ -62,12 +75,16 @@ say("Configured as 192.0.2.31, with SSL connected and DTLS connected")
 # tray's (failed, rebuild) row exists for.
 give_up = float(os.environ.get("FAKE_DIE_AFTER") or 0)
 deadline = time.monotonic() + give_up if give_up else None
+trace("entering the wait loop")
 while not state["stop"]:
     if deadline and time.monotonic() >= deadline:
         run_script("disconnect")
         say("[stand-in] gave up reconnecting")
         sys.exit(1)
     time.sleep(0.05)
-run_script("disconnect"); say("[stand-in] logout sent")
+trace("left the wait loop; running the disconnect script")
+run_script("disconnect"); trace("disconnect script returned")
+say("[stand-in] logout sent")
 say(f"[stand-in] nudges received: {state['nudges']}")
+trace("exiting 0")
 sys.exit(0)
