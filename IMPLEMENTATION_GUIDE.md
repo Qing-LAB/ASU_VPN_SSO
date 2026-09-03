@@ -1,11 +1,20 @@
-# Hand-over
+# Implementation guide
 
-State of the work, what is proven and what is not, and the things that were
-learned the expensive way. Written for whoever picks this up next — including a
-future assistant session starting cold.
+What you need to know *before* changing any of this: what is proven and what is
+only believed, the traps this codebase sets, and the lessons that were learned
+the expensive way — each one paid for by a bug that shipped.
 
-[README](README.md) is for users. [DESIGN.md](DESIGN.md) is how the code works.
-This file is what you need to know *before* changing any of it.
+Three documents, three jobs, no overlap between them:
+
+| | |
+| --- | --- |
+| [README.md](README.md) | For users: what it does, how to install it, what every setting means. |
+| [DESIGN.md](DESIGN.md) | How the code works: the state machine and its as-built table, who owns DNS, the invariants, how it is tested. |
+| **this file** | Why it works that way, what is still unproven, and what will bite you if you change it. |
+
+It was called `HANDOVER.md` while the work was being handed over. That is not
+what it is any more — it is the guide you read before touching the code, which
+is a job that does not end.
 
 ---
 
@@ -267,54 +276,36 @@ others use `abspath`, and the reference copy in the contract says which.
 
 ---
 
-## What to do next, roughly in order
+## The live checks still owed
 
-1. **Live-verify the routes-lost fix** — now also the state machine's first
-   live outing. The rebuild landed 2026-08-23 (eight states, one transition
-   table — see DESIGN's state-machine section, which now carries the full
-   as-built table (the self-check holds it to the code); git history records
-   the rationale and the user's decisions). It is suite- and sandbox-proven;
-   live confidence accrues with use, and the flush test doubles as its trial. The break was staged live on
-   2026-08-23 (`sudo ip route flush dev asuvpn0`) and defeated the ladder as
-   then designed, three ways at once: a same-address `reconnect` does not
-   reinstall routes (the stock vpnc-script only routes on `reason=connect`),
-   the reconnect event cleared a demotion the probe had never cleared (badge
-   flap every ~2 minutes, repeated notifications, sign-in branch unreachable
-   even opted in), and the surviving IPv6 routes hid an IPv4-only wipe from a
-   summed route count. All three are fixed the same day — demotions now
-   survive openconnect's word and are promoted only by the source that
-   demoted, the nudge is once per incident, and route families are counted
-   separately — with five selftest checks, four of them mutation-verified,
-   plus the sandbox scenarios. What remains is one live confirmation: with a
-   fresh applet, flush the routes again and expect two strikes → demotion →
-   one nudge → the badge *staying* demoted with one warning notification —
-   and with `autoreconnect on`, a sign-in within `autoreconnect-min-gap`.
-2. **Live-verify the rebuild** (added 2026-08-28, with `autoreconnect` now on
-   by default). `autoreconnect` used to gate one rung of the demotion ladder
-   and nothing else, so it did nothing for the commonest break there is:
-   openconnect gives up after its own 300 s reconnect timeout and the applet
-   sat at *Not connected*. The `(failed, rebuild)` row now signs in again, up
-   to `MAX_REBUILDS` = 3.
+Every item that used to be listed here as work has been implemented — the
+routes-lost fix, the rebuild, the sign-in deadline, all of it, each with
+selftest checks and sandbox scenarios. What none of them has is a **live**
+confirmation, and that is the only thing a suite cannot supply for itself. This
+is the residue, and it is short on purpose; what is proven is in the ledger
+above rather than restated here.
 
-   **What to stage:** suspend the machine for longer than five minutes, then
-   wake it. Expect the badge to read `connection dropped; rebuilding`, a
-   sign-in within one `autoreconnect-min-gap`, and the tunnel back. Leave the
-   WiFi off instead and expect three attempts and then one "gave up"
-   notification — not a fourth.
-
-   Suite- and sandbox-proven (`rebuild.sh`, eight mutation-verified checks),
-   live-unproven.
-3. **Confirm `signin-timeout` against a real Duo push.** Five minutes is
-   generous by design, but it is the first thing in this program that can cut
-   a sign-in short, and only a live approval taken slowly proves the floor is
-   comfortable. If someone hits it legitimately, raise it — the ceiling is
-   3600.
-4. **Watch how often the Duo pushes actually arrive** now that both automatic
+1. **The routes-lost ladder, past its first rung.** With a fresh applet:
+   `sudo ip route flush dev asuvpn0`. Expect two strikes → demotion → one
+   nudge → the badge *staying* demoted with one warning notification; with
+   `autoreconnect on`, a sign-in within `autoreconnect-min-gap`. The break was
+   staged live on 2026-08-23 and defeated the ladder as it was then designed,
+   three ways at once; all three are fixed, and this confirms the fix.
+2. **The rebuild.** Suspend for longer than five minutes and wake: expect
+   `connection dropped; rebuilding`, a sign-in within one
+   `autoreconnect-min-gap`, and the tunnel back. Or leave the WiFi off and
+   expect three attempts and one "gave up" — not a fourth.
+3. **`signin-timeout` against a real Duo push.** Five minutes is generous by
+   design, but it is the first thing here that can cut a sign-in short, and
+   only an approval taken slowly proves the floor is comfortable. Raise it if
+   anyone hits it legitimately; the ceiling is 3600.
+4. **How often the Duo pushes actually arrive**, now that both automatic
    sign-ins are on by default and share one `autoreconnect-min-gap`. More than
    one every five minutes means a bound is wrong, not that the feature is.
-5. **Consider whether `probe-every = 3` is the right frequency** now that a real
-   probe costs ~17 ms and one TCP handshake a minute.
-6. Leave the polkit prompt alone unless the user reopens it.
+
+Two judgement calls, neither urgent: whether `probe-every = 3` is still right
+now that a probe costs ~17 ms, and whether the polkit prompt is worth
+revisiting — leave that one alone unless the user reopens it.
 
 ---
 

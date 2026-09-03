@@ -251,11 +251,9 @@ table row fixed what the flag had hidden.)
 ### The table as built
 
 Every row, from `TRANSITIONS` at the top of `asuvpn-tray`. This is the
-as-built table, not a proposal: `asuvpn selftest` reads the code's dictionary
-and this section and fails if they disagree, so a row added, removed or
-re-pointed without touching this list is caught rather than silently leaving
-the documentation describing a program that no longer exists. `any` is the
-`ANY` wildcard — the row applies in every state.
+as-built table, not a proposal: it is generated from that dictionary rather
+than transcribed, and regenerating it is part of adding a row (see *Changing
+things*). `any` is the `ANY` wildcard — the row applies in every state.
 
 | State | Message | Handler | What the row is for |
 | --- | --- | --- | --- |
@@ -1073,10 +1071,8 @@ where it can be, checked by `asuvpn selftest`.
 | A refusal is reported as a sentence, not a number | `[helper] FATAL ` marker, set by the helper | wiring tier, by running three refused connects |
 | Everything executed as root is unwritable by a second principal | every loader's bootstrap check, the helper's runtime list (exit 26), `install.sh`'s `go-w` sweep | environment tier, by making each file writable in turn, and end to end for a shared group in the sandbox (`sec.sh` b/b2) |
 | The VPN's resolver stays in force for the life of the tunnel | per-link configuration through `systemd-resolved`, never `/etc/resolv.conf`; a third watchdog source asserts it every check and the ladder reconfigures it | logic tier drives every `resolver_health` verdict; the wiring tier drives `asuvpn-notify` against a stand-in `resolvectl` and asserts the call order, the revert on every failure, and that `INTERNAL_IP4_DNS` survives each one |
-| The version the programs print is the version the wheel carries | `VERSION` in the contract is read at runtime by the menu, the log, `--version` and the self-test, and at build time by hatchling out of the same line; the release workflow refuses a tag that disagrees with it | logic tier applies hatchling's own configured pattern and compares, and refuses a literal version in `pyproject.toml` — mutation-verified by planting one |
-| Every check says what it pins, and every assertion says what breaks | convention, and the suite parses itself to enforce it | logic tier walks its own AST: no `check_*` without a docstring, no `r.check` without a failure detail — mutation-verified in both halves |
-| Both PyPI console scripts run something that is actually packaged | one payload script each, force-included in `pyproject.toml` | logic tier reads the entry points, the module and the force-include list together |
-| No source, test or document names a real address or internal host | RFC 5737 / RFC 3849 space for every example; the only name under the endpoint's own domain is the shipped default | logic tier **walks the tree** rather than listing files — an explicit list already missed five tracked ones the day it was written. Mutation-verified by planting a real resolver in `pyproject.toml` and a real hostname in a CI workflow, both of which the list-based version let through |
+| The version the programs print is the version the wheel carries | `VERSION` in the contract is read at runtime by the menu, the log, `--version` and the self-test, and at build time by hatchling out of the same line; the release workflow refuses a tag that disagrees with it | CI builds the wheel, installs it, and compares the installed `asuvpn --version` with the artifact — a result, not a reading of `pyproject.toml` |
+| No source, test or document names a real address or internal host | RFC 5737 / RFC 3849 space for every example; the only name under the endpoint's own domain is the shipped default | a grep in CI, and review. Deliberately **not** a self-check: `asuvpn selftest` answers "will this work on this machine", and a source-hygiene scan is a lint that has no business shipping to users |
 | A domain from a gateway never reaches a root command line unvalidated | `DOMAIN_RE`, applied where the list is parsed | logic tier, with option-like, shell-punctuation and single-label payloads |
 | `openconnect-sso` can still import `pkg_resources` | `setuptools<71` pinned with `pipx inject --force` | environment tier, by importing it |
 
@@ -1147,13 +1143,8 @@ breaking the code on purpose:
 | refund the rebuild count when a tunnel merely reaches connected | a flapping tunnel cannot outrun the rebuild limit |
 | arm the rebuild on any exit, not only one that followed real traffic | a tunnel that never came up is not rebuilt |
 | have the helper read `INTERNAL_IP4_DNS` with `str.split()` again | the resolver the tray is told is one the link could really hold |
-| plant the real resolver's address in `pyproject.toml` | no source, test or document names a real address |
-| plant a real internal hostname in a CI workflow | no source or test file names an internal host |
 | return resolvers as the gateway spelled them, not canonically | resolvers come back canonical, so both ends can compare them |
 | keep the `#servername` suffix on a DNS-over-TLS server | a DNS-over-TLS server is recognised by its address |
-| put a literal `version = "9.9.9"` in `pyproject.toml` | the packaging states no version of its own |
-| delete a `check_*` docstring | every check says what it pins |
-| drop a `r.check` failure detail | every assertion says what breaks when it fails |
 | delete the `(failed, rebuild)` row | no handler is orphaned by the table, plus every rebuild check |
 | drop `_clear_drop` from the cancel row | cancelling a rebuild hands the whole budget back |
 | let `signin-timeout` accept 0, or any value at all | signin-timeout has no off, and no nonsense either |
@@ -1231,7 +1222,8 @@ dispatches on `$reason` but skips some, and **warn** when it cannot tell.
 ### Still unproven
 
 The ledger of what is proven live, what is proven only in the sandbox, and
-what is untested is [HANDOVER.md](HANDOVER.md) — update that file as items
+what is untested is [IMPLEMENTATION_GUIDE.md](IMPLEMENTATION_GUIDE.md) —
+update that file as items
 close. (This section used to restate the list, went stale against the ledger
 twice, and no longer tries.)
 
@@ -1278,6 +1270,12 @@ wholesale, but a bare short option sails past it, so listing only the long
 form leaves the one-letter door open. Add a case to the self-test's
 `refuse` list.
 
+**Adding a transition.** After the row and its `_tr_*` handler, regenerate
+*The table as built* above from `TRANSITIONS` — it is generated, not
+transcribed, so a hand-edit is how it starts describing a program that does not
+exist. Nothing checks this for you; that is deliberate, and *Adding a check*
+below says why.
+
 **Adding a setting.** One `Setting(...)` in `SETTINGS` in
 `asuvpn_contract.py` is the whole of it: the generated config file, its
 documentation and its defaults all come from that entry, and a config written
@@ -1292,9 +1290,10 @@ option's *presence* rather than its value is the switch.
 every source, test and document belongs in RFC 5737 (`192.0.2.x`,
 `198.51.100.x`, `203.0.113.x`) or RFC 3849 (`2001:db8::x`), and the only
 hostname allowed under the endpoint's own domain is the shipped default in
-`SETTINGS`. `asuvpn selftest` enforces both, because the tempting thing to do
-with a live session's log is paste it into a fixture, and that is how
-somebody's resolver ends up in a public repository. It already had: the first
+`SETTINGS`. A CI grep catches the obvious cases and review catches the rest,
+because the tempting thing to do with a live session's log is paste it into a
+fixture, and that is how somebody's resolver ends up in a public repository.
+It already had: the first
 cut of the split-DNS work carried the real resolver into the tests and the
 README, and the sandbox stand-in had imitated the real gateway's address for
 far longer.
@@ -1304,9 +1303,17 @@ where there was one, the bug that earned it — this project's checks exist
 because something broke, and that story is what stops a later reader deleting
 one that looks pedantic. Give every `r.check` a third argument too: the failure
 detail, carrying the observed value and the consequence, because it is the only
-thing printed when the check fails. The suite parses itself and fails if either
-is missing, so this is a rule rather than a habit. Then break the code on
-purpose and confirm the check notices; add the row to the mutation table above.
+thing printed when the check fails. Nothing enforces either — that is review's
+job, and a check that reads the suite's own source would be policing taste
+rather than behaviour. Then break the code on purpose and confirm the check
+notices; add the row to the mutation table above.
+
+**What a check may and may not do.** It exercises behaviour and asserts a
+result or an invariant. It does **not** read source text, Markdown or packaging
+metadata looking for patterns: `asuvpn selftest` ships to users and answers
+"will this work on this machine", and a suite that greps its own repository
+answers a question no user asked. Five such checks were written and removed the
+same day. Hygiene of that kind belongs in CI or in review.
 
 **Before committing.** `asuvpn selftest`, then the linters listed in the
 README's [Checking it](README.md#checking-it) section. All are expected to be

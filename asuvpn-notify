@@ -95,17 +95,6 @@ def report():
         client.close()
 
 
-# systemd's own tool, and the same one the stock vpnc-script reaches for on a
-# machine where it does detect resolved. Absolute paths, and no PATH lookup:
-# this runs as root, and the environment it runs in came from openconnect.
-RESOLVECTL_PATHS = ("/usr/bin/resolvectl", "/bin/resolvectl")
-
-# Generous for a call that answers in milliseconds, and the point is only that
-# there is a bound at all. openconnect waits for this script, so a resolved that
-# has wedged must cost the connection a few seconds, not hang it.
-RESOLVECTL_TIMEOUT = 5
-
-
 def note(message):
     """Say what was done with DNS, on the stream openconnect relays.
 
@@ -119,14 +108,6 @@ def note(message):
         sys.stderr.flush()
     except OSError:
         pass
-
-
-def resolvectl_path():
-    """Where resolvectl is, or None if this machine has none."""
-    for path in RESOLVECTL_PATHS:
-        if os.access(path, os.X_OK):
-            return path
-    return None
 
 
 def resolvectl(binary, *argv, quiet=False):
@@ -146,7 +127,7 @@ def resolvectl(binary, *argv, quiet=False):
     try:
         done = subprocess.run([binary, *argv], stdin=subprocess.DEVNULL,
                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                              timeout=RESOLVECTL_TIMEOUT, check=False)
+                              timeout=C.RESOLVECTL_TIMEOUT, check=False)
     except (OSError, ValueError, subprocess.SubprocessError) as exc:
         if not quiet:
             note(f"resolvectl {argv[0]} failed: {exc}")
@@ -269,7 +250,7 @@ def handle_dns(environ, binary=None):
     """
     if C.DNS_DOMAINS_VAR not in environ:
         return
-    binary = resolvectl_path() if binary is None else binary
+    binary = C.resolvectl_path() if binary is None else binary
     if binary is None:
         return  # no systemd-resolved on this machine; nothing to hand it
     device = environ.get("TUNDEV", "")

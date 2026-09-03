@@ -45,6 +45,30 @@ jobs:
       - name: the whole self-test, all three tiers
         run: /usr/bin/python3 -I asuvpn-selftest
 
+      # A lint, deliberately not a self-check: asuvpn-selftest ships to users
+      # and answers "will this work on this machine". Whether the repository
+      # names somebody's resolver is this job's question, not theirs.
+      - name: no source, test or document names a real address
+        run: |
+          bad=$(git grep -nIE '\b([0-9]{1,3}\.){3}[0-9]{1,3}\b' -- \
+                  ':!tests/sandbox/app' ':!tests/sandbox/rbin' \
+                | grep -vE '127\.0\.0\.[0-9]+|0\.0\.0\.0|255\.255\.255\.255' \
+                | grep -vE '192\.0\.2\.|198\.51\.100\.|203\.0\.113\.' \
+                || true)
+          if [ -n "$bad" ]; then
+            echo "$bad" >&2
+            echo "Examples belong in RFC 5737 space (192.0.2.x, 198.51.100.x," >&2
+            echo "203.0.113.x) so a fixture is never somebody's machine." >&2
+            exit 1
+          fi
+          host=$(git grep -nIoE '[A-Za-z0-9_.-]+\.asu\.edu' \
+                 | grep -v 'sslvpn\.asu\.edu' || true)
+          if [ -n "$host" ]; then
+            echo "$host" >&2
+            echo "Only the shipped default endpoint may appear." >&2
+            exit 1
+          fi
+
       - name: the analysers (README "Checking it", verbatim)
         run: |
           mkdir -p /tmp/asuvpn-lint
@@ -74,3 +98,15 @@ jobs:
           # A throwaway HOME: the same install.sh the repo ships runs from
           # the wheel's payload and ends with the installed self-check.
           HOME=/tmp/wheel-home /tmp/wheel-venv/bin/asuvpn-install
+          # Both console scripts exist and run something real, and the version
+          # the installed programs report is the one the wheel carries. Asserted
+          # against the built artifact rather than by reading pyproject.toml.
+          /tmp/wheel-venv/bin/asuvpn-bootstrap --help > /dev/null
+          built=$(ls dist/*.whl | sed -E 's/.*asuvpn-([^-]+)-py3.*/\1/')
+          reported=$(HOME=/tmp/wheel-home /tmp/wheel-home/.local/bin/asuvpn --version)
+          echo "wheel $built, installed reports: $reported"
+          case "$reported" in
+            *"$built"*) ;;
+            *) echo "the wheel is $built but the install reports $reported" >&2
+               exit 1 ;;
+          esac

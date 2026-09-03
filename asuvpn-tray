@@ -408,10 +408,6 @@ def probe_tunnel(address, port, timeout):
 # root, and asuvpn-notify already does it at the only moment it can be done
 # correctly. What is left here is the question nothing else was asking: is the
 # configuration it installed still there?
-RESOLVECTL_PATHS = ("/usr/bin/resolvectl", "/bin/resolvectl")
-RESOLVECTL_TIMEOUT = 5
-
-
 def parse_link_dns(text):
     """The resolver addresses in one `resolvectl dns <link>` answer.
 
@@ -444,14 +440,13 @@ def link_resolvers(device):
     per-link state files under /run/systemd/resolve/netif are 0700 to
     systemd-resolve, so the tool is the only way in from an ordinary account.
     """
-    binary = next((path for path in RESOLVECTL_PATHS if os.access(path, os.X_OK)),
-                  None)
+    binary = C.resolvectl_path()
     if binary is None or not device:
         return None
     try:
         done = subprocess.run([binary, "dns", device], stdin=subprocess.DEVNULL,
                               stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                              timeout=RESOLVECTL_TIMEOUT, check=False)
+                              timeout=C.RESOLVECTL_TIMEOUT, check=False)
     except (OSError, ValueError, subprocess.SubprocessError):
         return None
     if done.returncode != 0:
@@ -515,22 +510,6 @@ def resolver_health(device, expected):
             f" /etc/resolv.conf does not name {expected} either")
 
 
-def read_ifindex(device):
-    """The kernel's index for this device, or None if it has none right now.
-
-    An ifindex identifies one *incarnation* of a name, which is what tells
-    "our tunnel is still here" from "a device with the same name is here".
-    One implementation, because the tray needed this in two places and the
-    helper carries its own — three hand-copies of a /sys read is how a fix
-    to one of them gets lost.
-    """
-    try:
-        with open(f"/sys/class/net/{device}/ifindex") as fh:
-            return int(fh.read().strip())
-    except (OSError, ValueError):
-        return None
-
-
 def tunnel_health(device, ifindex, routes_seen=None):
     """Why the tunnel cannot be carrying traffic, or None. Facts, not packets.
 
@@ -563,7 +542,7 @@ def tunnel_health(device, ifindex, routes_seen=None):
     if not C.INTERFACE_RE.match(device):
         return None, {"dev": device, "ignored": "not a usable device name"}
     facts = {"dev": device}
-    current = read_ifindex(device)
+    current = C.interface_index(device)
     if current is None:
         return "the tunnel device is gone", facts
     facts["ifindex"] = current
@@ -1506,7 +1485,7 @@ class StateMachine:
             return
         self.tunnel_device = device
         # Taken now, while openconnect has just created it.
-        index = read_ifindex(device)
+        index = C.interface_index(device)
         if index is not None and index != self.tunnel_ifindex:
             # A different incarnation of the device. Which route families the
             # old one carried says nothing about this one, and a stale latch
@@ -2392,7 +2371,7 @@ class VpnTray(StateMachine):
 
         resolvectl answers in milliseconds, but it is a subprocess and a bus
         round trip, and a resolved that has wedged would otherwise freeze the
-        applet for RESOLVECTL_TIMEOUT with the menu open.
+        applet for C.RESOLVECTL_TIMEOUT with the menu open.
         """
         self.dns_check_in_flight = True
         device, expected = self.tunnel_device, self.tunnel_dns

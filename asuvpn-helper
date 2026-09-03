@@ -279,7 +279,7 @@ def serve_events(server, token, ifname, owned):
         if state == C.STATE_CONNECTED:
             # The authoritative moment to claim the device: openconnect has just
             # created it, so this ifindex is provably ours.
-            index = interface_index(device or ifname)
+            index = C.interface_index(device or ifname)
             if index is not None:
                 owned["ifindex"] = index
         # Sanitised here rather than trusted from the sender. asuvpn-notify
@@ -453,7 +453,7 @@ def watch_for_interface(ifname, holder, deadline=60):
     """Record the ifindex of our device once openconnect creates it."""
     end = time.monotonic() + deadline
     while time.monotonic() < end:
-        index = interface_index(ifname)
+        index = C.interface_index(ifname)
         if index is not None:
             holder["ifindex"] = index
             return
@@ -485,22 +485,6 @@ def tunnel_interfaces():
         return set()
 
 
-def interface_index(name):
-    """The kernel's ifindex for a device, or None.
-
-    ifindex is monotonic, so it identifies one *incarnation* of a name. Two
-    helpers racing can both pick the free name asuvpn0; the loser's openconnect
-    fails, but at teardown it would find asuvpn0 present and delete the winner's
-    live tunnel. Comparing the index taken once the tunnel was up proves the
-    device still is the one we created.
-    """
-    try:
-        with open(f"/sys/class/net/{name}/ifindex") as fh:
-            return int(fh.read().strip())
-    except (OSError, ValueError):
-        return None
-
-
 def interface_exists(name):
     """Ask about one device by name.
 
@@ -529,7 +513,7 @@ def verify_teardown(ifname, before, was_killed, owned):
     present = tunnel_interfaces()
 
     if interface_exists(ifname):
-        if owned is None or interface_index(ifname) != owned:
+        if owned is None or C.interface_index(ifname) != owned:
             log(f"{ifname} is not the device this session created; leaving it alone")
         elif not ip:
             log(f"WARNING: {ifname} outlived openconnect but 'ip' is missing;"

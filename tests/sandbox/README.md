@@ -130,6 +130,7 @@ refusals, the watchdog — against a modeled openconnect. It does not prove the
 model matches the real binary: that is the selftest environment tier's job
 (it reads the installed binary's own string table, asks it for its script
 path, and checks the stand-in against the same catalogue), and ultimately the
-live runs recorded in [HANDOVER.md](../../HANDOVER.md). Keep the two claims
+live runs recorded in
+[IMPLEMENTATION_GUIDE.md](../../IMPLEMENTATION_GUIDE.md). Keep the two claims
 separate; the hand-over's proven/unproven ledger is the place they are
 tracked.

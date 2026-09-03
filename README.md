@@ -1305,7 +1305,7 @@ teardown, and logged precisely so a declined action never reads as a hang.
 | [`asuvpn.svg`](asuvpn.svg) | App icon. |
 | [`tests/sandbox/`](tests/sandbox/README.md) | Scenario tests: the real programs run whole lifetimes against stand-ins, in a namespace. |
 | [`DESIGN.md`](DESIGN.md) | Internals: state machine, concurrency, invariants, how it is tested. |
-| [`HANDOVER.md`](HANDOVER.md) | What is proven and what is not, the lessons behind the design, and what to do next. |
+| [`IMPLEMENTATION_GUIDE.md`](IMPLEMENTATION_GUIDE.md) | Read before changing anything: what is proven and what is only believed, the traps, and the lessons each bug paid for. |
 | [`ruff.toml`](ruff.toml) | Lint config. Its `ignore` list records which rules are off and why. |
 | [`DESIGN.md`](DESIGN.md) | How the code works: the state machine and its full as-built transition table, who owns DNS, the invariants, and how it is all tested. |
 | [`SECURITY.md`](SECURITY.md) | How to report a vulnerability privately, what is in scope, and what belongs upstream. |
@@ -1342,7 +1342,7 @@ the middle one is the point:
 
 | Tier | What it checks |
 | --- | --- |
-| `logic` | Pure functions and the state machine — plus one rule about the repository itself: no source, test or document may name a real address or a real internal host. Every example lives in RFC 5737 / RFC 3849 documentation space, and the only hostname under the endpoint's own domain is the shipped default, so a fixture pasted from a live session cannot quietly publish somebody's machine. Then: the option blocklist, interface-name validation, `--interface`/`--script` parsing, the permission rules, state-payload parsing, the transition table driven with real message sequences, the rebuild bounds, the sign-in deadline against a child that would outlive the run, that `openconnect`'s output cannot forge a helper message, the split-DNS domain rules against option-like and shell-punctuation payloads, and every verdict the resolver check can reach |
+| `logic` | Pure functions and the state machine: the option blocklist, interface-name validation, `--interface`/`--script` parsing, the permission rules, state-payload parsing, the transition table driven with real message sequences, the rebuild bounds, the sign-in deadline against a child that would outlive the run, that `openconnect`'s output cannot forge a helper message, the split-DNS domain rules against option-like and shell-punctuation payloads, and every verdict the resolver check can reach |
 | `environment` | Our assumptions put to the installed binaries — that `openconnect` exists, that it *gives up retrying* rather than trying forever (the fact the rebuild rests on, read back out of its own `--help`), that the `vpnc-script` it names is executable and handles every `reason` we send, that our fallback log patterns still appear in its message catalogue, that the split-DNS variables the handover reads are still named what we think, and that nothing the helper runs as root is writable by anyone else |
 | `wiring` | `asuvpn-notify` actually executed: the event arrives with the right token and fields, the real `vpnc-script` still runs with its environment intact, the token is scrubbed before it sees it, no event can emit more than one line — and the DNS handover driven against a stand-in `resolvectl`, asserting the call order, the revert on every failure path, and that a failure always leaves the stock script its DNS job |
 
@@ -1497,7 +1497,8 @@ forced-DPD safety, free recovery through WiFi loss and suspend, the nudge)
 versus only in the sandbox (the full escalation ladder including the
 unattended sign-in, the shared-group refusal) is kept, with dates and evidence,
 in
-[HANDOVER.md](HANDOVER.md) — that ledger, not this paragraph, is current.
+[IMPLEMENTATION_GUIDE.md](IMPLEMENTATION_GUIDE.md) — that ledger, not this
+paragraph, is current.
 
 ## License
 

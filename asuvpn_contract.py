@@ -252,6 +252,58 @@ AC_VERSION = "4.7.00136"
 FALLBACK_VPNC_SCRIPT = "/usr/share/vpnc-scripts/vpnc-script"
 
 
+# ------------------------------------------------- what all three programs read
+
+
+def interface_index(name):
+    """The kernel's ifindex for a device, or None if it has none right now.
+
+    ifindex is monotonic, so it identifies one *incarnation* of a name, which
+    is what tells "our tunnel is still here" from "a device with the same name
+    is here". Two helpers racing can both pick the free name asuvpn0; the
+    loser's openconnect fails, but at teardown it would find asuvpn0 present
+    and delete the winner's live tunnel. Comparing the index taken once the
+    tunnel was up proves the device still is the one we created.
+
+    Here rather than in each program because it was written out twice, byte for
+    byte, under two names -- and one of those copies carried a docstring
+    warning that hand-copying a /sys read is how a fix to one of them gets
+    lost. This file exists for facts more than one program needs; a four-line
+    read is still a fact.
+    """
+    try:
+        with open(f"/sys/class/net/{name}/ifindex") as fh:
+            return int(fh.read().strip())
+    except (OSError, ValueError):
+        return None
+
+
+# systemd's own tool, and the one the stock vpnc-script reaches for on a machine
+# where it detects resolved. Absolute paths and no PATH lookup: asuvpn-notify
+# calls this as root, in an environment openconnect handed it.
+RESOLVECTL_PATHS = ("/usr/bin/resolvectl", "/bin/resolvectl")
+
+# Generous for a call that answers in milliseconds; the point is that there is a
+# bound at all. openconnect waits for the script, so a resolved that has wedged
+# must cost the connection a few seconds rather than hang it -- and the tray
+# must not freeze for longer than that with its menu open.
+RESOLVECTL_TIMEOUT = 5
+
+
+def resolvectl_path():
+    """Where resolvectl is, or None if this machine has none.
+
+    Both ends of the DNS work ask this -- asuvpn-notify to configure a link,
+    the tray to read one back -- and they asked it two different ways before
+    this existed, which is two chances to disagree about whether the machine
+    has systemd-resolved on it.
+    """
+    for path in RESOLVECTL_PATHS:
+        if os.access(path, os.X_OK):
+            return path
+    return None
+
+
 # ------------------------------------------------------------------ split DNS
 #
 # A split tunnel wants split DNS: the names that live behind the tunnel are

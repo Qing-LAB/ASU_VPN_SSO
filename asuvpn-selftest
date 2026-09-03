@@ -706,7 +706,7 @@ def check_demotion_rules(tray, r):
     # A reconnect that lands on a *different* device incarnation must not
     # inherit the old one's route-family observations: a stale IPv6 latch
     # held a demotion forever against a working v4-only session.
-    if tray.read_ifindex("lo") is None:
+    if tray.C.interface_index("lo") is None:
         r.warn("a replaced device forgets the old one's route families",
                "no lo to stage the adoption with")
     else:
@@ -1567,7 +1567,10 @@ def check_teardown_ownership(helper, r):
     deleted, logged = [], []
     originals = {name: getattr(helper, name) for name in
                  ("find_ip", "tunnel_interfaces", "interface_exists",
-                  "interface_index", "run", "log")}
+                  "run", "log")}
+    # ifindex now lives in the contract, and each program loads its own copy of
+    # that module, so patching this one reaches the helper and nothing else.
+    original_index = helper.C.interface_index
 
     def fake_run(command, timeout=5):
         deleted.append(list(command))
@@ -1579,7 +1582,7 @@ def check_teardown_ownership(helper, r):
     helper.run = fake_run
     helper.log = logged.append
     try:
-        helper.interface_index = lambda name: 7
+        helper.C.interface_index = lambda name: 7
         helper.verify_teardown("asuvpn0", set(), False, 9)  # not our incarnation
         foreign_deletes = [c for c in deleted if "delete" in c]
         left_alone = any("leaving it alone" in line for line in logged)
@@ -1600,6 +1603,7 @@ def check_teardown_ownership(helper, r):
     finally:
         for name, value in originals.items():
             setattr(helper, name, value)
+        helper.C.interface_index = original_index
     r.check("only the device this session created is ever deleted",
             not foreign_deletes and left_alone and ours_deleted,
             f"foreign deletes={foreign_deletes} left_alone={left_alone}"
@@ -2023,321 +2027,6 @@ def check_installed_permissions(C, r):
 # -------------------------------------------------------------------- wiring
 
 
-# Where a source file may point. RFC 5737 and RFC 3849 exist so that examples,
-# fixtures and documentation can name an address without naming anybody's
-# machine; loopback and link-local are unremarkable everywhere.
-DOCUMENTATION_NETS = (
-    "127.0.0.0/8", "0.0.0.0/32", "255.255.255.255/32",
-    "192.0.2.0/24", "198.51.100.0/24", "203.0.113.0/24",
-    "::1/128", "::/128", "2001:db8::/32", "fe80::/10",
-)
-
-# Loose on purpose: everything it catches is then handed to ipaddress, and
-# anything that is not an address is dropped. That is what keeps a timestamp
-# (15:38:44) and a version (4.7.00136) out of the results.
-ADDRESS_RE = re.compile(r"\b(?:[0-9]{1,3}(?:\.[0-9]{1,3}){3}"
-                        r"|[0-9A-Fa-f]{0,4}(?::[0-9A-Fa-f]{0,4}){2,7})\b")
-
-# Never walked: build output, caches, and the sandbox staging that enter.sh
-# restages on every run. They ship to nobody and hold whatever the last run
-# produced, so reporting them would be reporting this machine back to itself.
-UNSCANNED_DIRS = frozenset({
-    ".git", "__pycache__", "dist", "build", ".venv", ".ruff_cache",
-    ".mypy_cache", "app", "rbin", "home",
-})
-UNSCANNED_SUFFIXES = frozenset({".png", ".jpg", ".jpeg", ".ico", ".gz",
-                                ".whl", ".pyc", ".woff", ".woff2"})
-# A file bigger than this in a source tree is data, not something a person
-# wrote an address into.
-SCAN_MAX_BYTES = 2 * 1024 * 1024
-
-
-def shipped_files():
-    """Every text file in the tree, as (label, text, is_prose).
-
-    Walked rather than listed. The first version of this named seven files and
-    already missed five tracked ones -- pyproject.toml, the three workflows and
-    STATE-MACHINE-PLAN.md -- which is what an explicit list does after the
-    commit that writes it. Walking also means the rule covers a file nobody has
-    written yet, which is the only way a rule like this stays true.
-
-    `is_prose` marks Markdown. Addresses are held to the same rule everywhere,
-    because an address in a document was pasted from a live session by
-    definition; the hostname rule is not applied to prose, because this is an
-    ASU tool and its documentation says so on nearly every page.
-    """
-    out = []
-    for root, dirs, names in os.walk(HERE):
-        dirs[:] = sorted(d for d in dirs if d not in UNSCANNED_DIRS
-                         and not d.endswith(".egg-info"))
-        for name in sorted(names):
-            path = os.path.join(root, name)
-            if os.path.splitext(name)[1].lower() in UNSCANNED_SUFFIXES:
-                continue
-            try:
-                if os.path.getsize(path) > SCAN_MAX_BYTES:
-                    continue
-                with open(path, encoding="utf-8", errors="replace") as fh:
-                    text = fh.read()
-            except OSError:
-                continue
-            out.append((os.path.relpath(path, HERE), text,
-                        name.lower().endswith(".md")))
-    return out
-
-
-def check_documented_transitions(tray, r):
-    """DESIGN.md's transition table is the one the code actually runs.
-
-    The table is the design: it is the only place the whole of the applet's
-    behaviour is visible at once, and the README sends people to it. A table
-    that has drifted is worse than none, because it is read and believed --
-    and it drifts silently, since nothing about adding a row to a dict makes
-    anyone open a Markdown file.
-
-    So the document is held to the dict, both ways: every row the code has must
-    be written down, and every row written down must exist. The handler name is
-    compared too, because a row re-pointed at a different handler is a
-    behaviour change that leaves the pair looking untouched.
-    """
-    try:
-        with open(os.path.join(HERE, "DESIGN.md"), encoding="utf-8") as fh:
-            design = fh.read()
-    except OSError:
-        return  # an installed copy carries no design notes
-
-    section = design.partition("### The table as built")[2]
-    if not section:
-        r.fail("DESIGN.md documents the transition table the code runs",
-               "no '### The table as built' section — the README sends readers"
-               " there for the as-built rows")
-        return
-    documented = {
-        (state, message): handler
-        for state, message, handler in re.findall(
-            r"^\|\s*`([^`]+)`\s*\|\s*`([^`]+)`\s*\|\s*`_tr_([^`]+)`",
-            section, re.M)}
-    actual = {("any" if state == tray.ANY else state, message): handler
-              for (state, message), handler in tray.TRANSITIONS.items()}
-
-    undocumented = sorted(set(actual) - set(documented))
-    r.check("every transition the code runs is written down",
-            not undocumented,
-            f"{undocumented} are in TRANSITIONS and not in DESIGN.md — the"
-            " table is where the whole of the behaviour is visible at once")
-    invented = sorted(set(documented) - set(actual))
-    r.check("every transition written down still exists",
-            not invented,
-            f"{invented} are in DESIGN.md and not in TRANSITIONS — a documented"
-            " row that does not exist is read and believed")
-    mismatched = sorted(f"{pair}: doc says _tr_{documented[pair]},"
-                        f" code runs _tr_{actual[pair]}"
-                        for pair in set(documented) & set(actual)
-                        if documented[pair] != actual[pair])
-    r.check("every documented row names the handler the code runs",
-            not mismatched,
-            f"{mismatched} — a row re-pointed at another handler changes"
-            " behaviour while the pair looks untouched")
-
-
-def check_source_addresses(C, r):
-    """No source or test file names a real address or a real internal host.
-
-    Not a style rule. A fixture written from a live session is how somebody's
-    resolver, gateway or login node ends up in a public repository, and it
-    happened here: the first version of the split-DNS work carried the real
-    resolver into the tests and the README, and the sandbox stand-in had been
-    imitating the real gateway's address since long before that.
-
-    Two rules, both mechanical. Addresses must sit in the ranges reserved for
-    documentation, so an example can never be somebody's machine. Hostnames
-    must not sit under the domain the configured endpoint lives in -- except
-    that endpoint itself, which is the product's own public default and has to
-    be stated somewhere.
-    """
-    import ipaddress
-
-    sources = shipped_files()
-    if not sources:
-        r.warn("no source or test file names a real address", "nothing to scan")
-        return
-
-    allowed = [ipaddress.ip_network(net) for net in DOCUMENTATION_NETS]
-    strays = []
-    for label, text, _is_prose in sources:
-        for candidate in set(ADDRESS_RE.findall(text)):
-            try:
-                address = ipaddress.ip_address(candidate)
-            except ValueError:
-                continue  # not an address: a timestamp, a version, a typo test
-            if not any(address in net for net in allowed
-                       if net.version == address.version):
-                strays.append(f"{label}: {candidate}")
-    r.check("no source, test or document names a real address",
-            not strays,
-            f"{sorted(strays)} — examples belong in RFC 5737 / RFC 3849 space"
-            " (192.0.2.x, 198.51.100.x, 203.0.113.x, 2001:db8::x) so a fixture"
-            " can never be somebody's machine")
-
-    default_server = C.SETTINGS_BY_NAME["server"].default
-    home = C.parent_domain(default_server)
-    if not home:
-        r.info("the endpoint's domain cannot be derived, so hostnames in the"
-               " sources are not checked against it")
-        return
-    pattern = re.compile(r"[A-Za-z0-9_.-]*" + re.escape(home))
-    leaked = sorted({f"{label}: {found}"
-                     for label, text, is_prose in sources if not is_prose
-                     for found in pattern.findall(text)
-                     if found != default_server})
-    r.check("no source or test file names an internal host",
-            not leaked,
-            f"{leaked} — only {default_server} may appear, because it is the"
-            f" shipped default; anything else under {home} names a machine"
-            " that is nobody else's business")
-
-
-def check_version_is_stated_once(C, r):
-    """The version the programs print is the version the wheel is built from.
-
-    `C.VERSION` reaches the menu, the startup log, `asuvpn --version` and this
-    banner by being read at runtime, so those four cannot disagree with each
-    other. The build is the one consumer that could: hatchling re-reads the
-    same line out of the source with its own regex, and if that regex or that
-    path ever stops matching, `pip install asuvpn` and `asuvpn --version` start
-    naming different releases -- which is exactly the kind of drift nobody
-    notices until someone reports a bug against a version that never existed.
-
-    So the packaging is held to the same line, by applying hatchling's own
-    configured pattern here and requiring the answer to be what the programs
-    say. A checkout has pyproject.toml; an installed copy does not, and there
-    is nothing to check there.
-    """
-    path = os.path.join(HERE, "pyproject.toml")
-    try:
-        with open(path, encoding="utf-8") as fh:
-            pyproject = fh.read()
-    except OSError:
-        return  # an installed copy carries no packaging
-
-    source = re.search(r'^\s*path\s*=\s*"([^"]+)"', pyproject, re.M)
-    pattern = re.search(r"^\s*pattern\s*=\s*'([^']+)'", pyproject, re.M)
-    if not source or not pattern:
-        r.fail("the wheel takes its version from the contract",
-               "pyproject.toml no longer configures [tool.hatch.version] with"
-               " a path and a pattern; the build may be stating a version of"
-               " its own")
-        return
-    try:
-        with open(os.path.join(HERE, source.group(1)), encoding="utf-8") as fh:
-            found = re.search(pattern.group(1), fh.read())
-    except (OSError, re.error) as exc:
-        found = None
-        r.info(f"could not apply the build's own version pattern: {exc}")
-    built = found.group("version") if found else None
-    r.check("the wheel takes its version from the contract",
-            built == C.VERSION,
-            f"the build would package {built!r} while the programs report"
-            f" {C.VERSION!r} — pyproject.toml reads {source.group(1)}")
-
-    dynamic = re.search(r'^\s*dynamic\s*=\s*\[[^\]]*"version"', pyproject, re.M)
-    r.check("the packaging states no version of its own",
-            bool(dynamic) and not re.search(r'^\s*version\s*=\s*"', pyproject, re.M),
-            "pyproject.toml should declare version dynamic and let hatchling"
-            " read the contract; a literal there is a second source of truth")
-
-
-def check_the_suite_documents_itself(r):
-    """Every check says what it pins, and every assertion says what breaks.
-
-    Two rules, and they are here because a self-check is only as useful as what
-    it tells you at 2am. A named assertion that fails with no detail is a
-    riddle: you learn that something is wrong and nothing about what, and the
-    reader's next move is to go read the suite instead of fixing the fault.
-
-      * every `check_*` gets a docstring saying what invariant it pins and,
-        where there was one, the bug that earned it. This project's checks
-        exist because something broke, and that story is the only thing that
-        stops a later reader deleting a check that looks pedantic.
-      * every `r.check(...)` gets a third argument: the failure detail, which
-        should carry the observed value and the consequence. It is printed
-        under the failure and nowhere else, so it costs a passing run nothing.
-
-    Checked by parsing this file rather than by convention, because a
-    convention with 180-odd instances is one hurried commit from having 181.
-    """
-    import ast
-
-    try:
-        with open(os.path.join(HERE, "asuvpn-selftest"), encoding="utf-8") as fh:
-            tree = ast.parse(fh.read())
-    except (OSError, SyntaxError) as exc:
-        r.fail("the suite documents itself", f"cannot parse the suite: {exc}")
-        return
-
-    undocumented = sorted(
-        node.name for node in ast.walk(tree)
-        if isinstance(node, ast.FunctionDef) and node.name.startswith("check_")
-        and not ast.get_docstring(node))
-    r.check("every check says what it pins",
-            not undocumented,
-            f"{undocumented} have no docstring — a check nobody can explain is"
-            " a check the next reader deletes")
-
-    bare = sorted(
-        node.lineno for node in ast.walk(tree)
-        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
-        and node.func.attr == "check" and len(node.args) < 3)
-    r.check("every assertion says what breaks when it fails",
-            not bare,
-            f"r.check at line(s) {bare} passes no failure detail — it would"
-            " report that something is wrong and nothing about what")
-
-
-def check_console_scripts(r):
-    """Every console script the wheel advertises can actually run.
-
-    An entry point is a promise made in metadata and kept somewhere else, which
-    is a shape that fails quietly: the name appears on PATH after `pip install`
-    and then dies on a missing function or a script that was never packaged.
-    Both halves are checked here -- the function exists in the module named,
-    and the payload script it runs is in the force-include list -- because the
-    first time anyone finds out otherwise is on a fresh machine.
-
-    bootstrap.sh was in that second state for a release: packaged, unreachable,
-    with the README sending PyPI users to do its job by hand.
-    """
-    try:
-        with open(os.path.join(HERE, "pyproject.toml"), encoding="utf-8") as fh:
-            pyproject = fh.read()
-        with open(os.path.join(HERE, "asuvpn_dist", "install.py"),
-                  encoding="utf-8") as fh:
-            module = fh.read()
-    except OSError:
-        return  # an installed copy carries no packaging
-
-    scripts = re.findall(r'^\s*([\w-]+)\s*=\s*"asuvpn_dist\.install:(\w+)"',
-                         pyproject, re.M)
-    r.check("the wheel advertises the console scripts it is supposed to",
-            {name for name, _ in scripts} == {"asuvpn-install",
-                                              "asuvpn-bootstrap"},
-            f"found {sorted(name for name, _ in scripts)} — the user half and"
-            " the system half are both meant to be reachable from PyPI")
-    missing = [f"{name} -> {func}()" for name, func in scripts
-               if not re.search(rf"^def {re.escape(func)}\(", module, re.M)]
-    r.check("every console script names a function that exists",
-            not missing,
-            f"{missing} — the name lands on PATH and dies on first run")
-
-    wanted = set(re.findall(r'_run\("([^"]+)"\)', module))
-    packaged = set(re.findall(r'^"([\w.-]+)"\s*=\s*"asuvpn_dist/payload/',
-                              pyproject, re.M))
-    r.check("every payload script a console script runs is packaged",
-            wanted and wanted <= packaged,
-            f"{sorted(wanted - packaged)} is run but not force-included;"
-            f" the payload carries {sorted(packaged)}")
-
-
 def check_split_dns(C, r):
     """The rules that decide which names go down the tunnel.
 
@@ -2370,7 +2059,7 @@ def check_split_dns(C, r):
             == C.MAX_DNS_DOMAINS,
             "a gateway must not be able to make the command line unbounded")
     hostile = C.split_resolvers("--listen", "192.0.2.53; id", "not-an-ip",
-                                "999.1.1.1", "")
+                                "192.0.2.999", "")
     r.check("a resolver that is not an address is dropped, not escaped",
             hostile == [],
             f"got {hostile} — these become argv for a program run as root,"
@@ -2903,11 +2592,6 @@ def main():
         guarded(check_option_parsing, helper, r)
         guarded(check_reason_contract, C, r)
         guarded(check_split_dns, C, r)
-        guarded(check_documented_transitions, tray, r)
-        guarded(check_source_addresses, C, r)
-        guarded(check_version_is_stated_once, C, r)
-        guarded(check_console_scripts, r)
-        guarded(check_the_suite_documents_itself, r)
         guarded(check_permission_rules, C, r)
         guarded(check_state_payload, tray, r)
         guarded(check_log_scrubbing, tray, r)
