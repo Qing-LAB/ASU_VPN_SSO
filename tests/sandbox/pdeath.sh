@@ -12,8 +12,13 @@ SB="$(cd "$(dirname "$0")" && pwd)"; A="$SB/app"
 export HOME="$SB/home"
 mkfifo "$SB/ctl" 2>/dev/null; exec 9<>"$SB/ctl"
 printf 'FAKECOOKIE\n' >&9
+# Kept, not discarded: the helper warns on stderr when it cannot arm the
+# parent-death signal, and that warning is the first thing worth reading when
+# this scenario fails. Throwing it away is why an earlier failure could only
+# be answered with "poll longer".
+HLOG="$SB/pdeath.helper.log"; : > "$HLOG"
 "$A/asuvpn-helper" --host https://x --fingerprint pin-sha256:x \
-    <"$SB/ctl" >/dev/null 2>&1 &
+    <"$SB/ctl" >"$HLOG" 2>&1 &
 H=$!; sleep 1.5
 OC=$(pgrep -P "$H" -f openconnect | head -1)
 if [ -z "$OC" ]; then
@@ -33,6 +38,8 @@ done
 exec 9>&-; rm -f "$SB/ctl"
 if [ "$survived" -ne 0 ]; then
   echo "  FAIL: openconnect outlived its dead helper — as root, unreachable" >&2
+  echo "  --- what the helper said on its way up ---" >&2
+  sed 's/^/    /' "$HLOG" >&2 || true
   echo "  --- the survivor, for the record ---" >&2
   tr '\0' ' ' < "/proc/$OC/cmdline" >&2; echo >&2
   grep -E '^(Name|PPid|SigCgt|SigIgn|SigBlk|Uid)' "/proc/$OC/status" \

@@ -344,9 +344,27 @@ def die_with_parent(parent_pid):
     Runs in the child between fork and exec. That is only safe because the
     helper has not started any threads yet at this point.
     """
+    # Both failure modes here were silent: a libc that will not load, and a
+    # prctl that returns -1. Either leaves this function doing nothing at all
+    # while the caller believes the guard is armed -- and the guard is the only
+    # thing stopping a root openconnect outliving its supervisor. A silent
+    # no-op on a safety mechanism is the worst shape a bug can have, so both
+    # now say so on stderr, which the helper relays into the session log.
+    #
+    # os.write rather than log(): this runs in the child between fork and exec,
+    # where the helper's logging machinery is not safe to touch.
     try:
-        ctypes.CDLL("libc.so.6", use_errno=True).prctl(PR_SET_PDEATHSIG, signal.SIGINT)
-    except (OSError, AttributeError):
+        libc = ctypes.CDLL("libc.so.6", use_errno=True)
+        armed = libc.prctl(PR_SET_PDEATHSIG, signal.SIGINT)
+    except (OSError, AttributeError) as exc:
+        os.write(2, f"asuvpn: cannot arm parent-death signal ({exc});"
+                    " a helper killed outright would leave openconnect"
+                    " running as root\n".encode())
+        return
+    if armed != 0:
+        os.write(2, f"asuvpn: prctl(PR_SET_PDEATHSIG) failed with errno"
+                    f" {ctypes.get_errno()}; a helper killed outright would"
+                    " leave openconnect running as root\n".encode())
         return
     # The flag is only armed now, so a parent that died during the fork would
     # never be noticed. Comparing against the recorded pid rather than testing

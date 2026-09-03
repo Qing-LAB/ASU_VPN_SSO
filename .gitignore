@@ -22,3 +22,4 @@ tests/sandbox/ctl
 # packaging build output
 dist/
 build/
+tests/sandbox/pdeath.helper.log
