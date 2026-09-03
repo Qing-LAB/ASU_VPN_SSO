@@ -661,7 +661,7 @@ def watch_control_channel(tunnel):
 
 
 def host_domain(url):
-    """The domain a gateway's own name sits in: https://sslvpn.asu.edu/ -> asu.edu.
+    """The domain a gateway's own name sits in: https://vpn.example.com/ -> example.com.
 
     Only ever a fallback, for a gateway that pushes no domains of its own. The
     parsing is here rather than in the contract because this is the one place

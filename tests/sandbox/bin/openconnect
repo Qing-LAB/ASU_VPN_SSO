@@ -27,7 +27,7 @@ script = opt("--script") or "/usr/share/vpnc-scripts/vpnc-script"
 dev = opt("--interface") or "tun0"
 sys.stdin.readline()
 def say(m): print(m, flush=True)
-def run_script(reason, addr="10.242.7.31"):
+def run_script(reason, addr="192.0.2.31"):
     env = dict(os.environ)
     env.update({"reason":reason,"TUNDEV":os.environ.get("FAKE_TUNDEV", dev),
                 "VPNGATEWAY":"192.0.2.1","INTERNAL_IP4_ADDRESS":addr,
@@ -40,8 +40,8 @@ def on_usr2(_s,_f):
     state["nudges"] += 1
     say("[stand-in] SIGUSR2 received, re-establishing")  # the real binary reconnects on SIGUSR2 but logs no line for it
     run_script("attempt-reconnect")
-    run_script("reconnect", "10.242.9.99")
-    say("Configured as 10.242.9.99, with SSL connected and DTLS connected")
+    run_script("reconnect", "192.0.2.99")
+    say("Configured as 192.0.2.99, with SSL connected and DTLS connected")
 # FAKE_STUBBORN models a peer that will not yield to SIGINT — the case the
 # helper's ladder escalates through. It still stops on SIGTERM, exactly like
 # the real binary, so a correct ladder never needs SIGKILL against it.
@@ -54,7 +54,7 @@ signal.signal(signal.SIGUSR2, (lambda *_: say("[stand-in] SIGUSR2 ignored (deaf 
 say("Connected to 192.0.2.4:443")
 say("CSTP connected. DPD 0, Keepalive 0")     # exactly what ASU negotiates
 run_script("pre-init"); run_script("connect")
-say("Configured as 10.242.7.31, with SSL connected and DTLS connected")
+say("Configured as 192.0.2.31, with SSL connected and DTLS connected")
 # FAKE_DIE_AFTER models the real binary giving up: openconnect stops retrying
 # after --reconnect-timeout (300s by default) and exits nonzero, having run
 # the script one last time so the routing table is put back. Any suspend or

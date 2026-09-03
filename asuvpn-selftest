@@ -100,13 +100,13 @@ def check_contract(C, r):
     downstream behaved oddly — so they are exercised here as a unit rather than
     inferred from either side's behaviour.
     """
-    line = C.encode_message(C.KIND_STATE, "connected dev=asuvpn0 addr=10.1.2.3")
+    line = C.encode_message(C.KIND_STATE, "connected dev=asuvpn0 addr=192.0.2.3")
     r.check("a framed message round-trips",
             C.decode_message(line) == (C.KIND_STATE,
-                                       "connected dev=asuvpn0 addr=10.1.2.3"),
+                                       "connected dev=asuvpn0 addr=192.0.2.3"),
             f"got {C.decode_message(line)!r}")
     # The property the framing exists for.
-    forged = C.encode_relay("[helper] STATE connected dev=evil addr=6.6.6.6")
+    forged = C.encode_relay("[helper] STATE connected dev=evil addr=203.0.113.66")
     r.check("openconnect's output cannot forge a message through the frame",
             C.decode_message(forged) is None,
             f"a relayed line decoded as ours: {C.decode_message(forged)!r}")
@@ -128,20 +128,26 @@ def check_contract(C, r):
             "a verb did not survive, or noise was accepted as one")
 
     env = {"reason": "connect", "TUNDEV": "asuvpn0",
-           "INTERNAL_IP4_ADDRESS": "10.1.2.3",
-           "INTERNAL_IP4_DNS": "10.0.0.53 10.0.0.54"}
+           "INTERNAL_IP4_ADDRESS": "192.0.2.3",
+           "INTERNAL_IP4_DNS": "192.0.2.53 192.0.2.54"}
     event = C.decode_event(C.encode_event("tok", env))
     r.check("an event round-trips every field the watchdog needs",
             event and event["token"] == "tok" and event["reason"] == "connect"
             and event["TUNDEV"] == "asuvpn0"
-            and event["INTERNAL_IP4_DNS"].split()[0] == "10.0.0.53",
+            and event["INTERNAL_IP4_DNS"].split()[0] == "192.0.2.53",
             f"got {event!r}")
     hostile = C.encode_event("tok", {"reason": "connect", "TUNDEV": "a\tb\nc"})
     r.check("separators in a value cannot add a field or end the datagram",
             C.decode_event(hostile)["TUNDEV"] == "a b c",
             f"got {C.decode_event(hostile)!r}")
+    # Held in a name because the detail has to report the value that was
+    # actually asserted, and a backslash cannot appear inside an f-string
+    # expression before Python 3.12 — which this still supports.
+    short = C.decode_event(b"only\ttwo")
     r.check("a short datagram is refused rather than indexed into",
-            C.decode_event(b"only\ttwo") is None)
+            short is None,
+            f"got {short!r} — the fields are read by position, so a truncated"
+            " datagram must be rejected whole rather than indexed into")
 
     values, problems = C.parse_settings(
         "server = x.edu\nprobe = off\ndpd = 0\nnope = 1\nprobe-every = -3\n"
@@ -266,7 +272,10 @@ def check_reason_contract(C, r):
             expected == C.REASON_STATES,
             f"got {C.REASON_STATES}")
     r.check("pre-init produces no state (the tunnel is not configured yet)",
-            C.REASON_STATES.get("pre-init") is None)
+            C.REASON_STATES.get("pre-init") is None,
+            f"got {C.REASON_STATES.get('pre-init')!r} — openconnect runs the"
+            " script once before anything is configured; mapping that to a"
+            " state would badge a tunnel that does not exist yet")
 
 
 def check_permission_rules(C, r):
@@ -443,7 +452,7 @@ def check_notifications(tray, r):
             pass
 
     stub = Stub()
-    tray.VpnTray._announce_connected(stub, "10.1.2.3")
+    tray.VpnTray._announce_connected(stub, "192.0.2.3")
     first = stub.notes[-1]
     r.check("a first connect is announced as a connection",
             first == "VPN connected" and stub.state == tray.CONNECTED,
@@ -465,7 +474,7 @@ def check_notifications(tray, r):
             f"got {stub.notes[-1]!r}, state {stub.state!r} — without this the"
             " user is never told the tunnel went away")
 
-    tray.VpnTray._announce_connected(stub, "10.1.2.9")
+    tray.VpnTray._announce_connected(stub, "192.0.2.19")
     r.check("coming back is announced as a reconnection, not a fresh connect",
             stub.notes[-1] == "VPN reconnected",
             f"got {stub.notes[-1]!r} — the wording is how the user tells a"
@@ -576,7 +585,7 @@ def check_demotion_rules(tray, r):
     Stub = machine_stub(tray)
     stub = Stub()
     strikes = max(1, tray.SETTINGS["health-strikes"])
-    stub._apply_state_event("connected dev=asuvpn0 addr=10.0.0.1 dns=10.0.0.53")
+    stub._apply_state_event("connected dev=asuvpn0 addr=192.0.2.1 dns=192.0.2.53")
     for _ in range(strikes):
         stub.dispatch(tray.MSG_CHECK, source="probe",
                       reason="nothing answers", detail="no reply")
@@ -585,10 +594,10 @@ def check_demotion_rules(tray, r):
             and stub.notes[-1] == "VPN reconnecting",
             f"state={stub.state!r} sent={stub.sent} notes={stub.notes}")
 
-    stub._apply_state_event("connected dev=asuvpn0 addr=10.0.0.2 dns=10.0.0.53")
+    stub._apply_state_event("connected dev=asuvpn0 addr=192.0.2.2 dns=192.0.2.53")
     r.check("a reconnect event mid-demotion adopts the tunnel but not the badge",
             stub.state == tray.DEMOTED
-            and stub.tunnel_address == "10.0.0.2"
+            and stub.tunnel_address == "192.0.2.2"
             and "VPN reconnected" not in stub.notes,
             f"state={stub.state!r} addr={stub.tunnel_address!r}"
             f" notes={stub.notes}")
@@ -652,7 +661,7 @@ def check_demotion_rules(tray, r):
     tray.SETTINGS["health-strikes"] = 2
     try:
         blip = Stub()
-        blip._apply_state_event("connected dev=asuvpn0 addr=10.0.0.9 dns=")
+        blip._apply_state_event("connected dev=asuvpn0 addr=192.0.2.9 dns=")
         blip.dispatch(tray.MSG_CHECK, source="probe",
                       reason="nothing answers", detail="no reply")
         blip.dispatch(tray.MSG_CHECK, source="probe", reason=None,
@@ -681,7 +690,7 @@ def check_demotion_rules(tray, r):
         held = Stub()
         held.autoreconnect = True
         held._apply_state_event(
-            "connected dev=asuvpn0 addr=10.0.0.1 dns=10.0.0.53")
+            "connected dev=asuvpn0 addr=192.0.2.1 dns=192.0.2.53")
         held.last_nudge = time.monotonic() - 1
         for _ in range(strikes):
             held.dispatch(tray.MSG_CHECK, source="probe",
@@ -705,7 +714,7 @@ def check_demotion_rules(tray, r):
         fresh.state = tray.DEMOTED
         fresh.routes_seen = {"routes4": True, "routes6": True}
         fresh.tunnel_ifindex = -1  # provably not lo's real index
-        fresh._adopt_tunnel("lo", "10.0.0.9", "")
+        fresh._adopt_tunnel("lo", "192.0.2.9", "")
         r.check("a replaced device forgets the old one's route families",
                 fresh.routes_seen == {"routes4": False, "routes6": False}
                 and fresh.tunnel_ifindex not in (None, -1),
@@ -735,18 +744,18 @@ def check_demotion_rules(tray, r):
     # the badge. The event path proved this above; this is the other source.
     fallback = Stub()
     fallback.state = tray.DEMOTED
-    fallback.tunnel_address = "10.0.0.1"
+    fallback.tunnel_address = "192.0.2.1"
     fallback.helper_generation = 1
-    tray.VpnTray._on_tunnel_output(fallback, "Configured as 10.0.0.7", 1)
+    tray.VpnTray._on_tunnel_output(fallback, "Configured as 192.0.2.7", 1)
     r.check("a fallback tunnel-up mid-demotion adopts but does not promote",
             fallback.state == tray.DEMOTED
-            and fallback.tunnel_address == "10.0.0.7",
+            and fallback.tunnel_address == "192.0.2.7",
             f"state={fallback.state!r} addr={fallback.tunnel_address!r}")
     # Some connected patterns carry no address ("CSTP connected"); adopting
     # from one of those must not blank the address a real source delivered.
     tray.VpnTray._on_tunnel_output(fallback, "CSTP connected. DPD 30", 1)
     r.check("an addr-less fallback line does not blank a known address",
-            fallback.tunnel_address == "10.0.0.7",
+            fallback.tunnel_address == "192.0.2.7",
             f"addr={fallback.tunnel_address!r}")
 
     # A failure sentence lifted from openconnect's output becomes the detail
@@ -1075,7 +1084,7 @@ def check_rebuild_rules(tray, r):
         back = dropped_tunnel()
         back.rebuilds = 2
         back.state = tray.CONNECTING
-        back.dispatch(tray.MSG_TUNNEL_UP, device="", address="10.0.0.5", dns="")
+        back.dispatch(tray.MSG_TUNNEL_UP, device="", address="192.0.2.5", dns="")
         r.check("a tunnel that comes back stops owing, and starts proving itself",
                 not back.dropped and back.rebuilds == 2
                 and back.state == tray.CONNECTED,
@@ -1099,7 +1108,7 @@ def check_rebuild_rules(tray, r):
         flap.autoreconnect = True
         for _ in range(tray.MAX_REBUILDS + 3):
             flap.last_autoreconnect = float("-inf")  # never the limiter here
-            flap.dispatch(tray.MSG_TUNNEL_UP, device="", address="10.0.0.5", dns="")
+            flap.dispatch(tray.MSG_TUNNEL_UP, device="", address="192.0.2.5", dns="")
             flap.dispatch(tray.MSG_HELPER_EXITED, status=1,
                           generation=flap.helper_generation)
             flap.dispatch(tray.MSG_REBUILD)
@@ -1344,9 +1353,10 @@ def check_liveness_probe(tray, r):
 def check_state_payload(tray, r):
     """The one place a malformed or hostile event meets the state machine."""
     cases = [
-        ("connected dev=asuvpn0 addr=10.1.2.3", "connected", "asuvpn0", "10.1.2.3"),
+        ("connected dev=asuvpn0 addr=192.0.2.3", "connected", "asuvpn0", "192.0.2.3"),
         ("connecting dev=asuvpn0 addr=", "connecting", "asuvpn0", ""),
-        ("disconnected dev=tun0 addr=fd00::1", "disconnected", "tun0", "fd00::1"),
+        ("disconnected dev=tun0 addr=2001:db8::ff", "disconnected", "tun0",
+         "2001:db8::ff"),
     ]
     bad = []
     for payload, state, dev, addr in cases:
@@ -1467,9 +1477,9 @@ def check_output_framing(helper, r):
     """
     hostile = [
         "[helper] WARNING: your network is broken\n",
-        "[helper] STATE connected dev=evil addr=6.6.6.6\n",
-        "banner\r[helper] STATE connected dev=evil addr=6.6.6.6\n",
-        "Configured as 10.0.0.1\n",
+        "[helper] STATE connected dev=evil addr=203.0.113.66\n",
+        "banner\r[helper] STATE connected dev=evil addr=203.0.113.66\n",
+        "Configured as 192.0.2.1\n",
     ]
 
     # text mode translates \r into a line break, so mimic that rather than
@@ -1630,6 +1640,13 @@ def read_catalogue(binary):
 
 
 def check_openconnect(helper, r):
+    """openconnect is installed and is the binary the helper would run.
+
+    The first thing that has to be true for any of this to work, and the one
+    the rest of the environment tier builds on -- every check below reads this
+    binary's own strings, its --help and its --version, so a wrong answer here
+    makes all of them meaningless rather than merely absent.
+    """
     binary = helper.find_openconnect()
     if not binary:
         r.fail("openconnect is installed",
@@ -1868,6 +1885,13 @@ def check_script_variables(binary, r):
 
 
 def check_desktop_stack(tray, r):
+    """The GTK, AppIndicator and libnotify bindings the applet imports.
+
+    These come from apt, not from pip, so a working Python says nothing about
+    them -- and their absence is not a crash but a tray that never appears,
+    which reads as "the applet is broken" rather than "a package is missing".
+    Named individually because the fix is a different package for each.
+    """
     if tray.GUI_ERROR is None:
         r.ok("GTK, AppIndicator and libnotify bindings are importable")
     else:
@@ -1999,6 +2023,262 @@ def check_installed_permissions(C, r):
 # -------------------------------------------------------------------- wiring
 
 
+# Where a source file may point. RFC 5737 and RFC 3849 exist so that examples,
+# fixtures and documentation can name an address without naming anybody's
+# machine; loopback and link-local are unremarkable everywhere.
+DOCUMENTATION_NETS = (
+    "127.0.0.0/8", "0.0.0.0/32", "255.255.255.255/32",
+    "192.0.2.0/24", "198.51.100.0/24", "203.0.113.0/24",
+    "::1/128", "::/128", "2001:db8::/32", "fe80::/10",
+)
+
+# Loose on purpose: everything it catches is then handed to ipaddress, and
+# anything that is not an address is dropped. That is what keeps a timestamp
+# (15:38:44) and a version (4.7.00136) out of the results.
+ADDRESS_RE = re.compile(r"\b(?:[0-9]{1,3}(?:\.[0-9]{1,3}){3}"
+                        r"|[0-9A-Fa-f]{0,4}(?::[0-9A-Fa-f]{0,4}){2,7})\b")
+
+SCANNED_SOURCES = ("asuvpn_contract.py", "asuvpn-tray", "asuvpn-helper",
+                   "asuvpn-notify", "asuvpn-selftest", "install.sh",
+                   "bootstrap.sh")
+
+# Held to the address rule as well, and for a better reason than tidiness: an
+# address in a document was pasted from a live session by definition. The
+# hostname rule does not reach here -- this is an ASU tool and its prose says
+# so on nearly every page.
+SCANNED_DOCS = ("README.md", "DESIGN.md", "HANDOVER.md")
+
+
+def read_siblings(names):
+    """Each of these files beside us that exists, as (label, text)."""
+    out = []
+    for name in names:
+        path = os.path.join(HERE, name)
+        try:
+            with open(path, encoding="utf-8", errors="replace") as fh:
+                out.append((name, fh.read()))
+        except OSError:
+            continue  # an installed copy has no installers beside it
+    return out
+
+
+def scannable_sources():
+    """Every source and test file that ships, as (label, text)."""
+    out = read_siblings(SCANNED_SOURCES)
+    sandbox = os.path.join(HERE, "tests", "sandbox")
+    for root, dirs, files in os.walk(sandbox):
+        # app/, rbin/ and home/ are gitignored staging that enter.sh restages
+        # on every run; they hold whatever the last run produced, they ship to
+        # nobody, and walking them would report this machine's own leftovers as
+        # if they were checked-in fixtures.
+        dirs[:] = [d for d in sorted(dirs) if d not in ("app", "rbin", "home")]
+        for name in sorted(files):
+            path = os.path.join(root, name)
+            try:
+                with open(path, encoding="utf-8", errors="replace") as fh:
+                    out.append((os.path.relpath(path, HERE), fh.read()))
+            except OSError:
+                continue
+    return out
+
+
+def check_source_addresses(C, r):
+    """No source or test file names a real address or a real internal host.
+
+    Not a style rule. A fixture written from a live session is how somebody's
+    resolver, gateway or login node ends up in a public repository, and it
+    happened here: the first version of the split-DNS work carried the real
+    resolver into the tests and the README, and the sandbox stand-in had been
+    imitating the real gateway's address since long before that.
+
+    Two rules, both mechanical. Addresses must sit in the ranges reserved for
+    documentation, so an example can never be somebody's machine. Hostnames
+    must not sit under the domain the configured endpoint lives in -- except
+    that endpoint itself, which is the product's own public default and has to
+    be stated somewhere.
+    """
+    import ipaddress
+
+    sources = scannable_sources()
+    if not sources:
+        r.warn("no source or test file names a real address", "nothing to scan")
+        return
+
+    allowed = [ipaddress.ip_network(net) for net in DOCUMENTATION_NETS]
+    strays = []
+    for label, text in sources + read_siblings(SCANNED_DOCS):
+        for candidate in set(ADDRESS_RE.findall(text)):
+            try:
+                address = ipaddress.ip_address(candidate)
+            except ValueError:
+                continue  # not an address: a timestamp, a version, a typo test
+            if not any(address in net for net in allowed
+                       if net.version == address.version):
+                strays.append(f"{label}: {candidate}")
+    r.check("no source, test or document names a real address",
+            not strays,
+            f"{sorted(strays)} — examples belong in RFC 5737 / RFC 3849 space"
+            " (192.0.2.x, 198.51.100.x, 203.0.113.x, 2001:db8::x) so a fixture"
+            " can never be somebody's machine")
+
+    default_server = C.SETTINGS_BY_NAME["server"].default
+    home = C.parent_domain(default_server)
+    if not home:
+        r.info("the endpoint's domain cannot be derived, so hostnames in the"
+               " sources are not checked against it")
+        return
+    pattern = re.compile(r"[A-Za-z0-9_.-]*" + re.escape(home))
+    leaked = sorted({f"{label}: {found}" for label, text in sources
+                     for found in pattern.findall(text)
+                     if found != default_server})
+    r.check("no source or test file names an internal host",
+            not leaked,
+            f"{leaked} — only {default_server} may appear, because it is the"
+            f" shipped default; anything else under {home} names a machine"
+            " that is nobody else's business")
+
+
+def check_version_is_stated_once(C, r):
+    """The version the programs print is the version the wheel is built from.
+
+    `C.VERSION` reaches the menu, the startup log, `asuvpn --version` and this
+    banner by being read at runtime, so those four cannot disagree with each
+    other. The build is the one consumer that could: hatchling re-reads the
+    same line out of the source with its own regex, and if that regex or that
+    path ever stops matching, `pip install asuvpn` and `asuvpn --version` start
+    naming different releases -- which is exactly the kind of drift nobody
+    notices until someone reports a bug against a version that never existed.
+
+    So the packaging is held to the same line, by applying hatchling's own
+    configured pattern here and requiring the answer to be what the programs
+    say. A checkout has pyproject.toml; an installed copy does not, and there
+    is nothing to check there.
+    """
+    path = os.path.join(HERE, "pyproject.toml")
+    try:
+        with open(path, encoding="utf-8") as fh:
+            pyproject = fh.read()
+    except OSError:
+        return  # an installed copy carries no packaging
+
+    source = re.search(r'^\s*path\s*=\s*"([^"]+)"', pyproject, re.M)
+    pattern = re.search(r"^\s*pattern\s*=\s*'([^']+)'", pyproject, re.M)
+    if not source or not pattern:
+        r.fail("the wheel takes its version from the contract",
+               "pyproject.toml no longer configures [tool.hatch.version] with"
+               " a path and a pattern; the build may be stating a version of"
+               " its own")
+        return
+    try:
+        with open(os.path.join(HERE, source.group(1)), encoding="utf-8") as fh:
+            found = re.search(pattern.group(1), fh.read())
+    except (OSError, re.error) as exc:
+        found = None
+        r.info(f"could not apply the build's own version pattern: {exc}")
+    built = found.group("version") if found else None
+    r.check("the wheel takes its version from the contract",
+            built == C.VERSION,
+            f"the build would package {built!r} while the programs report"
+            f" {C.VERSION!r} — pyproject.toml reads {source.group(1)}")
+
+    dynamic = re.search(r'^\s*dynamic\s*=\s*\[[^\]]*"version"', pyproject, re.M)
+    r.check("the packaging states no version of its own",
+            bool(dynamic) and not re.search(r'^\s*version\s*=\s*"', pyproject, re.M),
+            "pyproject.toml should declare version dynamic and let hatchling"
+            " read the contract; a literal there is a second source of truth")
+
+
+def check_the_suite_documents_itself(r):
+    """Every check says what it pins, and every assertion says what breaks.
+
+    Two rules, and they are here because a self-check is only as useful as what
+    it tells you at 2am. A named assertion that fails with no detail is a
+    riddle: you learn that something is wrong and nothing about what, and the
+    reader's next move is to go read the suite instead of fixing the fault.
+
+      * every `check_*` gets a docstring saying what invariant it pins and,
+        where there was one, the bug that earned it. This project's checks
+        exist because something broke, and that story is the only thing that
+        stops a later reader deleting a check that looks pedantic.
+      * every `r.check(...)` gets a third argument: the failure detail, which
+        should carry the observed value and the consequence. It is printed
+        under the failure and nowhere else, so it costs a passing run nothing.
+
+    Checked by parsing this file rather than by convention, because a
+    convention with 180-odd instances is one hurried commit from having 181.
+    """
+    import ast
+
+    try:
+        with open(os.path.join(HERE, "asuvpn-selftest"), encoding="utf-8") as fh:
+            tree = ast.parse(fh.read())
+    except (OSError, SyntaxError) as exc:
+        r.fail("the suite documents itself", f"cannot parse the suite: {exc}")
+        return
+
+    undocumented = sorted(
+        node.name for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name.startswith("check_")
+        and not ast.get_docstring(node))
+    r.check("every check says what it pins",
+            not undocumented,
+            f"{undocumented} have no docstring — a check nobody can explain is"
+            " a check the next reader deletes")
+
+    bare = sorted(
+        node.lineno for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "check" and len(node.args) < 3)
+    r.check("every assertion says what breaks when it fails",
+            not bare,
+            f"r.check at line(s) {bare} passes no failure detail — it would"
+            " report that something is wrong and nothing about what")
+
+
+def check_console_scripts(r):
+    """Every console script the wheel advertises can actually run.
+
+    An entry point is a promise made in metadata and kept somewhere else, which
+    is a shape that fails quietly: the name appears on PATH after `pip install`
+    and then dies on a missing function or a script that was never packaged.
+    Both halves are checked here -- the function exists in the module named,
+    and the payload script it runs is in the force-include list -- because the
+    first time anyone finds out otherwise is on a fresh machine.
+
+    bootstrap.sh was in that second state for a release: packaged, unreachable,
+    with the README sending PyPI users to do its job by hand.
+    """
+    try:
+        with open(os.path.join(HERE, "pyproject.toml"), encoding="utf-8") as fh:
+            pyproject = fh.read()
+        with open(os.path.join(HERE, "asuvpn_dist", "install.py"),
+                  encoding="utf-8") as fh:
+            module = fh.read()
+    except OSError:
+        return  # an installed copy carries no packaging
+
+    scripts = re.findall(r'^\s*([\w-]+)\s*=\s*"asuvpn_dist\.install:(\w+)"',
+                         pyproject, re.M)
+    r.check("the wheel advertises the console scripts it is supposed to",
+            {name for name, _ in scripts} == {"asuvpn-install",
+                                              "asuvpn-bootstrap"},
+            f"found {sorted(name for name, _ in scripts)} — the user half and"
+            " the system half are both meant to be reachable from PyPI")
+    missing = [f"{name} -> {func}()" for name, func in scripts
+               if not re.search(rf"^def {re.escape(func)}\(", module, re.M)]
+    r.check("every console script names a function that exists",
+            not missing,
+            f"{missing} — the name lands on PATH and dies on first run")
+
+    wanted = set(re.findall(r'_run\("([^"]+)"\)', module))
+    packaged = set(re.findall(r'^"([\w.-]+)"\s*=\s*"asuvpn_dist/payload/',
+                              pyproject, re.M))
+    r.check("every payload script a console script runs is packaged",
+            wanted and wanted <= packaged,
+            f"{sorted(wanted - packaged)} is run but not force-included;"
+            f" the payload carries {sorted(packaged)}")
+
+
 def check_split_dns(C, r):
     """The rules that decide which names go down the tunnel.
 
@@ -2009,17 +2289,17 @@ def check_split_dns(C, r):
     whole internet has to be refused even when it is well formed.
     """
     r.check("comma and space separated domain lists both parse",
-            C.split_domains("a.asu.edu,b.asu.edu", "c.asu.edu") ==
-            ["a.asu.edu", "b.asu.edu", "c.asu.edu"],
-            f"got {C.split_domains('a.asu.edu,b.asu.edu', 'c.asu.edu')}")
+            C.split_domains("a.example.com,b.example.com", "c.example.com") ==
+            ["a.example.com", "b.example.com", "c.example.com"],
+            f"got {C.split_domains('a.example.com,b.example.com', 'c.example.com')}")
     r.check("domains are deduped and case folded, order kept",
-            C.split_domains("ASU.edu asu.EDU b.asu.edu") ==
-            ["asu.edu", "b.asu.edu"],
-            f"got {C.split_domains('ASU.edu asu.EDU b.asu.edu')}"
+            C.split_domains("EXAMPLE.com example.COM b.example.com") ==
+            ["example.com", "b.example.com"],
+            f"got {C.split_domains('EXAMPLE.com example.COM b.example.com')}"
             " — the first search domain is tried first, so order is meaning")
-    hostile = C.split_domains("-x.asu.edu", "a;b.asu.edu", "$(id).asu.edu",
-                              "a|b.asu.edu", "--dns=x", "..", "asu..edu",
-                              "a`id`.asu.edu", "*.asu.edu", "a/b.asu.edu")
+    hostile = C.split_domains("-x.example.com", "a;b.example.com", "$(id).example.com",
+                              "a|b.example.com", "--dns=x", "..", "example..com",
+                              "a`id`.example.com", "*.example.com", "a/b.example.com")
     r.check("anything that cannot be a domain is dropped, not escaped",
             hostile == [],
             f"got {hostile} — these become argv for a program run as root")
@@ -2027,26 +2307,27 @@ def check_split_dns(C, r):
             C.split_domains("localhost", "asu") == [],
             f"got {C.split_domains('localhost', 'asu')}")
     r.check("the domain list is bounded",
-            len(C.split_domains(" ".join(f"h{i}.asu.edu" for i in range(200))))
+            len(C.split_domains(" ".join(f"h{i}.example.com" for i in range(200))))
             == C.MAX_DNS_DOMAINS,
             "a gateway must not be able to make the command line unbounded")
-    hostile = C.split_resolvers("--listen", "10.0.0.53; id", "not-an-ip",
+    hostile = C.split_resolvers("--listen", "192.0.2.53; id", "not-an-ip",
                                 "999.1.1.1", "")
     r.check("a resolver that is not an address is dropped, not escaped",
             hostile == [],
             f"got {hostile} — these become argv for a program run as root,"
             " and a leading dash would be read as an option")
+    resolvers = C.split_resolvers("192.0.2.53 192.0.2.53 192.0.2.54",
+                                  "2001:db8::1")
     r.check("real resolvers survive, both families, order and dedup kept",
-            C.split_resolvers("10.0.0.53 10.0.0.53 10.0.0.54", "2620:d8::1") ==
-            ["10.0.0.53", "10.0.0.54", "2620:d8::1"],
-            f"got {C.split_resolvers('10.0.0.53 10.0.0.53 10.0.0.54', '2620:d8::1')}"
-            " — the first is asked first, and is the probe target too")
+            resolvers == ["192.0.2.53", "192.0.2.54", "2001:db8::1"],
+            f"got {resolvers} — the first is asked first, and is the probe"
+            " target too")
     r.check("a gateway's own name yields the domain it serves",
-            C.parent_domain("sslvpn.asu.edu") == "asu.edu",
-            f"got {C.parent_domain('sslvpn.asu.edu')!r}")
+            C.parent_domain("vpn.example.com") == "example.com",
+            f"got {C.parent_domain('vpn.example.com')!r}")
     r.check("a two-label name yields nothing rather than a public suffix",
-            C.parent_domain("asu.edu") == "" and C.parent_domain("host") == "",
-            f"got {C.parent_domain('asu.edu')!r} and {C.parent_domain('host')!r}"
+            C.parent_domain("example.com") == "" and C.parent_domain("host") == "",
+            f"got {C.parent_domain('example.com')!r} and {C.parent_domain('host')!r}"
             " — routing '.edu' to the tunnel would send half the internet"
             " down it")
 
@@ -2153,8 +2434,8 @@ def check_notify_roundtrip(C, r):
             C.REAL_SCRIPT_VAR: chained,
             "reason": "connect",
             "TUNDEV": "asuvpn0",
-            "INTERNAL_IP4_ADDRESS": "10.242.7.31",
-            "INTERNAL_IP4_DNS": "10.0.0.53 10.0.0.54",
+            "INTERNAL_IP4_ADDRESS": "192.0.2.31",
+            "INTERNAL_IP4_DNS": "192.0.2.53 192.0.2.54",
         })
         try:
             proc = subprocess.run([notify], env=env, stdin=subprocess.DEVNULL,
@@ -2176,11 +2457,11 @@ def check_notify_roundtrip(C, r):
                 len(fields) == 6 and fields[0] == "0123456789abcdef",
                 f"received {data!r}")
         r.check("the VPN's own resolvers come across, for the liveness probe",
-                fields[5:6] == ["10.0.0.53 10.0.0.54"],
+                fields[5:6] == ["192.0.2.53 192.0.2.54"],
                 f"received {fields[5:6]} — without this there is nothing to"
                 " probe, and a black-holed tunnel looks perfectly healthy")
         r.check("the event carries reason, device and address",
-                fields[1:4] == ["connect", "asuvpn0", "10.242.7.31"],
+                fields[1:4] == ["connect", "asuvpn0", "192.0.2.31"],
                 f"received {fields[1:4] if len(fields) > 3 else data!r}")
         try:
             with open(marker, encoding="utf-8") as fh:
@@ -2229,8 +2510,8 @@ def check_dns_takeover(notify, C, r):
             env = {
                 "reason": reason,
                 "TUNDEV": "asuvpn0",
-                "INTERNAL_IP4_DNS": "10.0.0.53 10.0.0.54",
-                C.DNS_DOMAINS_VAR: "asu.edu",
+                "INTERNAL_IP4_DNS": "192.0.2.53 192.0.2.54",
+                C.DNS_DOMAINS_VAR: "example.com",
             }
             env.update(env_extra)
             notify.handle_dns(env, binary=stub)
@@ -2244,8 +2525,8 @@ def check_dns_takeover(notify, C, r):
         calls, env = run({})
         r.check("a connect scopes the link before it gives it any resolver",
                 calls[:3] == ["default-route asuvpn0 no",
-                              "domain asuvpn0 asu.edu",
-                              "dns asuvpn0 10.0.0.53 10.0.0.54"],
+                              "domain asuvpn0 example.com",
+                              "dns asuvpn0 192.0.2.53 192.0.2.54"],
                 f"got {calls} — servers before scope would make the tunnel a"
                 " candidate for every lookup on the machine, briefly")
         r.check("a link this configured is handed over completely",
@@ -2253,17 +2534,19 @@ def check_dns_takeover(notify, C, r):
                 "the real vpnc-script would still rewrite /etc/resolv.conf,"
                 " and lose the change at the next link change")
 
-        calls, env = run({"CISCO_DEF_DOMAIN": "ad.asu.edu",
-                          "CISCO_SPLIT_DNS": "sol.asu.edu,rc.asu.edu"})
+        calls, env = run({"CISCO_DEF_DOMAIN": "ad.example.com",
+                          "CISCO_SPLIT_DNS": "one.example.com,two.example.com"})
+        scoped = ("domain asuvpn0 ad.example.com one.example.com"
+                  " two.example.com")
         r.check("what the gateway pushes beats what was configured locally",
-                "domain asuvpn0 ad.asu.edu sol.asu.edu rc.asu.edu" in calls,
+                scoped in calls,
                 f"got {calls} — the gateway is the authority on which names"
                 " live behind it")
 
         calls, env = run({C.DNS_DOMAINS_VAR: ""})
         r.check("a tunnel with no domains at all takes every lookup, not none",
                 "default-route asuvpn0 yes" in calls
-                and "dns asuvpn0 10.0.0.53 10.0.0.54" in calls,
+                and "dns asuvpn0 192.0.2.53 192.0.2.54" in calls,
                 f"got {calls} — scoping to nothing would resolve nothing,"
                 " which is worse than the behaviour being replaced")
 
@@ -2302,7 +2585,7 @@ def check_dns_takeover(notify, C, r):
                 " tunnel lookups out over the public resolver")
 
         env = {"reason": "connect", "TUNDEV": "asuvpn0",
-               "INTERNAL_IP4_DNS": "10.0.0.53"}
+               "INTERNAL_IP4_DNS": "192.0.2.53"}
         notify.handle_dns(env, binary=stub)
         r.check("DNS is left alone entirely when the user turned it off",
                 "INTERNAL_IP4_DNS" in env and not os.path.exists(log),
@@ -2403,12 +2686,12 @@ def check_event_translation(helper, tray, C, r):
                     # accepted
                     C.encode_event(token, {"reason": "connect",
                                            "TUNDEV": "asuvpn0",
-                                           "INTERNAL_IP4_ADDRESS": "10.242.7.31"}),
+                                           "INTERNAL_IP4_ADDRESS": "192.0.2.31"}),
                     # a name that cannot be a device: rejected, and the line
                     # falls back to the name we gave openconnect
                     C.encode_event(token, {"reason": "connect",
                                            "TUNDEV": "evil dev\nmore",
-                                           "INTERNAL_IP4_ADDRESS": "1.2.3.4"}),
+                                           "INTERNAL_IP4_ADDRESS": "203.0.113.4"}),
                     # the address is not an interface name, so nothing validates
                     # it — one_token is all that stands between this and both a
                     # forged second line and a forged second field. The space
@@ -2417,7 +2700,7 @@ def check_event_translation(helper, tray, C, r):
                     C.encode_event(token, {"reason": "reconnect",
                                            "TUNDEV": "asuvpn0",
                                            "INTERNAL_IP4_ADDRESS":
-                                               "9.9.9.9 addr=6.6.6.6\nmore"}),
+                                               "203.0.113.99 addr=203.0.113.66\nmore"}),
                 ):
                     client.sendto(datagram, path)
             finally:
@@ -2444,7 +2727,7 @@ def check_event_translation(helper, tray, C, r):
             len(accepted) == expected_lines,
             f"expected {expected_lines} accepted, got {len(accepted)}: {emitted}")
     r.check("an authenticated event becomes a state line",
-            any("connected dev=asuvpn0 addr=10.242.7.31" in p for p in accepted),
+            any("connected dev=asuvpn0 addr=192.0.2.31" in p for p in accepted),
             f"got {accepted}")
     r.check("a device name that cannot name a device is rejected",
             any(m and "impossible device name" in m[1] for m in decoded)
@@ -2518,6 +2801,10 @@ def main():
         guarded(check_option_parsing, helper, r)
         guarded(check_reason_contract, C, r)
         guarded(check_split_dns, C, r)
+        guarded(check_source_addresses, C, r)
+        guarded(check_version_is_stated_once, C, r)
+        guarded(check_console_scripts, r)
+        guarded(check_the_suite_documents_itself, r)
         guarded(check_permission_rules, C, r)
         guarded(check_state_payload, tray, r)
         guarded(check_log_scrubbing, tray, r)

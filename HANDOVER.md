@@ -315,7 +315,7 @@ others use `abspath`, and the reference copy in the contract says which.
 ## How to work on it
 
 ```bash
-asuvpn selftest                 # 154 checks; run before and after any change
+asuvpn selftest                 # 163 checks; run before and after any change
 tests/sandbox/enter.sh sec.sh   # scenario tests, in a namespace of stand-ins
 ./install.sh                    # copies into ~/.local, runs the self-check
 asuvpn log -f                   # what it is actually doing
@@ -327,9 +327,12 @@ self-test on every push (`checks.yml`) and the scenario sandbox on main
 (`scenarios.yml`). Releases: bump `VERSION` in
 `asuvpn_contract.py` (the single source — the build, `--version`, the menu
 and the startup log all read it), commit, then push a matching `v*` tag and
-`release.yml` publishes to PyPI via Trusted Publishing — configured once on pypi.org (project `asuvpn`,
-repo `Qing-LAB/ASU_VPN_SSO`, workflow `release.yml`, environment `pypi`);
-until then the upload step fails harmlessly. `DESIGN.md` has the invariants
+`workflow.yml` publishes to PyPI via Trusted Publishing — registered on pypi.org
+as project `asuvpn`, repo `Qing-LAB/ASU_VPN_SSO`, workflow **`workflow.yml`**,
+environment **`pypi`**. That filename is matched literally by PyPI, so renaming
+the file breaks publishing with an invalid-publisher error after a green build;
+change it on pypi.org first if it ever has to move. A version already on PyPI
+can never be re-uploaded, so the tag is the point of no return. `DESIGN.md` has the invariants
 table and a "Changing things" section saying what to update in lockstep.
 
 **Before claiming anything works, ask how it would look if it did not.** That

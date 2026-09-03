@@ -23,6 +23,18 @@ an icon in the notification area for disconnect, reconnect and the log.
 Everything the icon does is also available from the command line, so it scripts
 as well as it clicks.
 
+It also fixes something the usual setup gets quietly wrong. A split tunnel
+needs split DNS — ASU's names resolved by ASU's resolver, every other name left
+on the resolver you already had — and the stock `vpnc-script` cannot arrange
+that on a machine running `systemd-resolved`, which is to say on Ubuntu. It
+writes the VPN's resolver into `/etc/resolv.conf`, a file `systemd-resolved`
+owns and rewrites at the next network change, and internal names quietly stop
+resolving while the tunnel still looks perfectly healthy — `ssh` to a machine
+you were on ten minutes ago just hangs. This applet configures the resolver on
+the tunnel's own link instead, correctly scoped and nobody else's to overwrite,
+and the watchdog checks every twenty seconds that it is still there. See
+[DNS, and why it is not written to `/etc/resolv.conf`](#dns-and-why-it-is-not-written-to-etcresolvconf).
+
 Most of the engineering here is in the part nobody enjoys: making sure that
 however the tunnel ends — you disconnect, you log out, the applet crashes, the
 helper is killed — `openconnect` still gets to put your routes and DNS back.
@@ -106,18 +118,34 @@ openconnect-sso --server sslvpn.asu.edu --authenticate=shell
 
 ### From PyPI instead
 
-The same app is on PyPI as a delivery channel — the package carries this
-repository's programs and its own `install.sh`, and installs them exactly the
-way a checkout does (same files, same places, same self-check at the end):
+The same app is on PyPI as a delivery channel. The package is not a second
+installer — it carries this repository's programs **and both of its shell
+scripts**, and its two commands just run them, so a PyPI install and a checkout
+install put the same files in the same places and end with the same self-check.
+
+On Ubuntu or Debian, the whole thing:
 
 ```bash
 pipx install asuvpn
-asuvpn-install                  # accepts install.sh's flags, e.g. --server
+asuvpn-bootstrap                # system packages, then the app. Uses sudo.
 ```
 
-What PyPI cannot carry is the system half — the GTK bindings, `openconnect`,
-`pkexec`, the GNOME tray extension. On Ubuntu/Debian, one line covers them
-(this is what `bootstrap.sh` automates, minus the Python 3.12 story in
+`asuvpn-bootstrap` is `bootstrap.sh` — the same apt packages, the same
+`openconnect-sso` on Python 3.12, the same GNOME extension — and it finishes by
+running the user-half install itself, so that is the only command you need.
+
+If you would rather handle the system half yourself, or you are not on apt:
+
+```bash
+pipx install asuvpn
+asuvpn-install                  # user half only; accepts install.sh's flags
+```
+
+That writes nothing outside `$HOME` and asks for no privileges. What it cannot
+do is the part no wheel can carry — the GTK bindings, `openconnect`, `pkexec`,
+the GNOME tray extension are apt packages and a shell extension, not Python
+distributions. On Ubuntu/Debian one line covers the minimum (this is a subset
+of what `asuvpn-bootstrap` does, minus the Python 3.12 story in
 [Requirements](#requirements)):
 
 ```bash
@@ -125,7 +153,17 @@ sudo apt install openconnect vpnc-scripts policykit-1 python3-gi \
   gir1.2-gtk-3.0 gir1.2-ayatanaappindicator3-0.1 gir1.2-notify-0.7
 ```
 
-Updating later is `pipx upgrade asuvpn && asuvpn-install`.
+Either way, `asuvpn selftest` at the end says what is still missing rather than
+leaving you to find out at the first connect.
+
+Both commands install to your home directory and register the desktop launcher,
+so **ASU VPN appears in the Activities overview and app grid** exactly as it
+does from a checkout — see
+[What gets installed, and where](#what-gets-installed-and-where) for the full
+list of paths, including where the wheel itself lives.
+
+Updating later is `pipx upgrade asuvpn && asuvpn-install` — both steps, because
+what runs is the copy under `~/.local/share/asuvpn/`, not the wheel.
 
 ## Using it
 
@@ -376,6 +414,22 @@ Runtime state lives elsewhere, and is created on demand:
 Separately, `bootstrap.sh` installs system packages with `apt`, and installs
 `openconnect-sso` into its own pipx venv under `~/.local/share/pipx/`.
 
+**Installing from PyPI lands in exactly the same places.** `pipx install
+asuvpn` only puts the wheel in a pipx venv of its own
+(`~/.local/share/pipx/venvs/asuvpn/`); nothing there is the app. Running
+`asuvpn-bootstrap` or `asuvpn-install` then copies the payload out to the same
+`~/.local/share/asuvpn/` and writes the same launcher, icon, symlink and
+settings file as the table above — because it is the same `install.sh`, shipped
+inside the wheel. So **ASU VPN appears in the Activities overview and the app
+grid either way**, with the same Disconnect and Reconnect entries on its
+right-click menu, and the desktop and icon caches are refreshed the same way so
+it shows up without a logout. Nothing about the desktop integration depends on
+how the files arrived.
+
+One consequence worth knowing: the copy under `~/.local/share/asuvpn/` is what
+runs, not the one in the pipx venv, so `pipx upgrade asuvpn` alone changes
+nothing — run `asuvpn-install` after it to copy the new version out.
+
 ### Running from the checkout instead
 
 `--link` skips the copy and points the launcher at the checkout, so your edits
@@ -397,10 +451,15 @@ rm -f  ~/.local/share/applications/asuvpn.desktop \
 update-desktop-database ~/.local/share/applications
 ```
 
-That removes the app completely. It deliberately leaves the things it did not
-own: `openconnect-sso` (`pipx uninstall openconnect-sso`), the apt packages, the
-deadsnakes PPA, the AppIndicator GNOME extension, your keyring entries, and any
-polkit rule you added by hand.
+That removes the app completely, however it was installed — those paths are
+where it lives in both cases. If you installed from PyPI, `pipx uninstall
+asuvpn` removes the delivery wheel as well; on its own it would leave the
+installed copy above running, since that is a copy and not a link.
+
+It deliberately leaves the things it did not own: `openconnect-sso`
+(`pipx uninstall openconnect-sso`), the apt packages, the deadsnakes PPA, the
+AppIndicator GNOME extension, your keyring entries, and any polkit rule you
+added by hand.
 
 ## Security
 
@@ -921,9 +980,9 @@ connect you asked for still starts a fresh log.
 
 A split tunnel wants split DNS. ASU routes only its own prefixes down the
 tunnel and leaves everything else on your own connection; DNS should have the
-same shape. Names that live behind the tunnel — `sol.asu.edu` and the rest —
-have to be resolved by ASU's resolver, and every other name should stay on the
-resolver your machine already had.
+same shape. Names that live behind the tunnel — internal hosts, licence
+servers, a cluster login node — have to be resolved by ASU's resolver, and
+every other name should stay on the resolver your machine already had.
 
 **The stock `vpnc-script` cannot do that here, and fails in a way that looks
 like nothing at all.** It decides how to install a resolver by grepping
@@ -938,9 +997,10 @@ That file is a symlink to `/run/systemd/resolve/stub-resolv.conf`, which
 belongs to `systemd-resolved`. The write lands, DNS works — and then
 `systemd-resolved` rewrites its own file at the next link change and the VPN's
 resolver is silently gone. The tunnel is still up. The routes are still
-installed. Traffic still crosses. `ssh sol.asu.edu` resolves to Cloudflare's
-public edge and hangs, and reconnecting the VPN is the only thing that fixes
-it — until the next rewrite.
+installed. Traffic still crosses. An internal hostname resolves to whatever
+the public internet says — for a name fronted by a CDN, that is the CDN's edge,
+which answers nothing you were asking for — and reconnecting the VPN is the
+only thing that fixes it, until the next rewrite.
 
 So this applet configures DNS itself, on the tunnel's own link, through
 `systemd-resolved`'s own interface:
@@ -971,10 +1031,12 @@ resolver list:
 script, are it saying which names it serves. The `CISCO_` prefix is historical
 and not a limitation — it comes from vpnc, and `openconnect` funnels every
 protocol it speaks (AnyConnect, Juniper/Pulse, GlobalProtect, Fortinet, Array)
-into those same two variables, so this works the same against any of them. Only when it says nothing does the
-local answer apply — the `dns-domains` setting, or, empty, the domain derived
-from the server address (`sslvpn.asu.edu` → `asu.edu`). Nothing is hardcoded;
-point the applet at a different VPN and it derives that one's domain instead.
+into those same two variables, so this works the same against any of them.
+
+Only when the gateway names none does the local answer apply — the
+`dns-domains` setting, or, left empty, the domain derived from the server
+address (`sslvpn.asu.edu` → `asu.edu`). Nothing is hardcoded; point the applet
+at a different VPN and it derives that one's domain instead.
 If no domain can be worked out at all, the link takes every lookup rather than
 none — never worse than the behaviour being replaced — and the log says so and
 names the setting that would narrow it.
@@ -1215,7 +1277,7 @@ teardown, and logged precisely so a declined action never reads as a hang.
 | `ModuleNotFoundError: No module named 'pkg_resources'` | The `setuptools<71` pin did not take. `pipx inject openconnect-sso 'setuptools<71' --force` — the `--force` is what makes it apply. |
 | Badge says **not carrying traffic** | The watchdog found the tunnel device or its routes gone, or nothing answering through it. It has already nudged `openconnect` once; `asuvpn log` says what it saw. If it does not recover, the automatic sign-in fires (unless turned off) — or `asuvpn reconnect` yourself. |
 | Badge says **DNS not configured** | The resolver the VPN pushed is no longer on the tunnel's link, so internal names resolve to whatever public DNS says. The applet asks `openconnect` to re-establish, which reconfigures it. `resolvectl dns asuvpn0` shows the live state. |
-| `ssh sol.asu.edu` hangs while the VPN is up | The name is resolving to Cloudflare's public edge instead of ASU's internal address — `resolvectl query sol.asu.edu` says which. Check `resolvectl dns asuvpn0` lists the VPN's resolver; if it is empty, `asuvpn log` will say why the handover did not take. With `dns = off` this is the stock `vpnc-script` behaviour and is expected to come back. |
+| `ssh` to an internal host hangs while the VPN is up | The name is resolving to a public address instead of the internal one — `resolvectl query <host>` says which, and `resolvectl dns asuvpn0` says whether the VPN's resolver is on the link. If it is empty, `asuvpn log` will say why the handover did not take. With `dns = off` this is the stock `vpnc-script` behaviour and is expected to come back. |
 | Badge says **…; rebuilding** | The tunnel died on its own and the applet will sign in again shortly, up to three times. **Stop reconnecting** in the menu — or `asuvpn disconnect` — calls it off. |
 | `sign-in did not finish within 300s` | A sign-in sat unanswered — usually a Duo push or browser window with nobody at the keyboard — and was ended by `signin-timeout`. Connect again when you are there to answer it. |
 | Tunnel silently stops working, badge stays green | Should no longer happen: `--force-dpd 30` is passed because ASU negotiates DPD off, and the watchdog covers what DPD cannot see. If it recurs, `asuvpn log` now records every check. |
@@ -1238,7 +1300,7 @@ teardown, and logged precisely so a declined action never reads as a hang.
 | [`HANDOVER.md`](HANDOVER.md) | What is proven and what is not, the lessons behind the design, and what to do next. |
 | [`STATE-MACHINE-PLAN.md`](STATE-MACHINE-PLAN.md) | The state-machine rebuild's plan of record: the rationale and the decisions. The as-built table is in DESIGN.md. |
 | [`ruff.toml`](ruff.toml) | Lint config. Its `ignore` list records which rules are off and why. |
-| [`pyproject.toml`](pyproject.toml) + [`asuvpn_dist/`](asuvpn_dist/install.py) | The PyPI delivery channel: a wheel carrying these same files, and `asuvpn-install`, which runs the bundled `install.sh`. |
+| [`pyproject.toml`](pyproject.toml) + [`asuvpn_dist/`](asuvpn_dist/install.py) | The PyPI delivery channel: a wheel carrying these same files, plus `asuvpn-bootstrap` and `asuvpn-install`, which run the bundled `bootstrap.sh` and `install.sh`. No second installer. |
 | [`.github/workflows/`](.github/workflows) | CI: the self-test and analysers on every push and PR; the scenario sandbox on main; PyPI publishing on a `v*` tag. |
 | [`LICENSE`](LICENSE) | MIT. |
 
@@ -1271,7 +1333,7 @@ the middle one is the point:
 
 | Tier | What it checks |
 | --- | --- |
-| `logic` | Pure functions and the state machine: the option blocklist, interface-name validation, `--interface`/`--script` parsing, the permission rules, state-payload parsing, the transition table driven with real message sequences, the rebuild bounds, the sign-in deadline against a child that would outlive the run, that `openconnect`'s output cannot forge a helper message, the split-DNS domain rules against option-like and shell-punctuation payloads, and every verdict the resolver check can reach |
+| `logic` | Pure functions and the state machine — plus one rule about the repository itself: no source, test or document may name a real address or a real internal host. Every example lives in RFC 5737 / RFC 3849 documentation space, and the only hostname under the endpoint's own domain is the shipped default, so a fixture pasted from a live session cannot quietly publish somebody's machine. Then: the option blocklist, interface-name validation, `--interface`/`--script` parsing, the permission rules, state-payload parsing, the transition table driven with real message sequences, the rebuild bounds, the sign-in deadline against a child that would outlive the run, that `openconnect`'s output cannot forge a helper message, the split-DNS domain rules against option-like and shell-punctuation payloads, and every verdict the resolver check can reach |
 | `environment` | Our assumptions put to the installed binaries — that `openconnect` exists, that it *gives up retrying* rather than trying forever (the fact the rebuild rests on, read back out of its own `--help`), that the `vpnc-script` it names is executable and handles every `reason` we send, that our fallback log patterns still appear in its message catalogue, that the split-DNS variables the handover reads are still named what we think, and that nothing the helper runs as root is writable by anyone else |
 | `wiring` | `asuvpn-notify` actually executed: the event arrives with the right token and fields, the real `vpnc-script` still runs with its environment intact, the token is scrubbed before it sees it, no event can emit more than one line — and the DNS handover driven against a stand-in `resolvectl`, asserting the call order, the revert on every failure path, and that a failure always leaves the stock script its DNS job |
 

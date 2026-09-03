@@ -18,11 +18,17 @@ import socket
 s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
 s.settimeout(5)
 s.connect("\0asuvpn-tray-0")   # the applet is uid 0 in this namespace
-s.sendall(b"status")
-s.shutdown(socket.SHUT_WR)
 try:
+    s.sendall(b"status")
+    s.shutdown(socket.SHUT_WR)
     data = s.recv(256)
-except OSError:      # a refusal closes with our bytes unread, which is a RST
+except OSError:
+    # A refusal closes the connection with our bytes unread, which is a RST.
+    # Which call trips over it -- sendall, shutdown or recv -- is a race with
+    # how quickly the applet accepts and closes, and on a loaded machine it is
+    # usually the first. Guarding only recv made this scenario fail with an
+    # empty string and a BrokenPipeError traceback *because the gate worked*.
+    # All three outcomes mean the one thing being asserted: no reply.
     data = b""
 print(data.decode() or "<no reply>", end="")
 '

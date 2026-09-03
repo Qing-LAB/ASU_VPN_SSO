@@ -34,7 +34,7 @@ import stat
 # applet logs it at startup and shows it at the bottom of its menu, and the
 # self-test banner reports it. Distinct from CONTRACT_VERSION below, which
 # tracks the wire format and moves only when the programs must agree anew.
-VERSION = "0.9.0"
+VERSION = "0.10.0"
 
 # Bumped when the wire format changes in a way the programs must agree on.
 # `asuvpn selftest` reports it, and the header of a generated config file
@@ -331,7 +331,7 @@ def split_resolvers(*values):
 
 
 def parent_domain(host):
-    """The domain a gateway's own name sits in: sslvpn.asu.edu -> asu.edu.
+    """The domain a gateway's own name sits in: vpn.example.com -> example.com.
 
     The last resort for "which names belong to this VPN" when the gateway names
     none. It is a guess, but a well-founded one -- a university's VPN endpoint
@@ -435,7 +435,7 @@ SETTINGS = (
     Setting("dns-domains", "text", "",
             "Domains to resolve through the tunnel, space or comma separated,"
             " when the gateway names none itself. Empty means derive one from"
-            " the server address -- sslvpn.asu.edu gives asu.edu -- which is"
+            " the server address -- vpn.example.com gives example.com -- which"
             " right wherever the endpoint lives in the domain it serves. What"
             " the gateway does push always wins over both."),
     Setting("health-interval", "int", 20,

@@ -435,7 +435,7 @@ def link_resolvers(device):
         return None
     if done.returncode != 0:
         return None
-    # "Link 9 (asuvpn0): 192.0.2.53 2620:d8::1", or nothing after the colon
+    # "Link 9 (asuvpn0): 192.0.2.53 2001:db8::1", or nothing after the colon
     # when the link has none. Partitioned on the first colon only, because an
     # IPv6 resolver is full of them.
     text = done.stdout.decode("utf-8", "replace")

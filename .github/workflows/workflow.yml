@@ -1,0 +1,53 @@
+# Publishing: push a tag like v0.10.0 and this builds the sdist and wheel and
+# uploads them to PyPI. No token is stored anywhere — it uses PyPI's Trusted
+# Publishing, configured once on pypi.org against project "asuvpn", owner
+# Qing-LAB, repository ASU_VPN_SSO, workflow **workflow.yml**, environment
+# **pypi**.
+#
+# The filename is load-bearing. PyPI matches the publisher on the workflow's
+# *file name*, not the `name:` below, so this file cannot be renamed without
+# editing the publisher on pypi.org to match — the upload would be rejected as
+# an invalid publisher, after a green build, with nothing said about why. It
+# was called release.yml until the publisher was registered as workflow.yml.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  pypi:
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write   # what Trusted Publishing authenticates with
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      # PyPI takes a version number once and never again, and nothing else in
+      # this pipeline compares the tag with what is about to be built: hatch
+      # reads VERSION out of asuvpn_contract.py, so a v0.9.0 tag on a tree that
+      # says 0.10.0 publishes 0.10.0 and burns the wrong number, silently and
+      # permanently. Cheap to check, impossible to undo.
+      - name: the tag and the version must agree
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          version=$(sed -n 's/^VERSION = "\(.*\)"$/\1/p' asuvpn_contract.py)
+          if [ -z "$version" ]; then
+            echo "no VERSION line in asuvpn_contract.py" >&2
+            exit 1
+          fi
+          if [ "$tag" != "$version" ]; then
+            echo "tag ${GITHUB_REF_NAME} does not match VERSION ${version}." >&2
+            echo "Bump the contract or retag; a wrong number cannot be" >&2
+            echo "recalled once PyPI has it." >&2
+            exit 1
+          fi
+          echo "publishing ${version} as ${GITHUB_REF_NAME}"
+
+      - name: build the sdist and wheel
+        run: pipx run build
+
+      - name: publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1

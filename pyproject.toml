@@ -13,12 +13,13 @@ build-backend = "hatchling.build"
 [project]
 name = "asuvpn"
 dynamic = ["version"]
-description = "Click-to-connect GNOME tray applet and CLI for ASU's SSL VPN, wrapping openconnect and openconnect-sso"
+description = "GNOME tray applet and CLI for ASU's SSL VPN: openconnect with SSO, a tunnel watchdog, and split DNS that stays put"
 readme = "README.md"
 license = { file = "LICENSE" }
 requires-python = ">=3.10"
 authors = [{ name = "Quan Qing" }]
-keywords = ["vpn", "openconnect", "anyconnect", "asu", "gnome", "tray"]
+keywords = ["vpn", "openconnect", "anyconnect", "asu", "gnome", "tray",
+            "split-dns", "systemd-resolved", "saml", "duo"]
 classifiers = [
     "Environment :: X11 Applications :: GTK",
     "Intended Audience :: End Users/Desktop",
@@ -31,8 +32,13 @@ classifiers = [
 Homepage = "https://github.com/Qing-LAB/ASU_VPN_SSO"
 Documentation = "https://github.com/Qing-LAB/ASU_VPN_SSO#readme"
 
+# Two, because the install has two halves and only one of them is a wheel's to
+# do. See asuvpn_dist/install.py; both run a script from the payload, and every
+# script named here has to be force-included below or the entry point is a
+# stub that fails at the first run.
 [project.scripts]
 asuvpn-install = "asuvpn_dist.install:main"
+asuvpn-bootstrap = "asuvpn_dist.install:bootstrap"
 
 # The version is stated once, in the contract, where every program can read
 # it; the build reads the same line, so the wheel cannot drift from what
