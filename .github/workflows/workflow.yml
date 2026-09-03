@@ -55,5 +55,14 @@ jobs:
       - name: build the sdist and wheel
         run: pipx run build
 
+      # Force-pushing a tag re-triggers this workflow, and it happened: a
+      # history rewrite moved v0.10.0 and the job ran again against a version
+      # PyPI already had. It came back green because the rebuilt artifacts
+      # hashed identically, which is luck rather than design — a rebuild that
+      # differed by a timestamp would have failed the upload after a green
+      # build, on the one job whose failure looks like a broken release.
+      # skip-existing makes a re-run a deliberate no-op instead.
       - name: publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          skip-existing: true
