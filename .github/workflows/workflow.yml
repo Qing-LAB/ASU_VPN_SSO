@@ -39,7 +39,13 @@ jobs:
       - name: the tag and the version must agree
         run: |
           tag="${GITHUB_REF_NAME#v}"
-          version=$(sed -n 's/^VERSION = "\(.*\)"$/\1/p' asuvpn_contract.py)
+          # Read exactly the way hatchling reads it -- re.search with its
+          # pattern, over the whole file -- and not with an anchored sed. The
+          # two disagreed: a constant named "…VERSION = \"9.9.9\"" placed above
+          # the real one makes hatch build 9.9.9 while sed still prints the
+          # real number, so this guard would pass and the wrong version would
+          # go to PyPI, permanently. Demonstrated, not theorised.
+          version=$(python3 -c 'import re,sys; m=re.search(r"VERSION = \"(?P<version>[^\"]+)\"", open("asuvpn_contract.py").read()); print(m.group("version") if m else "")')
           if [ -z "$version" ]; then
             echo "no VERSION line in asuvpn_contract.py" >&2
             exit 1
@@ -54,6 +60,20 @@ jobs:
 
       - name: build the sdist and wheel
         run: pipx run build
+
+      # The belt to the brace above: whatever the two readings agreed on, the
+      # artifact about to be uploaded is the only thing that actually gets a
+      # version number, so it is what the tag is finally checked against.
+      - name: the artifact carries the tag's version
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          if [ ! -f "dist/asuvpn-${tag}-py3-none-any.whl" ] \
+             || [ ! -f "dist/asuvpn-${tag}.tar.gz" ]; then
+            echo "no artifact for ${tag}; dist/ holds:" >&2
+            ls -1 dist >&2
+            exit 1
+          fi
+          echo "dist/asuvpn-${tag}-py3-none-any.whl matches ${GITHUB_REF_NAME}"
 
       # Force-pushing a tag re-triggers this workflow, and it happened: a
       # history rewrite moved v0.10.0 and the job ran again against a version

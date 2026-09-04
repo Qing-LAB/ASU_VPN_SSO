@@ -64,11 +64,19 @@ packages = ["asuvpn_dist"]
 "asuvpn.svg" = "asuvpn_dist/payload/asuvpn.svg"
 
 [tool.hatch.build.targets.sdist]
+# Every pattern anchored with a leading "/". Hatchling matches these with
+# gitignore semantics, where a pattern containing no slash matches at *any*
+# depth -- so "README.md" also took tests/sandbox/README.md, and the bare
+# program names also took tests/sandbox/app/*, the gitignored copies the
+# scenario sandbox stages. An sdist built on a machine that had run the
+# scenarios carried stale duplicates of all four programs. The release
+# workflow checks out clean, so nothing shipped, but the config was one
+# similarly named file away from it.
 include = [
-    "asuvpn-tray", "asuvpn-helper", "asuvpn-notify", "asuvpn-selftest",
-    "asuvpn_contract.py", "install.sh", "bootstrap.sh", "asuvpn.svg",
-    "asuvpn_dist", "README.md", "DESIGN.md", "SECURITY.md",
-    "IMPLEMENTATION_GUIDE.md",
-    "LICENSE",
-    "ruff.toml",
+    "/asuvpn-tray", "/asuvpn-helper", "/asuvpn-notify", "/asuvpn-selftest",
+    "/asuvpn_contract.py", "/install.sh", "/bootstrap.sh", "/asuvpn.svg",
+    "/asuvpn_dist", "/README.md", "/DESIGN.md", "/SECURITY.md",
+    "/IMPLEMENTATION_GUIDE.md",
+    "/LICENSE",
+    "/ruff.toml",
 ]

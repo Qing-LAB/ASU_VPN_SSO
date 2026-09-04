@@ -11,9 +11,19 @@
 set -euo pipefail
 
 SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-APP_DIR="$HOME/.local/share/asuvpn"
-APPS_DIR="$HOME/.local/share/applications"
-ICON_DIR="$HOME/.local/share/icons/hicolor/scalable/apps"
+# XDG_DATA_HOME, on the same terms as XDG_CONFIG_HOME and XDG_CACHE_HOME
+# below: absolute or ignored, which is what the spec says. It was the one of
+# the three not honoured, so on a relocated data dir (home-manager, Nix, Guix)
+# the launcher and the icon landed outside the session's search path -- no
+# "ASU VPN" in the overview, no icon, and install.sh printing both paths as
+# though it had succeeded.
+case "${XDG_DATA_HOME:-}" in
+  /*) DATA_HOME="$XDG_DATA_HOME" ;;
+  *)  DATA_HOME="$HOME/.local/share" ;;
+esac
+APP_DIR="$DATA_HOME/asuvpn"
+APPS_DIR="$DATA_HOME/applications"
+ICON_DIR="$DATA_HOME/icons/hicolor/scalable/apps"
 BIN_DIR="$HOME/.local/bin"
 DESKTOP_FILE="$APPS_DIR/asuvpn.desktop"
 # Kept in sync by hand with the contract's `server` default: bash cannot load
@@ -109,7 +119,16 @@ CONFIG_DIR="$CONFIG_HOME/asuvpn"
 CONFIG_FILE="$CONFIG_DIR/asuvpn.conf"
 mkdir -p "$CONFIG_DIR"
 chmod 0700 "$CONFIG_DIR"
-if [ -f "$CONFIG_FILE" ]; then
+# `-s` and a settings line, not just `-f`. The redirection in the else branch
+# used to truncate the file before asuvpn-tray ran, so a --write-config that
+# failed for any reason -- a broken system python3, a payload left
+# non-executable by --link -- left a zero-byte config that every later run
+# then took the edit branch on, appending one `server =` line to nothing and
+# reporting success. The write below is staged through a scratch file now, so
+# that state cannot be created again; this test is what recovers a machine
+# that already has one. A file with real settings in it is the user's and is
+# only ever edited, never replaced.
+if [ -s "$CONFIG_FILE" ] && grep -q '=' "$CONFIG_FILE"; then
   # awk with the value passed as data, never interpolated into an expression:
   # `--server 'x|w /etc/passwd'` was an arbitrary file write once already.
   # END appends when no server line exists — a half-written file from an
@@ -126,7 +145,9 @@ if [ -f "$CONFIG_FILE" ]; then
     "$CONFIG_FILE" > "$CONFIG_FILE.$$.tmp" )
   mv "$CONFIG_FILE.$$.tmp" "$CONFIG_FILE"
 else
-  ( umask 077; "$INSTALL_DIR/asuvpn-tray" --write-config "$SERVER" > "$CONFIG_FILE" )
+  ( umask 077; "$INSTALL_DIR/asuvpn-tray" --write-config "$SERVER" \
+      > "$CONFIG_FILE.$$.tmp" )
+  mv "$CONFIG_FILE.$$.tmp" "$CONFIG_FILE"
 fi
 chmod 0600 "$CONFIG_FILE"
 
@@ -192,7 +213,7 @@ fi
 
 command -v update-desktop-database >/dev/null && update-desktop-database "$APPS_DIR" || true
 command -v gtk-update-icon-cache >/dev/null &&
-  gtk-update-icon-cache -f -t "$HOME/.local/share/icons/hicolor" 2>/dev/null || true
+  gtk-update-icon-cache -f -t "$DATA_HOME/icons/hicolor" 2>/dev/null || true
 
 echo "Installed:"
 # No mode claim here: the go-w above is allowed to fail on a read-only

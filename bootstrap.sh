@@ -99,6 +99,25 @@ for name, version in (("Gtk", "3.0"), ("AyatanaAppIndicator3", "0.1"),
 GI_CHECK
 }
 have_openconnect() { command -v openconnect >/dev/null 2>&1; }
+
+is_gnome() {
+  # XDG_CURRENT_DESKTOP alone was the test, and it is unset over ssh and on a
+  # VT -- so `ssh host ./bootstrap.sh` on a GNOME desktop decided it was not
+  # GNOME and skipped the extension the tray icon needs, silently.
+  case "${XDG_CURRENT_DESKTOP:-}" in *GNOME*) return 0 ;; esac
+  command -v gnome-shell >/dev/null 2>&1
+}
+
+have_tray_extension() {
+  # GNOME hides AppIndicator icons without an extension, so on GNOME this is a
+  # dependency like any other and belongs in the capability list. It was not
+  # in it, which is how the "everything is already present" fast path could
+  # finish with a cheerful "done" on a machine whose tray icon would never
+  # appear. Any appindicator extension counts, not only Ubuntu's.
+  is_gnome || return 0
+  [ -d /usr/share/gnome-shell/extensions/ubuntu-appindicators@ubuntu.com ] && return 0
+  gnome-extensions list 2>/dev/null | grep -qi appindicator
+}
 have_pkexec()      { command -v pkexec >/dev/null 2>&1; }
 have_sso() {
   command -v openconnect-sso >/dev/null 2>&1 ||
@@ -112,6 +131,10 @@ have_sso() {
 capability_packages() {          # $1 capability, $2 manager
   case "$1:$2" in
     gtk:apt)    echo "python3-gi gir1.2-gtk-3.0 gir1.2-ayatanaappindicator3-0.1 gir1.2-notify-0.7" ;;
+    tray-extension:apt)    echo "gnome-shell-extension-appindicator" ;;
+    tray-extension:dnf)    echo "gnome-shell-extension-appindicator" ;;
+    tray-extension:pacman) echo "gnome-shell-extension-appindicator" ;;
+    tray-extension:zypper) echo "gnome-shell-extension-appindicator" ;;
     gtk:dnf)    echo "python3-gobject gtk3 libappindicator-gtk3 libnotify" ;;
     gtk:pacman) echo "python-gobject gtk3 libappindicator-gtk3 libnotify" ;;
     gtk:zypper) echo "python3-gobject typelib-1_0-Gtk-3_0 libappindicator3-1 typelib-1_0-Notify-0_7" ;;
@@ -124,9 +147,10 @@ capability_packages() {          # $1 capability, $2 manager
 
 missing_capabilities() {
   local missing=()
-  have_gtk_bindings || missing+=("gtk")
-  have_openconnect  || missing+=("openconnect")
-  have_pkexec       || missing+=("pkexec")
+  have_gtk_bindings   || missing+=("gtk")
+  have_openconnect    || missing+=("openconnect")
+  have_pkexec         || missing+=("pkexec")
+  have_tray_extension || missing+=("tray-extension")
   printf '%s\n' "${missing[@]+"${missing[@]}"}"
 }
 
@@ -216,12 +240,35 @@ apt_install_missing() {
 
 # ------------------------------------------------------------------ python312
 
+is_ubuntu() {
+  # ID_LIKE is deliberately not consulted: Mint and Pop!_OS are Ubuntu
+  # derivatives that carry Ubuntu's own suites and can take the PPA, and they
+  # say so in ID_LIKE -- but so does every Debian derivative that cannot.
+  # UBUNTU_CODENAME is the field only an Ubuntu-suite system sets.
+  [ -r /etc/os-release ] || return 1
+  grep -q '^UBUNTU_CODENAME=' /etc/os-release
+}
+
 ensure_python() {
   if [ -x "$PYBIN" ]; then
     say "python$PY present ($("$PYBIN" -V 2>&1))"
     return
   fi
   if ! apt_known "python$PY"; then
+    # A PPA is Launchpad, which is Ubuntu. detect_manager says "apt" for
+    # Debian too, and add-apt-repository there either refuses or -- worse --
+    # writes a source pinned to a suite deadsnakes does not publish, after
+    # which *every* apt update on the machine fails until someone finds and
+    # deletes the file. Nothing here removes it, and set -e means install.sh
+    # is never reached, so the run leaves a broken package manager and no app.
+    if ! is_ubuntu; then
+      warn "python$PY is not in this distribution's archive, and"
+      warn "$DEADSNAKES_PPA is an Ubuntu PPA -- adding it here would break apt."
+      warn "Install python$PY however this distribution provides one, then:"
+      warn "  pipx install --python python$PY '$SSO_SPEC'"
+      warn "  pipx inject openconnect-sso '$SETUPTOOLS_PIN' --force"
+      die "python$PY is required and cannot be installed automatically here."
+    fi
     say "python$PY is not in the archive; it comes from deadsnakes"
     confirm "Add $DEADSNAKES_PPA?" ||
       die "python$PY is required. Add $DEADSNAKES_PPA yourself, or install python$PY another way."
@@ -398,9 +445,7 @@ if [ "$INSTALL_DEPS" -eq 1 ]; then
   alsa_pkg="$(apt_first_available libasound2t64 libasound2 || true)"
 
   tray_ext=""
-  desktop="${XDG_CURRENT_DESKTOP:-}"   # both sides need the fallback under set -u
-  if [ "$desktop" != "${desktop#*GNOME}" ] &&
-     [ ! -d /usr/share/gnome-shell/extensions/ubuntu-appindicators@ubuntu.com ]; then
+  if ! have_tray_extension; then
     tray_ext="$(apt_first_available gnome-shell-ubuntu-extensions gnome-shell-extension-appindicator || true)"
   fi
 

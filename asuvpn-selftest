@@ -2596,7 +2596,15 @@ def check_pipx_copy_is_the_running_one(C, r):
     cannot be answered here, and an unanswerable question is not a verdict.
     """
     name = "the installed programs are as new as the package they came from"
+    # PATH first, then the place pipx puts console scripts. Trusting PATH
+    # alone gave a cheerful "nothing to fall behind" to exactly the user this
+    # check is for: `~/.local/bin` off PATH is the case install.sh warns about
+    # and the README documents, and it is no evidence at all that the package
+    # is absent.
     script = shutil.which("asuvpn-install")
+    if script is None:
+        fallback = os.path.expanduser("~/.local/bin/asuvpn-install")
+        script = fallback if os.access(fallback, os.X_OK) else None
     if script is None:
         r.ok(name, "not installed from PyPI; nothing to fall behind")
         return
@@ -2633,17 +2641,31 @@ def check_pipx_copy_is_the_running_one(C, r):
         r.warn(name, "the package is installed but does not carry a readable"
                      f" payload version: {out.stderr.strip()[:200]}")
         return
-    # Only one direction is a problem. A running copy *newer* than the package
-    # is an ordinary checkout install sitting beside an older PyPI one, which
-    # is what a developer's machine looks like and is nobody's bug.
-    if packaged != C.VERSION:
+    # Only one direction is a problem, and the code now agrees with that
+    # sentence: it used to warn on any difference, so a checkout install
+    # sitting beside an older PyPI one -- what a developer's machine looks
+    # like -- was told on every run to run asuvpn-install, which would
+    # overwrite the newer copy with the older one.
+    def ordered(text):
+        """Comparable form, or None when this is not a plain dotted number."""
+        parts = str(text).split(".")
+        try:
+            return tuple(int(part) for part in parts)
+        except ValueError:
+            return None
+
+    here, there = ordered(C.VERSION), ordered(packaged)
+    behind = (here < there) if (here and there) else (packaged != C.VERSION)
+    if behind:
         r.warn(name,
                f"this copy is {C.VERSION} and the installed package carries"
                f" {packaged}. `pipx upgrade asuvpn` replaces the package but"
                " not the programs it installed; run `asuvpn-install` to"
                " finish the upgrade")
         return
-    r.ok(name, f"both are {C.VERSION}")
+    r.ok(name, f"this copy is {C.VERSION}, the installed package carries"
+               f" {packaged}" + ("" if packaged == C.VERSION else
+                                 " — older, so nothing is owed"))
 
 
 def check_install_scripts(C, r):

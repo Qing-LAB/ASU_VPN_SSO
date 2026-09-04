@@ -110,6 +110,13 @@ jobs:
             *) echo "the wheel is $built but the install reports $reported" >&2
                exit 1 ;;
           esac
+          # And the self-check's verdict, which this step is named after and
+          # was not reading. install.sh runs it advisorily -- installing
+          # before bootstrap.sh is a legitimate order, so it reports and
+          # carries on -- and its `if` is the last statement, so asuvpn-install
+          # exits 0 whatever the self-check said. Here, where the runner has
+          # every dependency, a red self-check is a broken wheel.
+          HOME=/tmp/wheel-home /tmp/wheel-home/.local/share/asuvpn/asuvpn-selftest
 
   # Proves the portable half is portable, and claims nothing more. The logic
   # tier is pure Python: it drives the contract, the state machine and the
