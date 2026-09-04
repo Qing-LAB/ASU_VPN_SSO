@@ -900,6 +900,43 @@ def check_teardown_rows(tray, r):
             stuck.state == tray.FAILED and stuck.notes == ["VPN warning"],
             f"state={stuck.state!r} notes={stuck.notes}")
 
+    # What the user does next, after that warning. The timeout leaves FAILED
+    # beside a helper handle this still holds, and Disconnect used to answer
+    # with a Disconnected badge and no teardown at all -- a claim about a root
+    # tunnel that may well still be carrying traffic.
+    class Live:
+        """A helper process that has not exited."""
+
+        @staticmethod
+        def poll():
+            return None
+
+    stuck.helper_proc = Live()
+    torn = []
+    stuck._disconnect_thread = lambda *a, **k: torn.append(True)
+    stuck.dispatch(tray.MSG_DISCONNECT)
+    r.check("Disconnect after a stuck teardown tries again, and claims nothing",
+            stuck.state == tray.DISCONNECTING and torn == [True]
+            and stuck.teardown_intent == "disconnect",
+            f"state={stuck.state!r} torn={torn}"
+            f" intent={stuck.teardown_intent!r} — the badge said Disconnected"
+            " while a root openconnect was still up, and nothing had been"
+            " asked to close it")
+    # And the ordinary FAILED, where there is no helper: this must still be
+    # the plain answer it always was, or every dropped tunnel would start a
+    # teardown of nothing.
+    gone = Stub()
+    gone.state = tray.FAILED
+    gone.dropped = True
+    gone.rebuilds = 2
+    gone.dispatch(tray.MSG_DISCONNECT)
+    r.check("Disconnect on a tunnel that is really gone still just says so",
+            gone.state == tray.DISCONNECTED and not gone.dropped
+            and gone.rebuilds == 0,
+            f"state={gone.state!r} dropped={gone.dropped}"
+            f" rebuilds={gone.rebuilds} — this is also how a pending rebuild"
+            " is called off, and a human taking over must end it")
+
     handoff = tearing_down()
     handoff.reconnect_keep_log = True
     handoff.dispatch(tray.MSG_TEARDOWN_FINISHED)

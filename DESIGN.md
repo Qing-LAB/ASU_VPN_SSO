@@ -304,7 +304,7 @@ things*). `any` is the `ANY` wildcard — the row applies in every state.
 | `connected` | `reconnect` | `_tr_teardown_reconnect` | Tear the tunnel down, then sign in again — a Duo push and a password. |
 | `demoted` | `reconnect` | `_tr_teardown_reconnect` | The expensive rung of the ladder, reached by hand or by autoreconnect. |
 | `disconnected` | `disconnect` | `_tr_already_disconnected` | Idempotent: say so rather than guessing. |
-| `failed` | `disconnect` | `_tr_already_disconnected` | Also how a pending rebuild is called off. |
+| `failed` | `disconnect` | `_tr_teardown_disconnect` | Usually nothing to close, and it says so — but a teardown that timed out lands here still holding the helper, so this tries again rather than claiming success. Also how a pending rebuild is called off. |
 | `authenticating` | `disconnect` | `_tr_cancel_attempt` | Kill the sign-in; nothing is established yet. |
 | `connecting` | `disconnect` | `_tr_cancel_attempt` | Terminate pkexec, and tear down if a helper already lives. |
 | `connected` | `disconnect` | `_tr_teardown_disconnect` | The ordinary teardown, through the signal ladder. |

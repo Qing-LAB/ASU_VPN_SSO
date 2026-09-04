@@ -245,7 +245,14 @@ TRANSITIONS = {
     (CONNECTED, MSG_RECONNECT): "teardown_reconnect",
     (DEMOTED, MSG_RECONNECT): "teardown_reconnect",
     (DISCONNECTED, MSG_DISCONNECT): "already_disconnected",
-    (FAILED, MSG_DISCONNECT): "already_disconnected",
+    # Not "already_disconnected", which is what this was. A teardown that
+    # timed out lands in FAILED with the helper handle still held and a root
+    # openconnect quite possibly still up -- and answering Disconnect there
+    # with a Disconnected badge and no teardown was simply a lie. The row it
+    # points at now covers both cases: no live helper and it says the same
+    # thing this used to, a live one and it tries the teardown again, which
+    # is the only recovery there is.
+    (FAILED, MSG_DISCONNECT): "teardown_disconnect",
     (AUTHENTICATING, MSG_DISCONNECT): "cancel_attempt",
     (CONNECTING, MSG_DISCONNECT): "cancel_attempt",
     (CONNECTED, MSG_DISCONNECT): "teardown_disconnect",
