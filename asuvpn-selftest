@@ -652,6 +652,7 @@ def machine_stub(tray):
             self.reconnect_keep_log = False
             self.autoreconnect = False
             self.killed = 0
+            self.pipes_closed = []
             self.notes, self.sent, self.logged = [], [], []
             self.signins, self.published, self.started = [], [], []
 
@@ -677,6 +678,9 @@ def machine_stub(tray):
 
         def _kill_auth(self):
             self.killed += 1
+
+        def _close_helper_stdin(self, proc):
+            self.pipes_closed.append(proc)
 
         def autoreconnect_enabled(self):
             return self.autoreconnect
@@ -1213,12 +1217,40 @@ def check_signin_deadline(tray, r):
     # until somebody came back. Driven through the shipping table, like every
     # other row; the sandbox drives the tick that sends this.
     Stub = machine_stub(tray)
+
+    class Terminable:
+        """A helper that is still running, and remembers being asked to stop."""
+
+        def __init__(self):
+            self.terminated = False
+
+        def poll(self):
+            return None
+
+        def terminate(self):
+            self.terminated = True
+
     stub = Stub()
     stub.state = tray.CONNECTING
     stub.dropped = True          # this was a rebuild: one attempt is spent
     stub.rebuilds = 1
+    helper = Terminable()
+    stub.helper_proc = helper
     generation = stub.helper_generation
     stub.dispatch(tray.MSG_AUTHORIZE_TIMEOUT)
+    # The pipe, not just the signal. helper_spoke does not prove the helper is
+    # still unprivileged -- it is set from an idle callback while this row is
+    # reached from a timeout, and a ready timeout runs first -- so a password
+    # typed at the last moment lands here with a root helper, against which
+    # terminate() is EPERM. Closing the control pipe is the only teardown that
+    # reaches one, and this was the single path that skipped it.
+    r.check("an unanswered authorization closes the pipe, not just signals",
+            stub.pipes_closed == [helper] and helper.terminated
+            and stub.helper_proc is helper,
+            f"closed={stub.pipes_closed} terminated={helper.terminated}"
+            f" handle={stub.helper_proc!r} — a root helper survives SIGTERM"
+            " from us, and dropping the handle made Disconnect and Quit both"
+            " report success over a live tunnel")
     r.check("an unanswered authorization ends, and keeps the rebuild's promise",
             stub.state == tray.FAILED and stub.dropped and stub.rebuilds == 1
             and stub.helper_generation == generation + 1
@@ -2134,7 +2166,8 @@ def check_teardown_ownership(helper, r):
         helper.interface_exists = lambda name: True
         helper.C.resolvectl_path = lambda: "/fake/resolvectl"
         deleted.clear()
-        helper.verify_teardown("asuvpn0", set(), True, 7, dns_on_link=True)
+        helper.verify_teardown("asuvpn0", set(), True, 7,
+                               dns_on_link=helper.C.DNS_OWNER_LINK)
         revert = ["/fake/resolvectl", "revert", "asuvpn0"]
         delete = ["/fake/ip", "link", "delete", "asuvpn0"]
         ordered = (revert in deleted and delete in deleted
@@ -2143,7 +2176,8 @@ def check_teardown_ownership(helper, r):
         # revert either -- the same rule the deletion already follows, for the
         # same reason: the name may belong to somebody else's tunnel by now.
         deleted.clear()
-        helper.verify_teardown("asuvpn0", set(), True, 9, dns_on_link=True)
+        helper.verify_teardown("asuvpn0", set(), True, 9,
+                               dns_on_link=helper.C.DNS_OWNER_LINK)
         foreign_revert = [c for c in deleted if "revert" in c]
         # And when the stock script owned DNS there is nothing to revert and
         # nothing this can fix -- only /etc/resolv.conf, whose backup belongs
@@ -2151,9 +2185,20 @@ def check_teardown_ownership(helper, r):
         # outcome: it reads exactly like a clean teardown.
         deleted.clear()
         logged.clear()
-        helper.verify_teardown("asuvpn0", set(), True, 7, dns_on_link=False)
+        helper.verify_teardown("asuvpn0", set(), True, 7,
+                               dns_on_link=helper.C.DNS_OWNER_SCRIPT)
         stock_revert = [c for c in deleted if "revert" in c]
         stock_warned = any(line.startswith("WARNING") and "resolv.conf" in line
+                           for line in logged)
+        # And the case the was_killed gate used to hide entirely: openconnect
+        # dying by somebody else's hand -- an OOM kill, a pkill -9, a crash --
+        # with the stock script still holding /etc/resolv.conf. The marker
+        # says the disconnect never ran; how it died is beside the point.
+        deleted.clear()
+        logged.clear()
+        helper.verify_teardown("asuvpn0", set(), False, 7,
+                               dns_on_link=helper.C.DNS_OWNER_SCRIPT)
+        crash_warned = any(line.startswith("WARNING") and "resolv.conf" in line
                            for line in logged)
     finally:
         for name, value in originals.items():
@@ -2165,24 +2210,36 @@ def check_teardown_ownership(helper, r):
             f"foreign deletes={foreign_deletes} left_alone={left_alone}"
             f" ours_deleted={ours_deleted} — a name match without the ifindex"
             " match must never reach `ip link delete` as root")
-    # And the helper's half of that agreement.
+    # And the helper's half of that agreement. The marker is removed by the
+    # disconnect transition, so anything still here at teardown says that
+    # transition did not run -- whatever killed openconnect.
     with tempfile.TemporaryDirectory() as session:
-        no_record = helper.dns_took_over(session)
-        open(os.path.join(session, helper.C.DNS_MARKER), "w",
-             encoding="utf-8").close()
-        recorded = helper.dns_took_over(session)
-    r.check("the teardown reads whether DNS was ours, or says it cannot tell",
-            recorded is True and no_record is False
-            and helper.dns_took_over(None) is None,
-            f"recorded={recorded} no_record={no_record}"
-            f" no_channel={helper.dns_took_over(None)} — inferring this from"
-            " the setting made the reassuring answer the default")
+        marker = os.path.join(session, helper.C.DNS_MARKER)
+        clean = helper.dns_owner(session)
+        with open(marker, "w", encoding="utf-8") as handle:
+            handle.write(helper.C.DNS_OWNER_SCRIPT + "\n")
+        handed_back = helper.dns_owner(session)
+        with open(marker, "w", encoding="utf-8") as handle:
+            handle.write(helper.C.DNS_OWNER_LINK + "\n")
+        on_link = helper.dns_owner(session)
+    r.check("the teardown reads who owns DNS, or says it cannot tell",
+            on_link == helper.C.DNS_OWNER_LINK
+            and handed_back == helper.C.DNS_OWNER_SCRIPT
+            and clean is None and helper.dns_owner(None) is None,
+            f"link={on_link!r} script={handed_back!r} clean={clean!r}"
+            f" no_channel={helper.dns_owner(None)!r} — the two owners need"
+            " different words, and only one of them needs a warning")
     r.check("a killed teardown drops the per-link resolver before the device",
             ordered and not foreign_revert,
             f"ordered={ordered} foreign_revert={foreign_revert} — the resolver"
             " usually dies with the link, but not when the device is"
             " persistent or the delete fails, and those are the runs nobody"
             " is watching")
+    r.check("a death we did not cause is reported like one we did",
+            crash_warned,
+            f"logged={logged} — gating this on was_killed meant an OOM kill"
+            " or a pkill -9 left /etc/resolv.conf naming a dead tunnel's"
+            " resolvers with nothing said at all")
     r.check("DNS the stock script owns is not claimed back, but is reported",
             not stock_revert and stock_warned,
             f"stock_revert={stock_revert} stock_warned={stock_warned}"
@@ -3097,6 +3154,23 @@ def check_dns_takeover(notify, C, r):
                 f"got {calls} — scoping to nothing would resolve nothing,"
                 " which is worse than the behaviour being replaced")
 
+        # The call that keeps a split tunnel off the default-route set. Its
+        # result used to be discarded, on the grounds that listing a domain
+        # implies it -- true for a route-only domain, false for the search
+        # domains actually passed, which default the other way. So a resolved
+        # too old for SetLinkDefaultRoute, or one transient bus error, left
+        # the tunnel's resolvers catching every lookup on the machine while
+        # the log said "DNS for example.com".
+        open(os.path.join(faildir, "default-route"), "w",
+             encoding="utf-8").close()
+        calls, env = run({})
+        r.check("a link that cannot be kept off the default route is not used",
+                "revert asuvpn0" in calls and "INTERNAL_IP4_DNS" in env
+                and not any(c.startswith("dns ") for c in calls),
+                f"got {calls} — servers on a link that answers for everything"
+                " is the state worse than doing nothing")
+        os.remove(os.path.join(faildir, "default-route"))
+
         open(os.path.join(faildir, "domain"), "w", encoding="utf-8").close()
         calls, env = run({})
         r.check("a link that cannot be scoped is reverted, not left half done",
@@ -3140,11 +3214,15 @@ def check_dns_takeover(notify, C, r):
         # Detected the way the stock script decides to install a default
         # route, because it is the same question.
         calls, env = run({"INTERNAL_IP4_ADDRESS": "192.0.2.9"})
-        r.check("a full tunnel takes every lookup, not just the scoped ones",
+        r.check("a full tunnel takes every lookup exclusively, not in parallel",
                 "default-route asuvpn0 yes" in calls
-                and "domain asuvpn0 example.com" in calls,
-                f"got {calls} — the script this replaces would have made the"
-                " tunnel's resolver the only one")
+                and "domain asuvpn0 ~. example.com" in calls,
+                f"got {calls} — `default-route yes` alone only adds this link"
+                " to the set resolved asks *in parallel*, so the local"
+                " network's resolver still sees every unmatched query, in"
+                " clear, and can win the race. `~.` is what makes this link"
+                " the best match for every name and leaves the others out —"
+                " which is what the /etc/resolv.conf rewrite it replaces did")
         calls, env = run({"INTERNAL_IP4_ADDRESS": "192.0.2.9",
                           "CISCO_SPLIT_INC": "1",
                           "CISCO_SPLIT_INC_0_ADDR": "198.51.100.0"})
@@ -3173,22 +3251,33 @@ def check_dns_takeover(notify, C, r):
         # reported "the resolver went with its link" on runs where DNS was
         # sitting in /etc/resolv.conf with its backup orphaned.
         marker = os.path.join(d, C.DNS_MARKER)
+
+        def owner():
+            try:
+                with open(marker, encoding="utf-8") as handle:
+                    return handle.read().strip()
+            except OSError:
+                return None
+
         socket_env = {C.EVENT_SOCKET_VAR: os.path.join(d, "events.sock")}
         run(socket_env)
-        wrote = os.path.exists(marker)
+        took_over = owner()
         run(dict(socket_env), reason="disconnect")
-        cleared = not os.path.exists(marker)
+        cleared = owner()
         r.check("taking DNS over is recorded, and giving it back clears it",
-                wrote and cleared,
-                f"wrote={wrote} cleared={cleared} — the teardown reads this"
-                " to tell a link resolver from a rewritten /etc/resolv.conf")
+                took_over == C.DNS_OWNER_LINK and cleared is None,
+                f"after connect={took_over!r} after disconnect={cleared!r}")
+        # And the other outcome, which is the one that needs a warning at
+        # teardown. "Nothing recorded" used to mean both "handed back" and
+        # "cleanly reverted", so the teardown could not tell a rewritten
+        # /etc/resolv.conf from a tunnel that had tidied up after itself.
         open(os.path.join(faildir, "dns"), "w", encoding="utf-8").close()
         run(dict(socket_env))
         os.remove(os.path.join(faildir, "dns"))
-        r.check("a handover that failed records nothing",
-                not os.path.exists(marker),
-                "the run fell back to the stock script, so DNS is not ours"
-                " and the teardown must not say it was")
+        r.check("a handover that failed records who took DNS instead",
+                owner() == C.DNS_OWNER_SCRIPT,
+                f"recorded {owner()!r} — the stock script now holds"
+                " /etc/resolv.conf, and only its own disconnect puts it back")
 
         calls, env = run({}, reason="disconnect")
         r.check("a disconnect reverts the link",

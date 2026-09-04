@@ -266,17 +266,25 @@ def marker_path(env):
     return os.path.join(os.path.dirname(socket_path), C.DNS_MARKER)
 
 
-def set_marker(env, present):
-    """Record, or clear, "DNS on this link is ours". Best effort by design."""
+def set_marker(env, owner):
+    """Record who owns DNS now, or clear it. Best effort by design.
+
+    `owner` is C.DNS_OWNER_LINK, C.DNS_OWNER_SCRIPT, or None to say nobody
+    does. The distinction matters at teardown: a resolver on the link is
+    something the helper can take off itself, while a rewritten
+    /etc/resolv.conf is only ever put back by the stock script's own
+    disconnect -- so the two need different words and one of them needs a
+    warning.
+    """
     path = marker_path(env)
     if path is None:
         return
     try:
-        if present:
-            with open(path, "w", encoding="utf-8") as handle:
-                handle.write("1\n")
-        else:
+        if owner is None:
             os.unlink(path)
+        else:
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write(owner + "\n")
     except OSError:
         pass
 
@@ -305,37 +313,53 @@ def apply_dns(env, device, binary, revert_on_failure=True):
     # Ordered so the link is never briefly wrong. Scope first, servers last: a
     # link with domains and no servers resolves nothing, which is harmless,
     # while a link with servers and no scope catches every query on the machine.
+    #
+    # Every call is checked, including the default-route one. That was dropped
+    # on the grounds that listing a domain implies it -- and systemd-resolved's
+    # own documentation says the implication holds for a *route-only* domain
+    # ("~name"), while these are search domains, where the implicit answer is
+    # the opposite. So the explicit call is the only thing keeping the link off
+    # the default-route set, and a version of resolved without
+    # SetLinkDefaultRoute, or one transient bus error, left the tunnel's
+    # resolvers catching every lookup on the machine while the log reported a
+    # neatly scoped success.
     everything = full_tunnel(env)
-    if domains and not everything:
-        # Explicit, though listing any domain already implies it. Saying so
-        # costs one call and removes the need to know the implication.
-        resolvectl(binary, "default-route", device, "no")
-        if not resolvectl(binary, "domain", device, *domains):
-            if revert_on_failure:
-                resolvectl(binary, "revert", device, quiet=True)
-            return False
-    else:
-        # Two ways to arrive here. Either the gateway named no domains and none
-        # could be derived -- scoping to nothing would resolve nothing, so the
-        # link takes every query instead, which is what the script this
-        # replaces would have done. Or this is a full tunnel, where taking
-        # every query is not a compromise at all but the only correct answer:
-        # all traffic is going down the tunnel already, and leaving the rest of
-        # DNS with the local network's resolver would send it in clear over the
-        # one link the VPN exists to stop using.
-        resolvectl(binary, "default-route", device, "yes")
-        if domains and not resolvectl(binary, "domain", device, *domains):
-            if revert_on_failure:
-                resolvectl(binary, "revert", device, quiet=True)
-            return False
-        if not everything:
-            note(f"no domains for {device}: every lookup may go to the"
-                 " tunnel's resolver. Set dns-domains to scope it.")
-    if not resolvectl(binary, "dns", device, *servers):
+    # A full tunnel wants every lookup, and "default-route yes" alone does not
+    # deliver that. resolved sends a query matching no routing domain to *all*
+    # links that are default routes -- so the local network's resolver is still
+    # asked, in parallel, in clear, over the one link the VPN exists to stop
+    # using, and it can win the race and answer for any name, including one
+    # inside the tunnel's own domain. "~." is a routing domain that matches
+    # every name, so this link becomes the best match for all of them and the
+    # others are not consulted. That is what the stock script's
+    # /etc/resolv.conf rewrite achieved, and what this has to achieve to
+    # replace it.
+    scope = ["~.", *domains] if everything else list(domains)
+    default_route = "yes" if everything or not scope else "no"
+
+    def failed():
+        # A connect reverts, because the revert *is* the handover: the stock
+        # script still has INTERNAL_IP4_DNS and picks DNS up. A reconnect has
+        # nobody to hand to, so it keeps what the link already had.
         if revert_on_failure:
             resolvectl(binary, "revert", device, quiet=True)
         return False
-    set_marker(env, True)
+
+    if not resolvectl(binary, "default-route", device, default_route):
+        return failed()
+    if scope and not resolvectl(binary, "domain", device, *scope):
+        return failed()
+    if not scope:
+        # The gateway named no domains and none could be derived. Scoping to
+        # nothing would resolve nothing, so the link takes every query
+        # instead. Deliberately *not* "~." here, unlike the full tunnel above:
+        # traffic is still split, so names the local network serves -- a
+        # printer, a NAS -- should stay with the resolver that knows them.
+        note(f"no domains for {device}: every lookup may go to the"
+             " tunnel's resolver. Set dns-domains to scope it.")
+    if not resolvectl(binary, "dns", device, *servers):
+        return failed()
+    set_marker(env, C.DNS_OWNER_LINK)
 
     where = " ".join(domains) if domains else "all names"
     if everything:
@@ -359,7 +383,7 @@ def revert_dns(device, binary, env):
     run always is the only choice that is right in both cases.
     """
     resolvectl(binary, "revert", device, quiet=True)
-    set_marker(env, False)
+    set_marker(env, None)
 
 
 def handle_dns(environ, binary=None):
@@ -375,7 +399,12 @@ def handle_dns(environ, binary=None):
         return
     binary = C.resolvectl_path() if binary is None else binary
     if binary is None:
-        return  # no systemd-resolved on this machine; nothing to hand it
+        # No systemd-resolved on this machine, so the stock script keeps DNS
+        # and will have written /etc/resolv.conf. Recorded for the teardown,
+        # which otherwise had no way to know this run had fallen back.
+        if environ.get("reason", "") in ("connect", "reconnect"):
+            set_marker(environ, C.DNS_OWNER_SCRIPT)
+        return
     device = environ.get("TUNDEV", "")
     if not C.INTERFACE_RE.match(device):
         # About to be an argument to a root command. The helper checks this too;
@@ -395,11 +424,17 @@ def handle_dns(environ, binary=None):
             # the installed script) -- so reverting would take a working
             # configuration off the link and leave DNS owned by no one, over a
             # transient resolvectl failure on a tunnel that is perfectly fine.
-            revert_on_failure=(reason == "connect")):
+                revert_on_failure=(reason == "connect")):
         # The real script guards both its DNS branches on this one variable
         # (vpnc-script: `if [ -n "$INTERNAL_IP4_DNS" ]`), so removing it is how
         # it is told the job is done -- routing untouched, DNS entirely ours.
         environ.pop("INTERNAL_IP4_DNS", None)
+    elif reason in ("connect", "reconnect"):
+        # Handed back. Recorded, because "no marker" would otherwise mean both
+        # "DNS was cleanly given back" and "the stock script has been holding
+        # /etc/resolv.conf all along", and the teardown has to tell those
+        # apart to know whether to warn.
+        set_marker(environ, C.DNS_OWNER_SCRIPT)
     # attempt-reconnect and pre-init are left alone on purpose. The link is
     # coming back, `reconnect` will configure it again, and tearing the resolver
     # down in between would only send lookups meant for the tunnel out over the

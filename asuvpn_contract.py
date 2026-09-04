@@ -201,10 +201,19 @@ def decode_control(line):
 # Set by the helper in openconnect's environment, which passes them through to
 # the script. Named here so the two ends cannot disagree about them.
 # Written by asuvpn-notify into the helper's own /run/asuvpn session directory
-# when it has put DNS on the link, removed when it takes it off again. The
-# helper reads it at teardown: whether DNS is ours is a fact about what
-# happened, and it used to be inferred from whether the user had asked for it.
-DNS_MARKER = "dns-on-link"
+# to record who ended up owning DNS, and removed when DNS is given back. The
+# helper reads it at teardown: this is a fact about what happened, and it used
+# to be inferred from whether the user had asked for it.
+DNS_MARKER = "dns-owner"
+# What the marker says. "link" means asuvpn-notify put the resolver on the
+# tunnel's own link; "script" means it handed DNS to the stock vpnc-script,
+# which rewrites /etc/resolv.conf and keeps a backup. The file is removed on a
+# clean disconnect, so finding it at teardown is evidence that the disconnect
+# transition never ran -- which is the question the teardown actually needs
+# answered, and a better one than "did we SIGKILL it", which is what it used
+# to ask.
+DNS_OWNER_LINK = "link"
+DNS_OWNER_SCRIPT = "script"
 
 EVENT_SOCKET_VAR = "ASUVPN_EVENT_SOCKET"
 EVENT_TOKEN_VAR = "ASUVPN_EVENT_TOKEN"

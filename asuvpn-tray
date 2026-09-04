@@ -907,6 +907,9 @@ class StateMachine:
     def _kill_auth(self, *_args, **_kwargs):
         raise NotImplementedError
 
+    def _close_helper_stdin(self, *_args, **_kwargs):
+        raise NotImplementedError
+
     def _probe_target(self, *_args, **_kwargs):
         raise NotImplementedError
 
@@ -1066,16 +1069,29 @@ class StateMachine:
     def _tr_authorize_timed_out(self, _data):
         """Nobody answered the authorization prompt, so stop waiting on it.
 
-        Terminating pkexec while its dialog is up dismisses the dialog -- it
-        is an ordinary process of ours until it becomes root, which is the
-        same move `_quit_thread` makes and for the same reason. Once it *has*
-        become root this fails with EPERM, and that is fine: it can only have
-        got there by being answered, and then `helper_spoke` would have
-        stopped us before here.
+        Two moves, not one, and the second is the one that matters.
+        Terminating pkexec while its dialog is up dismisses the dialog, which
+        is what `_quit_thread` does and why. But `helper_spoke` does *not*
+        prove the helper is still unprivileged: it is set from a GLib.idle_add
+        callback, while this row is reached from a GLib timeout, and a ready
+        timeout runs before an already-queued idle. So a password typed in the
+        last moment before the deadline lands us here with a *root* helper
+        whose first line is still in the queue -- and against root,
+        terminate() is EPERM and does nothing at all.
 
-        The generation is bumped first so the exit this kill produces is
-        retired rather than painting its own FAILED over this one -- a bare
-        "terminated by SIGTERM" would say nothing about the prompt.
+        Closing the control pipe is the teardown that works on a root helper;
+        it is the only one there is. Every other teardown path closes it, and
+        this row was the exception. Without it the helper and its openconnect
+        went on to build a tunnel that nothing could reach: Disconnect and
+        Quit both returned success (the handle was already dropped), and the
+        next Connect started a second root openconnect beside the first.
+
+        The handle is kept rather than dropped, for the same reason. FAILED
+        with a live helper is a state the machine now understands -- Disconnect
+        retries the teardown there, and Connect closes the tunnel before
+        signing in -- so keeping it is what makes those verbs reach this
+        tunnel. The generation bump retires the exit the kill produces, so a
+        bare "terminated by SIGTERM" cannot paint over the explanation.
 
         What is deliberately *not* touched is `dropped`. A rebuild that timed
         out here has spent one attempt and is still owed the rest, so the tick
@@ -1086,8 +1102,8 @@ class StateMachine:
         limit = SETTINGS["signin-timeout"]
         self.helper_generation += 1
         proc = self.helper_proc
-        self.helper_proc = None
         if proc is not None:
+            self._close_helper_stdin(proc)
             try:
                 proc.terminate()
             except (ProcessLookupError, PermissionError, OSError):

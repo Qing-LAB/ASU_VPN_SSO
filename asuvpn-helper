@@ -632,23 +632,27 @@ def interface_exists(name):
     return bool(name) and os.path.exists(f"/sys/class/net/{name}")
 
 
-def dns_took_over(event_dir):
-    """Did asuvpn-notify actually put DNS on this link, or only mean to?
+def dns_owner(event_dir):
+    """Who still owns DNS, as asuvpn-notify last recorded it.
 
-    A fact now, read from the marker asuvpn-notify writes into our own session
-    directory. It used to be inferred from `--dns-domains is not None`, which
-    is "the user asked for link DNS" -- true on every run that then fell back
-    to the stock script, so a killed teardown reported that the resolver had
-    gone with its link on exactly the runs where DNS was instead sitting in
-    /etc/resolv.conf with its backup orphaned, and suppressed the warning that
-    says so.
+    C.DNS_OWNER_LINK, C.DNS_OWNER_SCRIPT, or None -- and None is the good
+    answer, because a clean disconnect removes the file. So finding anything
+    here at teardown is evidence that the disconnect transition never ran,
+    which is the question this actually needs answered.
 
-    None when there is no session directory: nothing could have been recorded,
-    so the teardown says it cannot tell rather than picking a story.
+    It used to ask "did *we* SIGKILL it", which is a different and narrower
+    question: an OOM kill, an administrator's `pkill -9` or a crash all leave
+    that false, and the whole DNS half of the teardown was skipped -- no
+    revert, and no warning about an /etc/resolv.conf still naming resolvers
+    that are now unreachable.
     """
     if not event_dir:
         return None
-    return os.path.exists(os.path.join(event_dir, C.DNS_MARKER))
+    try:
+        with open(os.path.join(event_dir, C.DNS_MARKER), encoding="utf-8") as fh:
+            return fh.read().strip() or None
+    except OSError:
+        return None
 
 
 def drop_link_dns(ifname):
@@ -699,7 +703,7 @@ def verify_teardown(ifname, before, was_killed, owned, dns_on_link=None):
             log(f"WARNING: {ifname} outlived openconnect but 'ip' is missing;"
                 " it was not removed")
         else:
-            if was_killed and dns_on_link is not False:
+            if dns_on_link == C.DNS_OWNER_LINK:
                 # Before the deletion, while there is still a link to name.
                 # Usually redundant -- the resolver goes when the link does --
                 # but not when the device is persistent or the delete below
@@ -729,23 +733,26 @@ def verify_teardown(ifname, before, was_killed, owned, dns_on_link=None):
     else:
         log("WARNING: no default route after teardown — network is likely broken")
         log("WARNING: try 'nmcli networking off && nmcli networking on'")
-    if was_killed:
-        if dns_on_link:
-            log("openconnect was killed; the tunnel's resolver was on its link"
-                " and went with it")
-        elif dns_on_link is None:
-            # No session channel, so nothing recorded which way DNS went. Say
-            # that, rather than pick the reassuring half of it.
-            log("WARNING: openconnect was killed before it could restore DNS,"
-                " and there is no record of how DNS was configured. If names"
-                " stop resolving, check /etc/resolv.conf")
-        else:
-            # Nothing here can fix this: the backup belongs to the stock
-            # script and is only put back by the disconnect that never ran.
-            log("WARNING: openconnect was killed before it could restore DNS."
-                " /etc/resolv.conf may still name the tunnel's resolvers; a"
-                " clean connect-then-disconnect, or restarting NetworkManager,"
-                " puts it back")
+    # Not gated on was_killed. The marker is only removed by the disconnect
+    # transition, so its survival says that transition did not run -- however
+    # openconnect died, and including the ways we did not cause.
+    if dns_on_link == C.DNS_OWNER_LINK:
+        log("the disconnect never ran, so the tunnel's resolver was still on"
+            " its link; it has been taken off")
+    elif dns_on_link == C.DNS_OWNER_SCRIPT:
+        # Nothing here can fix this: the backup belongs to the stock script
+        # and is only put back by the disconnect that never ran.
+        log("WARNING: openconnect died before it could restore DNS, and this"
+            " session had handed DNS to the stock script. /etc/resolv.conf may"
+            " still name the tunnel's resolvers; a clean"
+            " connect-then-disconnect, or restarting NetworkManager, puts it"
+            " back")
+    elif was_killed and dns_on_link is None:
+        # Killed, and nothing was recorded -- there was no session channel to
+        # record in. Say that rather than pick the reassuring half of it.
+        log("WARNING: openconnect was killed before it could restore DNS, and"
+            " there is no record of how DNS was configured. If names stop"
+            " resolving, check /etc/resolv.conf")
 
 
 class Tunnel:
@@ -1008,7 +1015,13 @@ def main():
     if events is not None:
         script_env[C.EVENT_SOCKET_VAR] = event_path
         script_env[C.EVENT_TOKEN_VAR] = token
-        script_env[C.REAL_SCRIPT_VAR] = chained
+        # Quoted for the same reason: asuvpn-notify execs this through
+        # `sh -c` too. A caller's own --script value is already a command line
+        # and is passed on as given -- their command line, their quoting --
+        # but the path this program derived is a path and has to be made into
+        # one.
+        script_env[C.REAL_SCRIPT_VAR] = (
+            chained if caller_script else shlex.quote(chained))
         if args.dns_domains is not None:
             # Resolved here, once, rather than at every transition: the script
             # runs several times per tunnel and this answer cannot change
@@ -1021,7 +1034,18 @@ def main():
             log("DNS goes on the tunnel's own link, not in /etc/resolv.conf;"
                 f" for whichever names the gateway claims, else {fallback}")
         extra = list(strip_script_option(extra))
-        extra = [*extra, "--script", NOTIFY]
+        # Quoted, because --script is a shell *command line* and not a path:
+        # openconnect hands it to `sh -c`, which is also how asuvpn-notify
+        # chains onward. An install under a directory with a space in it --
+        # `install.sh --link` from "~/My Projects/…", or any XDG_DATA_HOME
+        # with one -- otherwise produced `sh -c /home/u/My Projects/...`,
+        # which execs "/home/u/My", fails with 127, and leaves *no* script
+        # running at any transition: no routes, no DNS, and nothing restored
+        # at disconnect, while the tray fell back to log matching and reported
+        # Connected throughout. A path containing ; or $( ) was worse than
+        # broken. Every sandbox path is space-free, which is why no scenario
+        # ever saw it.
+        extra = [*extra, "--script", shlex.quote(NOTIFY)]
 
     # Says what was done, not what the server did: this runs before the server
     # has said anything, and asserting its behaviour here would be wrong for
@@ -1121,7 +1145,7 @@ def main():
     else:
         log(f"openconnect exited with status {returncode}")
     verify_teardown(ifname, interfaces_before, tunnel.killed,
-                    owned.get("ifindex"), dns_took_over(event_dir))
+                    owned.get("ifindex"), dns_owner(event_dir))
     closing.set()  # the socket close below is deliberate, not a failure
     if events is not None:
         events.close()
