@@ -878,6 +878,120 @@ def check_demotion_rules(tray, r):
             f"last_failure={kept!r}")
 
 
+def check_verbs_reach_every_state(tray, r):
+    """The states a user verb was silently dropped in, and the ones it was not.
+
+    Two gaps, both found by reading the table rather than the code: RECOVERING
+    had no row for connect or reconnect, and DEMOTED none for link-lost. The
+    first mattered because the CLI is a second surface with no menu to hide
+    the verb -- `asuvpn reconnect --wait` was answered "ok", dropped, and then
+    polled a busy state for its whole timeout. The second because a link blip
+    on an already-demoted tunnel kept striking through openconnect's own free
+    re-establish, and the next rung after a spent nudge is a Duo push.
+    """
+    Stub = machine_stub(tray)
+
+    recovering = Stub()
+    recovering.state = tray.RECOVERING
+    recovering.helper_proc = None
+    recovering.dispatch(tray.MSG_RECONNECT)
+    r.check("reconnect is not dropped while openconnect is re-establishing",
+            recovering.signins == [False]
+            and not any("ignoring" in line for line in recovering.logged),
+            f"signins={recovering.signins} logged={recovering.logged} — the"
+            " IPC answers ok either way, so a dropped verb is a --wait that"
+            " polls a busy state until it times out")
+
+    demoted = Stub()
+    demoted.state = tray.DEMOTED
+    demoted.strikes = dict(tray.fresh_strikes(), probe=2)
+    demoted.dispatch(tray.MSG_LINK_LOST)
+    r.check("a link openconnect is rebuilding stops the strikes, not the badge",
+            demoted.state == tray.DEMOTED
+            and demoted.strikes == tray.fresh_strikes()
+            and demoted.signins == [],
+            f"state={demoted.state!r} strikes={demoted.strikes} — promoting"
+            " here would be the mistake adopt_only exists to prevent, and"
+            " striking through it buys a Duo push for a WiFi blip")
+
+    # FAILED does not always mean "no tunnel": a timed-out teardown lands
+    # there still holding one. Connect then meant a browser, a Duo approval,
+    # and only afterwards "a tunnel is already running".
+    class Live:
+        @staticmethod
+        def poll():
+            return None
+
+    stuck = Stub()
+    stuck.state = tray.FAILED
+    stuck.helper_proc = Live()
+    stuck.dispatch(tray.MSG_CONNECT)
+    r.check("connect on a tunnel that is still up closes it first",
+            stuck.signins == [] and stuck.state == tray.DISCONNECTING,
+            f"signins={stuck.signins} state={stuck.state!r} — signing in from"
+            " cold spends a Duo push to arrive at a refusal")
+
+    # And the exit of that old helper, arriving while the sign-in it triggered
+    # is still in flight. There is no (FAILED, auth-ok) row, so painting
+    # FAILED here threw the completed sign-in away.
+    signing = Stub()
+    signing.state = tray.AUTHENTICATING
+    signing.tunnel_ever_connected = True
+    signing.autoreconnect = True
+    signing.dispatch(tray.MSG_HELPER_EXITED, status=1,
+                     generation=signing.helper_generation)
+    r.check("a previous tunnel's exit does not discard the sign-in under way",
+            signing.state == tray.AUTHENTICATING and not signing.dropped,
+            f"state={signing.state!r} dropped={signing.dropped} — the user's"
+            " Duo approval would arrive in FAILED, be logged as ignored, and"
+            " the tick would start a second sign-in beside the first")
+
+
+def check_a_demotion_can_always_be_lifted(tray, r):
+    """No verdict may outlive the check that can overturn it.
+
+    Only the demoting source promotes -- that is what stops one check clearing
+    another's finding. But nothing made that source speak again, so a user who
+    read "staying demoted until a check clears" and switched off the check
+    being complained about was stuck with the badge until Reconnect.
+    """
+    Stub = machine_stub(tray)
+    original = {name: tray.SETTINGS[name]
+                for name in ("dns", "probe", "health-interval")}
+    try:
+        demoted = Stub()
+        demoted.state = tray.DEMOTED
+        demoted.demoted_by = "dns"
+        demoted.tunnel_dns = "192.0.2.53"
+        demoted.tunnel_address = "192.0.2.1"
+        tray.SETTINGS["dns"] = True
+        r.check("a check that still runs keeps holding its demotion",
+                demoted._source_can_speak("dns"),
+                "a source that can still speak must not be stood down; that"
+                " would clear findings the moment they were made")
+        tray.SETTINGS["dns"] = False
+        r.check("a check that has been switched off cannot hold one",
+                not demoted._source_can_speak("dns"),
+                "nothing will ever clear it, so the badge would stay demoted"
+                " for the rest of the session")
+        demoted._stand_down("dns")
+        r.check("standing down lifts the badge without claiming a recovery",
+                demoted.state == tray.CONNECTED and demoted.demoted_by is None
+                and demoted.notes == [],
+                f"state={demoted.state!r} demoted_by={demoted.demoted_by!r}"
+                f" notes={demoted.notes} — nothing checked, so nothing may"
+                " announce that traffic is flowing again")
+        tray.SETTINGS["dns"] = True
+        tray.SETTINGS["health-interval"] = 0
+        r.check("a watchdog switched off holds no demotions either",
+                not demoted._source_can_speak("dns")
+                and not demoted._source_can_speak("device"),
+                "with nothing being inspected, every source has stopped"
+                " speaking, including the one that needs only the kernel")
+    finally:
+        tray.SETTINGS.update(original)
+
+
 def check_teardown_rows(tray, r):
     """The teardown outcomes the sandbox cannot reach quickly.
 
@@ -891,13 +1005,29 @@ def check_teardown_rows(tray, r):
 
     Stub = machine_stub(tray)
 
-    def tearing_down():
+    class Live:
+        """A helper process that has not exited."""
+
+        @staticmethod
+        def poll():
+            return None
+
+    def tearing_down(helper=True):
         # Mid-teardown with the reconnect intent: the default the timeout and
         # handoff rows are weighed against. The non-None intent is what makes
         # the handoff's `teardown_intent is None` assert below non-vacuous.
+        #
+        # And a live helper, because that is what a teardown timeout *means*.
+        # These fixtures used to leave helper_proc None -- a helper that will
+        # not exit, modelled by no helper at all -- which passed only because
+        # nothing on the path looked. The row now distinguishes a helper that
+        # is still there from one whose exit crossed the deadline, so the
+        # difference has to be staged.
         stub = Stub()
         stub.state = tray.DISCONNECTING
         stub.teardown_intent = "reconnect"
+        if helper:
+            stub.helper_proc = Live()
         return stub
 
     timed = tearing_down()
@@ -922,14 +1052,6 @@ def check_teardown_rows(tray, r):
     # beside a helper handle this still holds, and Disconnect used to answer
     # with a Disconnected badge and no teardown at all -- a claim about a root
     # tunnel that may well still be carrying traffic.
-    class Live:
-        """A helper process that has not exited."""
-
-        @staticmethod
-        def poll():
-            return None
-
-    stuck.helper_proc = Live()
     torn = []
     stuck._disconnect_thread = lambda *a, **k: torn.append(True)
     stuck.dispatch(tray.MSG_DISCONNECT)
@@ -954,6 +1076,20 @@ def check_teardown_rows(tray, r):
             f"state={gone.state!r} dropped={gone.dropped}"
             f" rebuilds={gone.rebuilds} — this is also how a pending rebuild"
             " is called off, and a human taking over must end it")
+
+    # The other side of that: a deadline that expires after the helper has
+    # already gone must not report a tunnel that would not close. Event.wait
+    # returns the condition's answer rather than the flag, so a set() landing
+    # exactly on the timeout still returns False and the timeout is posted for
+    # a teardown that finished.
+    crossed = tearing_down(helper=False)
+    crossed.reconnect_keep_log = True
+    crossed.dispatch(tray.MSG_TEARDOWN_TIMEOUT, during="reconnect")
+    r.check("a deadline that crossed the helper's exit signs in, not fails",
+            crossed.signins == [True] and crossed.state != tray.FAILED,
+            f"state={crossed.state!r} signins={crossed.signins} — the"
+            " reconnect had nothing left to wait for, and stranding it leaves"
+            " no tunnel, no helper and no rebuild owed")
 
     handoff = tearing_down()
     handoff.reconnect_keep_log = True
@@ -3281,6 +3417,8 @@ def main():
         guarded(check_owner_is_a_principal, C, r)
         guarded(check_tunnel_health, tray, r)
         guarded(check_demotion_rules, tray, r)
+        guarded(check_verbs_reach_every_state, tray, r)
+        guarded(check_a_demotion_can_always_be_lifted, tray, r)
         guarded(check_teardown_rows, tray, r)
         guarded(check_signin_deadline, tray, r)
         guarded(check_rebuild_rules, tray, r)

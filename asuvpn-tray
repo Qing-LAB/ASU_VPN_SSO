@@ -259,6 +259,14 @@ TRANSITIONS = {
     (FAILED, MSG_RECONNECT): "start_signin",
     (CONNECTED, MSG_RECONNECT): "teardown_reconnect",
     (DEMOTED, MSG_RECONNECT): "teardown_reconnect",
+    # The menu hides Reconnect in RECOVERING, and the CLI is a second surface
+    # with no such filter: `asuvpn reconnect` was dropped here while the IPC
+    # answered "ok", so --wait then polled a busy state for its whole timeout
+    # and reported on a reconnect that never happened. openconnect
+    # re-establishing is not a reason to refuse a fresh session; it is a
+    # reason the user might want one.
+    (RECOVERING, MSG_RECONNECT): "teardown_reconnect",
+    (RECOVERING, MSG_CONNECT): "connect_means_reconnect",
     (DISCONNECTED, MSG_DISCONNECT): "already_disconnected",
     # Not "already_disconnected", which is what this was. A teardown that
     # timed out lands in FAILED with the helper handle still held and a root
@@ -286,6 +294,11 @@ TRANSITIONS = {
     (DEMOTED, MSG_TUNNEL_UP): "adopt_only",
     (CONNECTED, MSG_LINK_LOST): "link_lost",
     (RECOVERING, MSG_LINK_LOST): "still_recovering",
+    # Dropped before, which meant the watchdog kept striking a tunnel
+    # openconnect was already re-establishing for free -- and with the free
+    # nudge spent, the next rung is a Duo push, bought for a WiFi blip that
+    # would have healed itself.
+    (DEMOTED, MSG_LINK_LOST): "hold_for_openconnect",
     (CONNECTED, MSG_CHECK): "weigh_check",
     (RECOVERING, MSG_CHECK): "weigh_check",
     (DEMOTED, MSG_CHECK): "weigh_check",
@@ -886,6 +899,9 @@ class StateMachine:
     def _kill_auth(self, *_args, **_kwargs):
         raise NotImplementedError
 
+    def _probe_target(self, *_args, **_kwargs):
+        raise NotImplementedError
+
     def _act_start_tunnel(self, *_args, **_kwargs):
         raise NotImplementedError
 
@@ -956,6 +972,18 @@ class StateMachine:
         # behind them -- this row and the one below are the only ways out of
         # FAILED, which is the only state a rebuild is ever owed from.
         self._clear_drop()
+        if self.helper_proc is not None and self.helper_proc.poll() is None:
+            # FAILED does not always mean "no tunnel": a teardown that timed
+            # out lands here still holding a live root openconnect. Signing in
+            # from cold then opened a browser, took a Duo approval, and only
+            # at _act_start_tunnel refused with "a tunnel is already running".
+            # Connect means "get me connected", which here is a teardown and
+            # then a sign-in -- the same reading (DEMOTED, connect) already
+            # has.
+            self.log("[tray] connect asked for while a tunnel is still up;"
+                     " closing it first")
+            self._tr_teardown_reconnect({"keep_log": False})
+            return
         # Always a fresh log: this row serves the user verbs, and the
         # keep-the-log flavor travels only through the reconnect teardown
         # (_tr_teardown_reconnect), never through a connect from cold.
@@ -1184,6 +1212,43 @@ class StateMachine:
             self._set_state(CONNECTED, self.tunnel_address)
             self.notify("VPN carrying traffic again", self.server)
 
+    def _source_can_speak(self, source):
+        """Will this source ever produce another verdict?
+
+        Only the demoting source can promote, which is what stops one check
+        clearing another's finding -- but nothing guaranteed that source would
+        speak again. A user who reads "staying demoted until a check clears"
+        and turns off the check being complained about, or a watchdog switched
+        off entirely, or a tunnel that stops reporting a resolver, all leave
+        the badge demoted for the rest of the session with no way out but
+        Reconnect. Whether a source is still being consulted is a question
+        with an answer; this asks it.
+        """
+        if SETTINGS["health-interval"] <= 0:
+            return False            # nothing is being inspected at all
+        if source == "dns":
+            return bool(SETTINGS["dns"] and self.tunnel_dns)
+        if source == "probe":
+            return bool(SETTINGS["probe"] and self._probe_target())
+        return True                 # the device check needs only the kernel
+
+    def _stand_down(self, source):
+        """Lift a demotion whose source has stopped being consulted.
+
+        Not a promotion, and deliberately quieter than one: nothing here says
+        the tunnel is carrying traffic, because nothing checked. What is said
+        is that the applet has stopped judging, which is the honest badge for
+        a check that is switched off.
+        """
+        self.log(f"[tray] the {source} check no longer runs, so nothing can"
+                 " clear the demotion it was holding; lifting it")
+        self.demoted_by = None
+        self.strikes = fresh_strikes()
+        self.nudge_spent = False
+        self.failure_notified = False
+        self.giveup_notified = False
+        self._set_state(CONNECTED, self.tunnel_address)
+
     def _check_strike(self, source, reason, detail):
         strikes = max(1, SETTINGS["health-strikes"])
         self.strikes[source] += 1
@@ -1220,6 +1285,23 @@ class StateMachine:
         self.teardown_intent = None
         if intent == "cancel":
             self._set_state(DISCONNECTED)
+            return
+        if self.state == AUTHENTICATING:
+            # A sign-in is already in flight and this is the *previous*
+            # tunnel's helper finally dying -- reachable whenever a teardown
+            # timed out, left FAILED holding a live helper, and the user
+            # connected again. Publishing FAILED over it discarded the
+            # sign-in: there is no (FAILED, auth-ok) row, so the Duo approval
+            # the user had just given was logged as ignored, and the tick then
+            # started a *second* sign-in beside the first, with a second
+            # browser window nothing could reach.
+            #
+            # `dropped` is deliberately not armed either. A human, or a
+            # rebuild that is already counted, is handling this; arming it
+            # here would owe an automatic retry on top of the attempt already
+            # under way.
+            self.log(f"[tray] the previous tunnel closed (status {status})"
+                     " while signing in; the sign-in carries on")
             return
         if intent in ("disconnect", "quit") or self.state in (DISCONNECTING,
                                                               DISCONNECTED):
@@ -1356,6 +1438,19 @@ class StateMachine:
         self._act_start_signin(keep_log=keep)
 
     def _tr_teardown_timed_out(self, data):
+        if self.helper_proc is None or self.helper_proc.poll() is not None:
+            # The deadline and the exit crossed. Event.wait returns the
+            # condition's answer, not the flag, so a set() landing exactly on
+            # the timeout can still return False -- and the exit message is
+            # then already queued or already handled. Reporting "would not
+            # close" about a helper that has closed strands a reconnect that
+            # had nothing left to wait for.
+            self.teardown_intent = None
+            self.log("[tray] the teardown deadline and the helper's exit"
+                     " crossed; the tunnel is closed")
+            if data["during"] == "reconnect":
+                self._tr_teardown_finished(data)
+            return
         self.teardown_intent = None
         if data["during"] == "reconnect":
             # Carrying on would null out our only handle on a live root
@@ -1525,6 +1620,24 @@ class StateMachine:
         self._set_state(CONNECTED, address)
         where = f"{self.server} — {address}".strip(" —")
         self.notify("VPN connected" if first else "VPN reconnected", where)
+
+    def _tr_hold_for_openconnect(self, _data):
+        """openconnect is rebuilding a link this applet had already demoted.
+
+        No state change: DEMOTED is still true, and promoting on a link event
+        is the mistake `adopt_only` exists to prevent. What changes is the
+        strike count, which is reset for the same reason RECOVERING stands
+        aside from checks entirely -- the checks are about to fail because the
+        link is down, not because this tunnel is unrecoverable, and letting
+        them accumulate spends the ladder's expensive rung on an outage
+        openconnect heals for free.
+
+        Unbounded only in appearance: openconnect gives up after its own
+        reconnect timeout and exits, and the drop path takes it from there.
+        """
+        self.strikes = fresh_strikes()
+        self.log("[tray] openconnect is re-establishing the link;"
+                 " holding the checks while it does")
 
     def _announce_link_lost(self):
         """openconnect has lost the link and is re-establishing it itself.
@@ -1885,11 +1998,18 @@ class VpnTray(StateMachine):
         # simply never showed it, so the only way to call off a retry from
         # the panel was to untick a setting the user may well want kept.
         armed = self.state == FAILED and self.dropped
-        self.disconnect_item.set_visible(established or armed)
+        # FAILED with a live helper is the timed-out teardown, and
+        # (FAILED, disconnect) exists precisely so it can be retried -- but
+        # the menu showed that verb only while a rebuild was owed, which that
+        # state never is. The panel offered Connect and Quit, and Connect was
+        # a Duo push into the same failure.
+        stuck = (self.state == FAILED and self.helper_proc is not None
+                 and self.helper_proc.poll() is None)
+        self.disconnect_item.set_visible(established or armed or stuck)
         # Named for what it does there: "Disconnect" is the wrong word for a
         # tunnel that is already gone, and what is being stopped is the
         # sign-in that has not happened yet.
-        self.disconnect_item.set_label("Stop reconnecting" if armed
+        self.disconnect_item.set_label("Stop reconnecting" if armed and not stuck
                                        else "Disconnect")
         self.reconnect_item.set_visible(established)
         # Not while disconnecting: teardown must not be interrupted, and there
@@ -2094,6 +2214,12 @@ class VpnTray(StateMachine):
         else:
             self.log("[tray] ---- reconnecting; the lines above say why ----")
 
+        # Whatever was already signing in has to die first. The bump below
+        # retires its *result*, but the process itself keeps its browser
+        # window open and, being start_new_session, outlives the applet --
+        # and _kill_auth can only ever reach the newest handle, so an older
+        # one became unreachable the moment this overwrote it.
+        self._kill_auth()
         self.auth_generation += 1
         self._set_state(AUTHENTICATING, "waiting for ASU sign-in")
         self.log(f"[tray] authenticating to {self.server} via {sso}")
@@ -2505,6 +2631,13 @@ class VpnTray(StateMachine):
                 and time.monotonic() - self.connecting_since
                 >= SETTINGS["signin-timeout"]):
             self.dispatch(MSG_AUTHORIZE_TIMEOUT)
+            return True
+        # Before the off switch, and that is deliberate: turning the watchdog
+        # off is one of the ways a demotion becomes permanent, so the stand-
+        # down has to be reachable from the same tick that notices.
+        if self.state == DEMOTED and self.demoted_by \
+                and not self._source_can_speak(self.demoted_by):
+            self._stand_down(self.demoted_by)
             return True
         if SETTINGS["health-interval"] <= 0:
             return True  # watchdog off: keep reading the config, check nothing

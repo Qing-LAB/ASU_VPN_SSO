@@ -303,6 +303,8 @@ things*). `any` is the `ANY` wildcard — the row applies in every state.
 | `failed` | `reconnect` | `_tr_start_signin` | Same, keeping the log that explains the failure. |
 | `connected` | `reconnect` | `_tr_teardown_reconnect` | Tear the tunnel down, then sign in again — a Duo push and a password. |
 | `demoted` | `reconnect` | `_tr_teardown_reconnect` | The expensive rung of the ladder, reached by hand or by autoreconnect. |
+| `recovering` | `reconnect` | `_tr_teardown_reconnect` | openconnect re-establishing is a reason the user might want a fresh session, not a reason to refuse one. The CLI has no menu to hide the verb, and dropping it left `--wait` polling a busy state. |
+| `recovering` | `connect` | `_tr_connect_means_reconnect` | Same reading as on a demoted tunnel: there is a session to replace. |
 | `disconnected` | `disconnect` | `_tr_already_disconnected` | Idempotent: say so rather than guessing. |
 | `failed` | `disconnect` | `_tr_teardown_disconnect` | Usually nothing to close, and it says so — but a teardown that timed out lands here still holding the helper, so this tries again rather than claiming success. Also how a pending rebuild is called off. |
 | `authenticating` | `disconnect` | `_tr_cancel_attempt` | Kill the sign-in; nothing is established yet. |
@@ -322,6 +324,7 @@ things*). `any` is the `ANY` wildcard — the row applies in every state.
 | `connected` | `tunnel-up` | `_tr_refresh_address` | Only refresh the address if the tunnel was re-addressed. |
 | `demoted` | `tunnel-up` | `_tr_adopt_only` | Adopt, but do **not** promote: openconnect asserting connected is what it asserted before the watchdog disagreed. |
 | `connected` | `link-lost` | `_tr_link_lost` | openconnect is re-establishing; say so, it costs nothing. |
+| `demoted` | `link-lost` | `_tr_hold_for_openconnect` | Stay demoted — promoting on a link event is what `adopt_only` prevents — but reset the strikes: the checks are failing because the link is down, and openconnect is already rebuilding it for free. |
 | `recovering` | `link-lost` | `_tr_still_recovering` | Already announced; a line per retry would spam a long outage. |
 | `connected` | `check` | `_tr_weigh_check` | Weigh a device, probe or DNS verdict; strike or clear. |
 | `recovering` | `check` | `_tr_weigh_check` | Verdicts are set aside — openconnect owns its own recovery. |
