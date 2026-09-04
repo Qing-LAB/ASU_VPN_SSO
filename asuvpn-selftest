@@ -167,8 +167,8 @@ def check_contract(C, r):
     r.check("settings parse by type, and every default survives a bad file",
             values["server"] == "x.edu" and values["probe"] is False
             and values["dpd"] == 0
-            and values["probe-every"] == C.SETTINGS_BY_NAME["probe-every"].default
-            and values["probe-port"] == C.SETTINGS_BY_NAME["probe-port"].default,
+            and values["probe-every"] == C.SCHEMA_BY_NAME["probe-every"].default
+            and values["probe-port"] == C.SCHEMA_BY_NAME["probe-port"].default,
             f"got {values!r}")
     # probe-port 0 is among the refused lines above: it is not a connectable
     # port, so accepting it would make every probe silently inconclusive —
@@ -180,7 +180,7 @@ def check_contract(C, r):
     # so the setting's documentation forbids it and the parser enforces that.
     r.check("a teardown-timeout below the signal escalation is refused",
             values["teardown-timeout"]
-            == C.SETTINGS_BY_NAME["teardown-timeout"].default
+            == C.SCHEMA_BY_NAME["teardown-timeout"].default
             and any("teardown-timeout" in p for p in problems),
             f"got {values['teardown-timeout']!r}, problems={problems!r}")
     rendered, round_trip_problems = C.parse_settings(C.render_settings())
@@ -1195,7 +1195,7 @@ def check_signin_deadline(tray, r):
 
     # The setting cannot be turned off, because the guarantee above would
     # then have a hole exactly where an unattended rebuild runs.
-    setting = tray.C.SETTINGS_BY_NAME["signin-timeout"]
+    setting = tray.C.SCHEMA_BY_NAME["signin-timeout"]
     refused = []
     for value in ("0", "-1", "5", "99999"):
         try:
@@ -2527,7 +2527,7 @@ def check_sso_method(C, r):
     import http.client
 
     settings, _ = C.load_settings(C.config_path())
-    server = settings.get("server") or C.SETTINGS_BY_NAME["server"].default
+    server = settings.get("server") or C.SCHEMA_BY_NAME["server"].default
     # The endpoint comes out of a config file the user owns and is about to be
     # dialled. Held to the same rule install.sh applies to --server: a hostname
     # and nothing else, so nothing here can carry a path or a credential.

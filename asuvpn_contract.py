@@ -617,7 +617,13 @@ class Setting:
         return str(value)
 
 
-SETTINGS = (
+# The schema: what a setting *is*. Named SCHEMA rather than SETTINGS because
+# the applet's module-level SETTINGS is the current *values*, and the two sat
+# side by side under one name -- `C.SETTINGS_BY_NAME["dns"].default` next to
+# `SETTINGS["dns"]`, one yielding a Setting and the other a value. Nothing
+# broke because of it, but a name that means two things in two modules used
+# together is a question waiting to be answered wrongly.
+SCHEMA = (
     Setting("server", "text", "sslvpn.asu.edu",
             "The VPN endpoint. Set by install.sh --server."),
     Setting("autoreconnect", "bool", True,
@@ -712,12 +718,12 @@ SETTINGS = (
             " Capped at 99: every rotation walks the whole numbered chain.",
             maximum=99),
 )
-SETTINGS_BY_NAME = {s.name: s for s in SETTINGS}
+SCHEMA_BY_NAME = {s.name: s for s in SCHEMA}
 CONFIG_BASENAME = "asuvpn.conf"
 
 
 def defaults():
-    return {s.name: s.default for s in SETTINGS}
+    return {s.name: s.default for s in SCHEMA}
 
 
 def parse_settings(text):
@@ -738,7 +744,7 @@ def parse_settings(text):
         if not sep:
             problems.append(f"line {number}: expected name = value")
             continue
-        setting = SETTINGS_BY_NAME.get(name)
+        setting = SCHEMA_BY_NAME.get(name)
         if setting is None:
             problems.append(f"line {number}: unknown setting {name!r}")
             continue
@@ -787,7 +793,7 @@ def render_settings(overrides=None):
         f"# Written by install.sh. Contract version {CONTRACT_VERSION}.",
         "",
     ]
-    for setting in SETTINGS:
+    for setting in SCHEMA:
         value = overrides.get(setting.name, setting.default)
         for chunk in _wrap(setting.summary):
             out.append(f"# {chunk}")

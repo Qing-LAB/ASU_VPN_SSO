@@ -881,7 +881,7 @@ def main():
     # config resolves it and hands over a value, and the privileged side never
     # reads anything an unprivileged account can write.
     parser.add_argument("--dpd", type=int,
-                        default=C.SETTINGS_BY_NAME["dpd"].default,
+                        default=C.SCHEMA_BY_NAME["dpd"].default,
                         help="dead peer detection interval; 0 leaves the"
                              " server's choice alone")
     # Presence is the switch, not the value: an empty string still means "do

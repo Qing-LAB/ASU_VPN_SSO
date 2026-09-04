@@ -148,7 +148,7 @@ jobs:
           # (demonstrated). This reads the value back out of the config a real
           # install produced, which is the only form that cannot be satisfied
           # by the text alone.
-          schema=$(python3 -c 'import importlib.util as u; s=u.spec_from_file_location("c","asuvpn_contract.py"); m=u.module_from_spec(s); s.loader.exec_module(m); print(m.SETTINGS_BY_NAME["server"].default)')
+          schema=$(python3 -c 'import importlib.util as u; s=u.spec_from_file_location("c","asuvpn_contract.py"); m=u.module_from_spec(s); s.loader.exec_module(m); print(m.SCHEMA_BY_NAME["server"].default)')
           # Asked of the contract rather than assumed: the runner exports
           # XDG_CONFIG_HOME, so the config does not land under the throwaway
           # HOME at all, and hardcoding that path made this step fail against

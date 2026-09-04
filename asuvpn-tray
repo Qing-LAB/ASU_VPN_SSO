@@ -121,7 +121,7 @@ def reload_settings():
 
 APP_ID = "asuvpn-tray"
 APP_NAME = "ASU VPN"
-DEFAULT_SERVER = C.SETTINGS_BY_NAME["server"].default
+DEFAULT_SERVER = C.SCHEMA_BY_NAME["server"].default
 HERE = Path(__file__).resolve().parent
 HELPER = HERE / "asuvpn-helper"
 LOG_FILE = _xdg_dir("XDG_CACHE_HOME", ".cache") / "asuvpn" / "session.log"
@@ -667,7 +667,7 @@ def write_setting(name, value):
     it does not exist yet — a config file is the user's, and a program that
     reformats it on every toggle is not one anybody trusts.
     """
-    setting = C.SETTINGS_BY_NAME[name]
+    setting = C.SCHEMA_BY_NAME[name]
     rendered = f"{name} = {setting.render(value)}"
     CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     os.chmod(CONFIG_FILE.parent, 0o700)  # a pre-existing directory keeps 0700 too
@@ -2586,7 +2586,7 @@ class VpnTray(StateMachine):
         """
         interval = SETTINGS["health-interval"]
         if interval <= 0:
-            interval = C.SETTINGS_BY_NAME["health-interval"].default
+            interval = C.SCHEMA_BY_NAME["health-interval"].default
         GLib.timeout_add_seconds(interval, self._health_check)
 
     def _health_check(self):
@@ -3166,7 +3166,7 @@ def run_selftest(argv):
 
 def run_autoreconnect(argv):
     if not argv:
-        print(C.SETTINGS_BY_NAME["autoreconnect"].render(SETTINGS["autoreconnect"]))
+        print(C.SCHEMA_BY_NAME["autoreconnect"].render(SETTINGS["autoreconnect"]))
         return 0
     if len(argv) > 1 or argv[0] not in ("on", "off"):
         print("usage: asuvpn autoreconnect [on|off]", file=sys.stderr)
@@ -3176,7 +3176,7 @@ def run_autoreconnect(argv):
     except OSError as exc:
         print(f"could not change the setting: {exc}", file=sys.stderr)
         return 1
-    print(C.SETTINGS_BY_NAME["autoreconnect"].render(SETTINGS["autoreconnect"]))
+    print(C.SCHEMA_BY_NAME["autoreconnect"].render(SETTINGS["autoreconnect"]))
     return 0
 
 
