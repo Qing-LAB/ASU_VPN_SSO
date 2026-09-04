@@ -1171,6 +1171,19 @@ recovery is:
 nmcli networking off && nmcli networking on
 ```
 
+### Why the sign-in needs its own browser window
+
+`openconnect` can do SAML by itself, handing the login to your normal browser
+with `--external-browser`. That would remove most of what `bootstrap.sh`
+installs — Qt, PyQt6-WebEngine, the Python 3.12 they pin, the compiler that
+builds `lxml`. It was measured, and **ASU's gateway refuses that method**: asked
+for it alone it answers `error 108, does not support the requested
+authentication type`, and only `single-sign-on-v2` — the embedded browser
+`openconnect-sso` drives — is accepted. `asuvpn selftest` re-asks on every run,
+so if that ever changes you will hear it from the self-check rather than from a
+failed sign-in. [DESIGN.md](DESIGN.md#why-openconnect-sso-and-not-openconnects-own-external-browser)
+has the detail.
+
 ### Two upstream quirks worth knowing
 
 **The TOTP prompt.** `openconnect-sso` asks for a TOTP secret on the terminal

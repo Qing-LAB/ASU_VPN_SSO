@@ -173,6 +173,45 @@ sequenceDiagram
 The cookie never appears on a command line, so `ps` cannot show it, and it is
 never written to the log.
 
+### Why openconnect-sso, and not openconnect's own external browser
+
+openconnect can do SAML itself. `--external-browser=BROWSER` hands the login to
+your ordinary browser, listens on `localhost:29786`, and collects the token when
+the browser is redirected back — no embedded browser at all. Taking it would
+delete most of what `bootstrap.sh` installs: PyQt6 and QtWebEngine, the Python
+3.12 that `PyQt6-WebEngine<7` forces, the toolchain that compiles `lxml`, the
+pipx venv and its `setuptools<71` pin. Roughly nineteen of thirty apt packages
+and a from-source build, for one flag.
+
+**ASU's gateway refuses it.** Asked with only that capability on offer, it
+answers:
+
+```
+<error id="108">Your AnyConnect version does not support the requested
+authentication type.</error>
+```
+
+Asked with only `single-sign-on-v2`, it issues an `sso-v2-login` URL and the
+sign-in proceeds. So the embedded browser is not a preference here, it is the
+only method the gateway accepts, and openconnect-sso stays a dependency.
+
+Two traps for whoever revisits this, both of which caught this project once:
+
+The gateway echoes the client's own advertised capabilities back inside
+`<opaque is-for="sg">`. Offering both methods and reading that block looks
+exactly like the server endorsing external-browser — it is the server repeating
+what it was told. The only honest test is to offer *one* method and see whether
+it is accepted, which is what the numbers above are.
+
+And the redirect is the likely reason it is off. The identity provider only ever
+redirects to the gateway's own HTTPS endpoint (`sso-v2-login-final`, the SAML
+ACS URL); it is the gateway that would then redirect to `http://localhost:29786`.
+Cisco has to be configured to allow that plaintext local hop, and ASU's is not.
+
+`asuvpn selftest` asks this question on every run — see *the gateway still
+offers the sign-in method this applet uses*. If ASU ever switches, the
+self-check says so before a user meets an unhelpful sign-in error.
+
 ## The state machine
 
 Eight states, one table, one dispatcher. Everything that can happen — a user

@@ -1428,15 +1428,20 @@ def check_secret_redaction(tray, r):
     The useful half of a line has to survive, or the redaction gets turned off
     the first time somebody needs to debug a connection.
     """
+    # Every value here is deliberately a word rather than anything shaped like
+    # a real token. A fixture that looks like a credential trips secret
+    # scanners, invites a reader to wonder whether it ever was one, and is
+    # exactly the habit that put somebody's resolver in this repository once
+    # already. The regex does not care what the value looks like.
     leaky = [
-        "COOKIE='3311180634@13561856@1339425499@B315A0E29D16C6FD92EE'",
-        "HOST='192.0.2.1' COOKIE=abc123def FINGERPRINT='469bb424'",
-        "GET /?acSamlv2Token=eyJhbGciOiJIUzI1NiJ9.body.signature HTTP/1.1",
-        "Set-Cookie: webvpn=A1B2C3D4; path=/; secure",
-        "sso-token: 0123456789abcdef",
+        "COOKIE='NOT-A-REAL-COOKIE-example-value'",
+        "HOST='192.0.2.1' COOKIE=NOT-A-REAL-COOKIE FINGERPRINT='469bb424'",
+        "GET /?acSamlv2Token=NOT-A-REAL-TOKEN.example.value HTTP/1.1",
+        "Set-Cookie: webvpn=NOT-A-REAL-SESSION; path=/; secure",
+        "sso-token: NOT-A-REAL-SSO-TOKEN",
     ]
-    secrets = ("3311180634", "abc123def", "eyJhbGciOiJIUzI1NiJ9",
-               "A1B2C3D4", "0123456789abcdef")
+    secrets = ("NOT-A-REAL-COOKIE", "NOT-A-REAL-TOKEN",
+               "NOT-A-REAL-SESSION", "NOT-A-REAL-SSO-TOKEN")
     survived = [line for line in leaky
                 for secret in secrets
                 if secret in tray.redact_secrets(line)]
@@ -1444,7 +1449,8 @@ def check_secret_redaction(tray, r):
             not survived,
             f"these still carry their secret after redaction: {survived}")
 
-    kept = tray.redact_secrets("HOST='192.0.2.1' COOKIE=abc123 FINGERPRINT='469bb'")
+    kept = tray.redact_secrets(
+        "HOST='192.0.2.1' COOKIE=NOT-A-REAL-COOKIE FINGERPRINT='469bb'")
     r.check("redaction keeps the half of the line worth reading",
             "192.0.2.1" in kept and "469bb" in kept and "COOKIE" in kept,
             f"got {kept!r} — the key stays visible so the reader knows"
@@ -1929,6 +1935,99 @@ def check_script_variables(binary, r):
         r.info("this openconnect sets no INTERNAL_IP6_DNS: every resolver,"
                " both families, arrives in INTERNAL_IP4_DNS — which is why"
                " they are validated as addresses, not as IPv4 addresses")
+
+
+# The unauthenticated handshake every AnyConnect client makes before any login:
+# "here is what I can do, what do you want?". No credentials are sent and none
+# can be -- there is nothing in this exchange but a capability list.
+SSO_PROBE_TIMEOUT = 10
+SSO_PROBE_REQUEST = (
+    '<?xml version="1.0" encoding="UTF-8"?>\n'
+    '<config-auth client="vpn" type="init" aggregate-auth-version="2">'
+    "<version who=\"vpn\">{version}</version><device-id>linux-64</device-id>"
+    "<capabilities><auth-method>single-sign-on-v2</auth-method></capabilities>"
+    "<group-access>https://{server}/</group-access></config-auth>"
+)
+
+
+def check_sso_method(C, r):
+    """The gateway still offers the sign-in method this applet implements.
+
+    openconnect-sso drives an embedded browser and reads the session cookie out
+    of it, which is the `single-sign-on-v2` method. It is not the only one a
+    Cisco gateway can offer: `single-sign-on-external-browser` hands the login
+    to your normal browser instead, and a gateway configured for that and
+    nothing else would leave every sign-in here failing with an unhelpful
+    error, on a day nobody changed this code.
+
+    So ask. The exchange is the same unauthenticated capability handshake any
+    client makes first, it sends no credentials, and it answers in one line the
+    question that otherwise costs an afternoon: what does this server actually
+    accept? Measured against ASU's gateway, external-browser is refused outright
+    (`error 108`) and v2 is issued -- so this is the method that has to keep
+    working, and this check is what notices if that stops being true.
+
+    Skips rather than fails when the server cannot be reached. A self-check that
+    goes red on a train is one people learn to ignore.
+    """
+    import http.client
+
+    settings, _ = C.load_settings(C.config_path())
+    server = settings.get("server") or C.SETTINGS_BY_NAME["server"].default
+    # The endpoint comes out of a config file the user owns and is about to be
+    # dialled. Held to the same rule install.sh applies to --server: a hostname
+    # and nothing else, so nothing here can carry a path or a credential.
+    if not re.fullmatch(r"[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?", server) \
+            or ".." in server:
+        r.fail("the gateway still offers the sign-in method this applet uses",
+               f"{server!r} in the config is not a plain hostname; refusing to"
+               " turn it into a request")
+        return
+
+    # HTTPSConnection rather than urlopen: it can only speak https, so there is
+    # no scheme to get wrong and no URL for a config value to smuggle one into.
+    # The alternative was a linter suppression on urlopen, which would have
+    # been a promise instead of a guarantee.
+    body = SSO_PROBE_REQUEST.format(version=C.AC_VERSION, server=server)
+    connection = None
+    try:
+        connection = http.client.HTTPSConnection(server,
+                                                 timeout=SSO_PROBE_TIMEOUT)
+        connection.request(
+            "POST", "/", body=body.encode(),
+            headers={"User-Agent": f"AnyConnect Linux_64 {C.AC_VERSION}",
+                     "X-Transcend-Version": "1", "X-Aggregate-Auth": "1",
+                     "X-Support-HTTP-Auth": "true",
+                     "Content-Type": "application/xml; charset=utf-8"})
+        page = connection.getresponse().read(65536).decode("utf-8", "replace")
+    except (OSError, http.client.HTTPException, ValueError) as exc:
+        r.warn(f"{server} still offers the sign-in method this applet uses",
+               f"could not ask it ({exc.__class__.__name__}); offline, behind a"
+               " captive portal, or the endpoint moved. Not a verdict.")
+        return
+    finally:
+        if connection is not None:
+            connection.close()
+
+    if "sso-v2-login" in page:
+        r.ok("the gateway still offers the sign-in method this applet uses",
+             f"{server} issued an sso-v2 login URL")
+        return
+    if "single-sign-on-external-browser" in page and "error id" not in page:
+        r.fail("the gateway still offers the sign-in method this applet uses",
+               f"{server} wants single-sign-on-external-browser, which"
+               " openconnect-sso cannot drive. Sign-in will fail until this"
+               " applet learns openconnect's --external-browser flow.")
+        return
+    if "<form" in page and "password" in page:
+        r.fail("the gateway still offers the sign-in method this applet uses",
+               f"{server} answered with a plain username/password form instead"
+               " of SSO. Either the endpoint changed or the group did; the"
+               " browser sign-in this applet performs will not be used.")
+        return
+    r.fail("the gateway still offers the sign-in method this applet uses",
+           f"{server} answered with neither an sso-v2 login URL nor a"
+           f" recognisable form: {page[:160]!r}")
 
 
 def check_desktop_stack(tray, r):
@@ -2667,6 +2766,7 @@ def main():
         guarded(check_message_catalogue, tray, binary, r)
         guarded(check_standin_catalogue, binary, r)
         guarded(check_script_variables, binary, r)
+        guarded(check_sso_method, C, r)
         guarded(check_desktop_stack, tray, r)
         guarded(check_installed_permissions, C, r)
         guarded(check_install_scripts, C, r)

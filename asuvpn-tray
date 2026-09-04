@@ -311,11 +311,12 @@ ANSI_ESCAPE = re.compile(
 # Secrets must not reach the log, whatever produced the line. Today the session
 # cookie is kept out by construction -- it travels on a pipe into the tray and
 # on stdin to the helper, never argv, never a file -- but "by construction"
-# only covers the paths this project wrote. `openconnect --authenticate` prints
-# COOKIE= on stdout, an error path could put it on stderr, and the
-# external-browser sign-in carries a token back through a redirect URL. This is
-# the last gate before bytes reach the file, so it is the place to enforce it
-# rather than trusting every future producer to remember.
+# only covers the paths this project wrote, and the log also carries lines it
+# merely forwards: openconnect's own output, verbatim. openconnect prints
+# COOKIE= on stdout when it authenticates, and an error path can put a token on
+# stderr, which is pumped straight into the session log. This is the last gate
+# before bytes reach the file, so it is the place to enforce the rule rather
+# than trusting every future producer to remember it.
 #
 # The key is left visible and only the value replaced: a reader needs to know
 # that something was removed, and which something, or the log starts lying by

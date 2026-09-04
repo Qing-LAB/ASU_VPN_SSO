@@ -482,20 +482,6 @@ SETTINGS = (
             "Seconds between dead-peer probes, forced on because some servers"
             " negotiate detection off and then a dropped tunnel looks connected."
             " 0 leaves the server's choice alone."),
-    Setting("browser", "text", "integrated",
-            "Which browser signs you in. 'integrated' runs openconnect-sso,"
-            " which opens its own Qt window -- the default, and the only one"
-            " proven against ASU's Duo. 'external' asks openconnect itself to"
-            " drive your normal browser, which needs no Qt, no PyQt6-WebEngine"
-            " and no Python 3.12, and so removes most of what bootstrap.sh"
-            " installs. It works only where the gateway advertises the"
-            " single-sign-on-external-browser method; `asuvpn selftest` says"
-            " whether yours does. Override once with --browser on the command"
-            " line rather than editing this, if you are just trying it."),
-    Setting("browser-command", "text", "xdg-open",
-            "The program 'external' hands the login URL to. xdg-open picks"
-            " your desktop's default; name a browser directly if you would"
-            " rather sign in somewhere other than your everyday profile."),
     Setting("dns", "bool", True,
             "Hand the resolver the VPN pushes to systemd-resolved as per-link"
             " DNS, with the tunnel's domains routed to it and everything else"
