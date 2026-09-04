@@ -379,8 +379,15 @@ def check_owner_is_a_principal(C, r):
         os.chmod(path, 0o644)
         mine = os.stat(path).st_uid
 
+        # The set deliberately does not contain 0, though every real caller's
+        # does: run as root -- which is how the container jobs run, and how
+        # this first failed -- the owner *is* root, so {0, mine + 1} trusts it
+        # and the check proved nothing. What is being asserted is the rule,
+        # "an owner outside the trusted set is refused", so the fixture has to
+        # build a set that genuinely excludes this file's owner whoever that
+        # turns out to be.
         r.check("a file owned by an untrusted uid is refused",
-                C.unsafe_write_access(path, trusted_uids={0, mine + 1}) is not None,
+                C.unsafe_write_access(path, trusted_uids={mine + 1}) is not None,
                 "a 0644 file owned by somebody else is writable by them"
                 " whenever they like; running it as root is the whole hazard"
                 " this gate exists for")
