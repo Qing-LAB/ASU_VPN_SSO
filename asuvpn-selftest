@@ -203,11 +203,26 @@ def load(name, filename):
     """
     path = os.path.join(HERE, filename)
     if os.geteuid() == 0:
+        # Ownership, not only mode -- and here rather than in main(), which is
+        # where this check used to live *alone*. main() runs long after this
+        # function has already executed the file as root, so a contract owned
+        # by another user was run and only then refused. An owner can rewrite
+        # their own file whatever its mode, so the two questions are one
+        # question and both have to be asked before exec_module.
+        trusted = {0}
+        try:
+            trusted.add(int(os.environ["PKEXEC_UID"]))
+        except (KeyError, ValueError):
+            pass
         for target in (HERE, path):
             info = os.stat(target)
             if info.st_mode & stat.S_IWOTH or (
                     info.st_mode & stat.S_IWGRP and info.st_gid != info.st_uid):
                 raise SystemExit(f"refusing to load {target}: writable by others")
+            if info.st_uid not in trusted:
+                raise SystemExit(
+                    f"refusing to load {target}: owned by uid {info.st_uid},"
+                    " who is neither root nor the user asking for this")
     loader = importlib.machinery.SourceFileLoader(name, path)
     spec = importlib.util.spec_from_loader(name, loader)
     module = importlib.util.module_from_spec(spec)
@@ -2926,21 +2941,38 @@ def check_fatal_reporting(r):
     if not os.access(path, os.X_OK):
         r.warn("a refused connect explains itself", f"{path} not executable")
         return
+    host, pin = "https://example.invalid", "pin-sha256:x"
     cases = [
-        (["--", "--background"], "an option that would detach openconnect", 25),
-        (["--", "--interface", "../../etc/passwd"],
+        ([host, pin, "--", "--background"],
+         "an option that would detach openconnect", 25),
+        ([host, pin, "--", "--interface", "../../etc/passwd"],
          "an impossible device name", 22),
         # lo exists on every machine this runs on, and refusing to take over
         # a device this session did not create is what keeps `--interface
         # docker0` from having root delete the caller's bridge at teardown.
-        (["--", "--interface", "lo"], "a device this session did not create", 23),
+        ([host, pin, "--", "--interface", "lo"],
+         "a device this session did not create", 23),
+        # The door beside the blocklist. --host is the last element of
+        # openconnect's argv and getopt_long permutes, so these are options to
+        # the program that receives them -- the first being the very one the
+        # blocklist exists for, and the second re-admitting all of them from a
+        # file. Neither passed through unsupported_option(), which only ever
+        # saw the arguments after "--".
+        # The `=` spelling, deliberately: argparse rejects `--host -b` on its
+        # own, because it reads the -b as an option of its own, so the space
+        # form never reaches the helper's argv at all and testing it would
+        # prove nothing about this check.
+        (["-b", pin], "a gateway that is really --background", 28),
+        (["--config=/tmp/asuvpn-not-a-real-file", pin],
+         "a gateway that is really --config", 28),
+        ([host, "-b"], "a certificate pin that is really an option", 28),
     ]
     unmarked = []
-    for extra, label, expected_rc in cases:
+    for argv, label, expected_rc in cases:
         try:
             out = subprocess.run(
-                [path, "--host", "https://example.invalid",
-                 "--fingerprint", "pin-sha256:x", *extra],
+                [path, f"--host={argv[0]}", f"--fingerprint={argv[1]}",
+                 *argv[2:]],
                 input="not-a-real-cookie\n", capture_output=True,
                 text=True, timeout=30)
         except (OSError, subprocess.SubprocessError) as exc:
@@ -2955,6 +2987,24 @@ def check_fatal_reporting(r):
                             f" (expected {expected_rc}) out={out.stdout!r}")
     r.check("a refused connect explains itself rather than exiting a number",
             not unmarked, "; ".join(unmarked))
+
+    # And the other direction, without which the six refusals above would be
+    # satisfied by a helper that refuses everything: an ordinary gateway and
+    # an ordinary pin must get past these checks and fail later, on the
+    # missing cookie.
+    try:
+        ordinary = subprocess.run(
+            [path, "--host", "vpn.example.edu", "--fingerprint",
+             "pin-sha256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="],
+            input="\n", capture_output=True, text=True, timeout=30)
+        r.check("an ordinary gateway and pin are not caught by those refusals",
+                ordinary.returncode == 21,
+                f"rc={ordinary.returncode} (expected 21, the missing cookie)"
+                f" out={ordinary.stdout!r} — a validator that refuses real"
+                " sign-ins would break every connect")
+    except (OSError, subprocess.SubprocessError) as exc:
+        r.warn("an ordinary gateway and pin are not caught by those refusals",
+               str(exc))
 
 
 def check_event_translation(helper, tray, C, r):

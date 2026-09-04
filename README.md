@@ -385,8 +385,9 @@ so this does not depend on how any of them happen to be worded:
 | `23` | that interface already exists, and it was not created by this session |
 | `24` | no free `asuvpnN` name (a hundred tunnels is not a real scenario) |
 | `25` | an option was passed that would detach `openconnect` from the helper |
-| `26` | the helper, its directory, `asuvpn-notify` or the shared `asuvpn_contract.py` is writable by someone else |
+| `26` | the helper, its directory, `asuvpn-notify` or the shared `asuvpn_contract.py` is writable by someone else, or owned by someone else |
 | `27` | a negative dead-peer interval was passed |
+| `28` | `--host` or `--fingerprint` was not one — a value that `openconnect` would read as an option rather than as a server |
 
 ```bash
 asuvpn status >/dev/null || asuvpn connect --wait
@@ -543,12 +544,22 @@ reach it — and every message carries a per-session token, so two concurrent
 sessions cannot be confused for one another.
 
 Before doing any of that, the helper **refuses to run** if itself, its
-directory, `asuvpn-notify` or `asuvpn_contract.py` is world-writable or
-writable by a shared group. That turns
+directory, `asuvpn-notify` or `asuvpn_contract.py` is world-writable, writable
+by a shared group, **or owned by anyone but you or root**. Permissions say who
+may write a file *besides* its owner; an owner rewrites their own file whenever
+they like, so ownership is part of the same question rather than a separate
+one, and `install.sh --link` from a checkout somebody else owns is a documented
+way to arrive there. That turns
 the caveat below from something you have to remember into something enforced. A
 user-private group is not treated as a finding: Debian and Ubuntu default to
 umask 002, so an ordinary checkout is `0775` with `gid == uid` and the "group"
 is one person.
+
+The ownership half is asked *before* `asuvpn_contract.py` is executed, not
+after. It used to be asked only in `main()`, which runs long after the module
+has been imported — so a contract owned by another user was run as root and
+refused afterwards. `sec.sh` case (e3) stages exactly that, with a payload, so
+"refused" has to mean "did not run".
 
 ### What it never does
 

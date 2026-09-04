@@ -48,8 +48,11 @@ the only version question with an answer.
 
 **In scope** — anything that crosses a privilege or user boundary:
 
-- the root helper (`asuvpn-helper`) and the `vpnc-script` wrapper
-  (`asuvpn-notify`), both of which run as root under `pkexec`;
+- the root helper (`asuvpn-helper`), which runs under `pkexec`, and the
+  `vpnc-script` wrapper (`asuvpn-notify`), which runs as root because
+  `openconnect` executes it — a different way in, and worth keeping distinct:
+  `asuvpn-notify` is reached with an environment the gateway has a hand in,
+  never through a polkit dialog;
 - the polkit action, and anything that widens what it authorises;
 - the control socket's uid gate — it is an abstract socket with no file
   permissions, so `SO_PEERCRED` is the only thing between another local

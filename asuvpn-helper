@@ -65,11 +65,26 @@ def _contract():
     here = os.path.dirname(os.path.abspath(__file__))
     path = os.path.join(here, "asuvpn_contract.py")
     if os.geteuid() == 0:
+        # Ownership, not only mode -- and here rather than in main(), which is
+        # where this check used to live *alone*. main() runs long after this
+        # function has already executed the file as root, so a contract owned
+        # by another user was run and only then refused. An owner can rewrite
+        # their own file whatever its mode, so the two questions are one
+        # question and both have to be asked before exec_module.
+        trusted = {0}
+        try:
+            trusted.add(int(os.environ["PKEXEC_UID"]))
+        except (KeyError, ValueError):
+            pass
         for target in (here, path):
             info = os.stat(target)
             if info.st_mode & stat.S_IWOTH or (
                     info.st_mode & stat.S_IWGRP and info.st_gid != info.st_uid):
                 raise SystemExit(f"refusing to load {target}: writable by others")
+            if info.st_uid not in trusted:
+                raise SystemExit(
+                    f"refusing to load {target}: owned by uid {info.st_uid},"
+                    " who is neither root nor the user asking for this")
     loader = importlib.machinery.SourceFileLoader("asuvpn_contract", path)
     spec = importlib.util.spec_from_loader("asuvpn_contract", loader)
     module = importlib.util.module_from_spec(spec)
@@ -829,6 +844,20 @@ def main():
         if reason:
             fatal(f"refusing to run: {path} is {reason}")
             return 26
+
+    # Before anything is spawned, and separately from UNSUPPORTED_OPTIONS,
+    # which only ever inspected the passthrough arguments. --host lands as the
+    # last element of openconnect's argv and getopt_long permutes, so a value
+    # beginning with "-" is read as an option there -- including --background,
+    # the one option the blocklist exists for, and --config, which re-admits
+    # all the others out of a file. The blocklist was guarding one door.
+    if not C.valid_gateway(args.host):
+        fatal(f"refusing a gateway that is not a server name: {args.host!r}")
+        return 28
+    if not C.valid_fingerprint(args.fingerprint):
+        fatal("refusing a certificate pin that is not one:"
+              f" {args.fingerprint!r}")
+        return 28
 
     openconnect = find_openconnect()
     if not openconnect:

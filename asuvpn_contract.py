@@ -256,6 +256,40 @@ REASON_STATES = {
 # interpolated into a path under /sys. \Z, not $: a dollar also matches just
 # before a trailing newline, so "asuvpn0\n" passed as a device name.
 INTERFACE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,14}\Z")
+
+# A gateway, as the sign-in hands it over and as openconnect will be given it.
+#
+# Anchored, and it must not start with "-". That is the whole point: this value
+# becomes the *last* element of a root command line, and getopt_long permutes,
+# so openconnect reads options that follow the server just as it reads ones
+# before it -- measured, not assumed. A --host of "-b" is therefore not a
+# server at all but --background, which fork()s away from PR_SET_PDEATHSIG and
+# leaves a root openconnect nothing can reach, and "--config=/tmp/opts"
+# re-admits every option UNSUPPORTED_OPTIONS exists to refuse. The blocklist
+# only ever saw the passthrough arguments, so this door stood open beside it.
+#
+# The scheme is optional because the helper accepts a bare hostname too, and
+# host_domain() already copes with both.
+GATEWAY_RE = re.compile(r"^(?:https?://)?"
+                        r"[A-Za-z0-9]([A-Za-z0-9._-]{0,252}[A-Za-z0-9])?"
+                        r"(?::[0-9]{1,5})?"
+                        r"(?:[/?][A-Za-z0-9._~!$&'()*+,;=:@%/?-]*)?\Z")
+
+# The certificate pin. It cannot become an option -- openconnect takes it as
+# the argument of --servercert, whatever it looks like -- so this is narrower
+# than it needs to be for safety and exists to catch a sign-in that returned
+# something other than a pin.
+FINGERPRINT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9:+/=_.-]{0,200}\Z")
+
+
+def valid_gateway(value):
+    """Is this safe to hand a root openconnect as the server to connect to?"""
+    return bool(GATEWAY_RE.match(str(value or "").strip()))
+
+
+def valid_fingerprint(value):
+    """Does this look like a certificate pin rather than anything else?"""
+    return bool(FINGERPRINT_RE.match(str(value or "").strip()))
 INTERFACE_PREFIX = "asuvpn"
 
 # What we present to the gateway. Both the tray (which passes it) and the

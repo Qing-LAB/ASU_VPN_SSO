@@ -74,6 +74,34 @@ out="$(helper_run)"; rc=$?
 echo "$out" | head -2 | sed 's/^/      /'
 chmod 0755 "$A/asuvpn-notify"
 refused "a world-writable asuvpn-notify" "$rc" "$out"
+echo "--- e3) contract owned by another uid, writable by nobody else ---"
+# The mode bits say who may write a file *besides* its owner; they say nothing
+# about who the owner is, and an owner rewrites their own file whenever they
+# like. install.sh --link from a checkout somebody else owns is a documented
+# way to arrive here.
+#
+# Staged with a payload, and that is the point of this case rather than a
+# neater one: the ownership question used to be asked in main(), which runs
+# long after _contract() has already executed the file as root at import. A
+# case that only checked the exit code would have passed against that. The
+# marker is what tells "refused" from "refused afterwards".
+marker="$SB/e3-executed"
+rm -f "$marker"
+cp "$A/asuvpn_contract.py" "$A/real_contract.py"
+{ printf 'import pathlib; pathlib.Path(%s).write_text("ran")\n' "\"$marker\"";
+  cat "$A/real_contract.py"; } > "$A/asuvpn_contract.py"
+chown 65534 "$A/asuvpn_contract.py" \
+    || { echo "      FAIL: cannot stage a second uid; is enter.sh mapping subuids?"; exit 1; }
+chmod 0644 "$A/asuvpn_contract.py"
+out="$(helper_run)"; rc=$?
+echo "$out" | head -2 | sed 's/^/      /'
+rm -f "$A/asuvpn_contract.py"; mv "$A/real_contract.py" "$A/asuvpn_contract.py"
+if [ -e "$marker" ]; then
+    rm -f "$marker"
+    echo "      FAIL: the foreign-owned contract RAN as root before being refused" >&2
+    exit 1
+fi
+refused "a contract owned by another uid" "$rc" "$out"
 # There is no case (e): the dpd refusals that carried the letter moved to
 # sec3.sh, and the letters after it are cross-referenced from sec2.sh and
 # the design notes, so they keep their names; e2 fills the hole with the
