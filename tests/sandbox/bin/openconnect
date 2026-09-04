@@ -84,7 +84,38 @@ while not state["stop"]:
     time.sleep(0.05)
 trace("left the wait loop; running the disconnect script")
 run_script("disconnect"); trace("disconnect script returned")
-say("[stand-in] logout sent")
-say(f"[stand-in] nudges received: {state['nudges']}")
+# One trace per write. The failure this narrows is a process still alive and
+# sleeping after the disconnect script returned, which leaves exactly these two
+# statements -- and "which of the two" is the whole question.
+# These last two writes go down the same pipe as everything else, and by now
+# the helper that reads it has been SIGKILLed. What happens then is not the
+# same on every machine, which is what made this scenario look flaky:
+#
+#   here      the write raises BrokenPipeError, the process dies, test passes
+#   a runner  the write *blocks* and the process sleeps for ever, test fails
+#             with "openconnect outlived its dead helper" -- against a guard
+#             that had worked perfectly
+#
+# The per-write traces above located it exactly: the log stops at "about to
+# say" and never reaches "said". A real openconnect cannot be wedged by a log
+# line and neither should its stand-in be, so the last words get two seconds
+# and are allowed to fail. The scenario then measures the thing it exists to
+# measure -- did the death signal kill this process -- rather than how the
+# kernel felt about a doomed write.
+def _too_slow(_s, _f):
+    raise TimeoutError("stdout is not draining")
+
+
+signal.signal(signal.SIGALRM, _too_slow)
+try:
+    signal.alarm(2)
+    trace("about to say: logout sent")
+    say("[stand-in] logout sent")
+    say(f"[stand-in] nudges received: {state['nudges']}")
+    trace("said both lines")
+except (OSError, TimeoutError, ValueError) as exc:
+    trace(f"could not say the last lines ({exc.__class__.__name__}); exiting anyway")
+finally:
+    signal.alarm(0)
 trace("exiting 0")
 sys.exit(0)

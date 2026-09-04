@@ -68,6 +68,13 @@ if [ "$survived" -ne 0 ]; then
   sed 's/^/    /' "$HLOG" >&2 || true
   echo "  --- the survivor, for the record ---" >&2
   tr '\0' ' ' < "/proc/$OC/cmdline" >&2; echo >&2
+  # Where it is blocked, not merely that it is. wchan names the kernel
+  # function it is sleeping in and syscall gives the number and arguments --
+  # between them they say whether this is a write to a pipe nobody is draining
+  # or something else entirely.
+  printf '    wchan:\t%s\n' "$(cat "/proc/$OC/wchan" 2>/dev/null || echo '?')" >&2
+  printf '    syscall:\t%s\n' "$(cat "/proc/$OC/syscall" 2>/dev/null || echo '?')" >&2
+  printf '    fd 1:\t%s\n' "$(readlink "/proc/$OC/fd/1" 2>/dev/null || echo '?')" >&2
   grep -E '^(Name|State|PPid|SigCgt|SigIgn|SigBlk|Uid)' "/proc/$OC/status" \
     | sed 's/^/    /' >&2
   kill -9 "$OC" 2>/dev/null
