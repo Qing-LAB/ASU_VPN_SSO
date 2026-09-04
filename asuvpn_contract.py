@@ -420,9 +420,9 @@ def parent_domain(host):
     domain, and DNS that plainly does not resolve, than a domain so broad that
     every query on the machine is sent down the tunnel.
 
-    An address is not a name. DOMAIN_RE accepts "129.219.1.1" -- every label is
+    An address is not a name. DOMAIN_RE accepts "192.0.2.10" -- every label is
     alphanumeric -- so without this an endpoint configured by IP produced the
-    routing domain "219.1.1": a name nothing will ever match, silently scoping
+    routing domain "0.2.10": a name nothing will ever match, silently scoping
     the link to nothing while the log reported success. Refusing here falls
     through to the no-domains branch, which at least resolves.
 

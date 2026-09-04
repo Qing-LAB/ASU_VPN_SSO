@@ -393,7 +393,7 @@ def check_owner_is_a_principal(C, r):
                 "with no trusted set there is no privilege being granted, so"
                 " ownership is not the caller's business")
 
-        os.chmod(path, 0o646)
+        os.chmod(path, 0o646)  # noqa: S103 - the hazard is the point here
         r.check("world-writable still wins over the ownership test",
                 C.unsafe_write_access(path, trusted_uids={0, mine})
                 == "world-writable",
