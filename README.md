@@ -1367,6 +1367,15 @@ the middle one is the point:
 | `environment` | Our assumptions put to the installed binaries — that `openconnect` exists, that it *gives up retrying* rather than trying forever (the fact the rebuild rests on, read back out of its own `--help`), that the `vpnc-script` it names is executable and handles every `reason` we send, that our fallback log patterns still appear in its message catalogue, that the split-DNS variables the handover reads are still named what we think, and that nothing the helper runs as root is writable by anyone else |
 | `wiring` | `asuvpn-notify` actually executed: the event arrives with the right token and fields, the real `vpnc-script` still runs with its environment intact, the token is scrubbed before it sees it, no event can emit more than one line — and the DNS handover driven against a stand-in `resolvectl`, asserting the call order, the revert on every failure path, and that a failure always leaves the stock script its DNS job |
 
+CI adds one thing the three tiers cannot do on a single machine: it runs the
+`logic` tier inside Fedora, Arch and Debian containers. That tier is pure
+Python — the GUI stack is imported behind a `try`/`except`, so a machine with
+no GTK at all still loads every module and runs the contract, the state machine
+and the split-DNS rules. It proves the portable half is portable. It proves
+nothing about the tray on those distributions: no GTK, no `openconnect`, no
+`pkexec` is exercised there, and `bootstrap.sh` still installs packages on apt
+only.
+
 The environment tier reads the installed `libopenconnect`'s own strings, so
 `asuvpn selftest` is what tells you the fallback patterns have gone stale on
 some future release, instead of finding out during an outage.

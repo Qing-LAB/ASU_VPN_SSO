@@ -110,3 +110,44 @@ jobs:
             *) echo "the wheel is $built but the install reports $reported" >&2
                exit 1 ;;
           esac
+
+  # Proves the portable half is portable, and claims nothing more. The logic
+  # tier is pure Python: it drives the contract, the state machine and the
+  # split-DNS rules without a desktop, a display or a package manager -- the
+  # tray's GUI stack is imported behind a try/except, so a machine with no GTK
+  # at all still loads every module and runs 100+ checks.
+  #
+  # This does NOT show the applet works on these distributions. Nothing here
+  # exercises GTK, AppIndicator, openconnect or pkexec, and bootstrap.sh still
+  # installs packages on apt only. What it catches is the thing that would
+  # otherwise be found by a stranger: a Debian-shaped assumption compiled into
+  # the Python.
+  portable:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false          # one distribution failing must not hide the rest
+      matrix:
+        image: ["fedora:41", "archlinux:latest", "debian:12"]
+    container: ${{ matrix.image }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: a python3 to run it with
+        run: |
+          if command -v python3 >/dev/null; then
+            echo "already present: $(python3 -V)"
+          elif command -v dnf >/dev/null; then
+            dnf install -y python3
+          elif command -v pacman >/dev/null; then
+            pacman -Sy --noconfirm python
+          elif command -v apt-get >/dev/null; then
+            apt-get update -qq && apt-get install -y --no-install-recommends python3
+          else
+            echo "no package manager recognised in this image" >&2; exit 1
+          fi
+          python3 -V
+
+      - name: the logic tier, on a machine with no desktop at all
+        run: python3 -I asuvpn-selftest --tier logic
+
