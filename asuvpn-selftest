@@ -220,20 +220,40 @@ def check_option_blocklist(helper, r):
     refuse = [
         "--background", "-b", "-bv", "-vb", "--syslog", "-l", "-lv",
         "--pid-file", "--pid-file=/tmp/x", "--cookieonly", "--authenticate",
+        # Abbreviations. getopt_long takes any unambiguous prefix, so an
+        # exact-spelling blocklist stopped --background and waved --backg
+        # through -- measured against the installed binary, which accepts
+        # --backgroun, --backg and --syslo while rejecting --zzzz. This whole
+        # list existed to keep openconnect supervised and did not.
+        "--backgroun", "--backg", "--b", "--syslo", "--pid-fi",
+        "--cookieonl", "--authenticat",
+        # Reads more options out of a file, so it defeats any argv check.
+        "--config", "--config=/tmp/x",
+        # No tun device to own, so teardown has nothing to restore.
+        "-S", "--script-tun",
+        # An arbitrary program run as root during the trojan phase.
+        "--csd-wrapper", "--csd-wrapper=/tmp/x",
     ]
-    allow = ["-v", "-i", "--interface", "lo", "--script", "-s", "-4", "--os=linux-64"]
+    # --script must survive the abbreviation test even though --script-tun is
+    # blocked: chaining a caller's own vpnc-script is a deliberate extension
+    # point, and getopt_long itself prefers an exact match to a longer option.
+    allow = ["-v", "-i", "--interface", "lo", "--script", "--script=/tmp/s",
+             "-s", "-4", "--os=linux-64", "--servercert", "--protocol=anyconnect"]
     missed = [o for o in refuse if helper.unsupported_option(o) is None]
     r.check(
         "supervision-breaking options are refused, bundles included",
         not missed,
-        f"accepted: {', '.join(missed)} — getopt reads -bv as -b -v, so a bundle"
-        " can smuggle in --background and openconnect then daemonises",
+        f"accepted: {', '.join(missed)} — getopt reads -bv as -b -v and takes"
+        " --backg for --background, so either can smuggle in a daemonised"
+        " openconnect that fork() detaches from PR_SET_PDEATHSIG",
     )
     wrong = [o for o in allow if helper.unsupported_option(o) is not None]
     r.check(
         "ordinary options are still allowed through",
         not wrong,
-        f"wrongly refused: {', '.join(wrong)}",
+        f"wrongly refused: {', '.join(wrong)} — --script in particular is an"
+        " extension point this helper chains through, not an abbreviation of"
+        " --script-tun",
     )
 
 
@@ -334,6 +354,50 @@ def check_permission_rules(C, r):
             os.chown(d, -1, os.getgid())
         # Restored to a sane mode before the directory is removed.
         os.chmod(d, 0o755)  # nosec B103  # noqa: S103
+
+
+def check_owner_is_a_principal(C, r):
+    """A file another user owns is not safe to run as root, however tidy it is.
+
+    The permission bits say who may write a file *besides* its owner. They say
+    nothing about who the owner is -- and an owner may rewrite their own file
+    whatever the mode. So a 0644 file belonging to somebody else passed this
+    gate for as long as it only looked at permissions, and `install.sh --link`
+    from a checkout another user owns is a documented way to arrive there. The
+    next thing they wrote would run as root at the next connect.
+
+    The uid set is passed in because only the caller knows which human is
+    asking: under pkexec that is PKEXEC_UID, not geteuid().
+    """
+    import os
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as directory:
+        path = os.path.join(directory, "asuvpn-helper")
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write("#!/usr/bin/python3\n")
+        os.chmod(path, 0o644)
+        mine = os.stat(path).st_uid
+
+        r.check("a file owned by an untrusted uid is refused",
+                C.unsafe_write_access(path, trusted_uids={0, mine + 1}) is not None,
+                "a 0644 file owned by somebody else is writable by them"
+                " whenever they like; running it as root is the whole hazard"
+                " this gate exists for")
+        r.check("our own file, and root's, are accepted",
+                C.unsafe_write_access(path, trusted_uids={0, mine}) is None,
+                "the documented design is that the invoking user owns these"
+                " files; refusing that would refuse every ordinary install")
+        r.check("an unprivileged caller is not asked the ownership question",
+                C.unsafe_write_access(path) is None,
+                "with no trusted set there is no privilege being granted, so"
+                " ownership is not the caller's business")
+
+        os.chmod(path, 0o646)
+        r.check("world-writable still wins over the ownership test",
+                C.unsafe_write_access(path, trusted_uids={0, mine})
+                == "world-writable",
+                "the older, blunter finding must not be masked by the new one")
 
 
 def check_tunnel_health(tray, r):
@@ -2035,9 +2099,18 @@ def check_sso_method(C, r):
                " of SSO. Either the endpoint changed or the group did; the"
                " browser sign-in this applet performs will not be used.")
         return
-    r.fail("the gateway still offers the sign-in method this applet uses",
-           f"{server} answered with neither an sso-v2 login URL nor a"
-           f" recognisable form: {page[:160]!r}")
+    # Warn, not fail. The two branches above are definite -- the gateway named
+    # a method, and it was the wrong one. This is the leftover: a body we do
+    # not recognise. That is far more likely to be a load balancer, a rate
+    # limit, a captive portal or a truncated read than a real change at the far
+    # end, and I watched exactly one such run go red here today against a
+    # gateway that was fine a second later. The same reasoning already governs
+    # the unreachable case a few lines up; an answer we cannot parse is no more
+    # of a verdict than no answer at all, and a check that reddens on its own
+    # is one people stop reading.
+    r.warn(f"{server} still offers the sign-in method this applet uses",
+           f"answered with neither an sso-v2 login URL nor a recognisable"
+           f" form, so this run proves nothing either way: {page[:160]!r}")
 
 
 def check_desktop_stack(tray, r):
@@ -2754,6 +2827,7 @@ def main():
         guarded(check_log_scrubbing, tray, r)
         guarded(check_secret_redaction, tray, r)
         guarded(check_log_write_path, tray, r)
+        guarded(check_owner_is_a_principal, C, r)
         guarded(check_tunnel_health, tray, r)
         guarded(check_demotion_rules, tray, r)
         guarded(check_teardown_rows, tray, r)

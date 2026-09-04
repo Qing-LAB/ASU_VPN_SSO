@@ -103,7 +103,24 @@ UNSUPPORTED_OPTIONS = (
     "-l", "--syslog",
     "--pid-file",
     "--cookieonly", "--authenticate",
+    # Reads further options out of a file, so it defeats any check made against
+    # argv. Everything above could be smuggled back in through it.
+    "--config",
+    # Replaces the tunnel with a pipe to a program of the caller's choosing;
+    # there is then no device for teardown to own and no routing to restore.
+    "-S", "--script-tun",
+    # Runs an arbitrary program as root during the trojan/CSD phase.
+    "--csd-wrapper",
 )
+# Every long form above, for the prefix test below.
+UNSUPPORTED_LONG = tuple(o for o in UNSUPPORTED_OPTIONS if o.startswith("--"))
+# Real options that happen to be prefixes of blocked ones, and must survive the
+# abbreviation test. getopt_long does the same: an exact match wins even when a
+# longer option starts with it, so `--script` reaches openconnect as --script
+# and never as an abbreviation of --script-tun. Only --script qualifies today,
+# and it has to: chaining a caller's own vpnc-script is a deliberate extension
+# point of this helper, not an oversight.
+PERMITTED_EXACT = ("--script",)
 # getopt_long bundles short options, so -bv is -b -v and slips straight past a
 # comparison against whole argv elements -- which is how --background got in
 # after all, taking openconnect out of this helper's supervision. Working out
@@ -111,6 +128,17 @@ UNSUPPORTED_OPTIONS = (
 # reimplementing getopt against a table that changes between releases, so
 # bundles are refused instead and the message says how to rewrite them.
 BUNDLED_SHORT_RE = re.compile(r"^-[A-Za-z]{2,}$")
+
+# The same lesson a second time, and it had not been learned: getopt_long also
+# accepts any *unambiguous abbreviation* of a long option. Measured against the
+# installed binary, `--backgroun`, `--backg` and `--syslo` are all accepted
+# while `--zzzz` is rejected -- so an exact-spelling blocklist stopped
+# `--background` and waved `--backg` through, and with it a root openconnect
+# that fork() detaches from this helper's supervision, PR_SET_PDEATHSIG cleared,
+# nothing able to reach it. Abbreviations are refused wholesale rather than
+# resolved: deciding whether one is ambiguous means knowing openconnect's whole
+# option table, which changes between releases. A user who meant a different
+# option can spell it in full.
 
 syslog.openlog("asuvpn-helper", syslog.LOG_PID, syslog.LOG_DAEMON)
 
@@ -130,6 +158,12 @@ def unsupported_option(option):
     name = option.split("=", 1)[0]
     if name in UNSUPPORTED_OPTIONS:
         return f"refusing {name}: it would detach openconnect from this helper"
+    if name.startswith("--") and len(name) > 2 and name not in PERMITTED_EXACT:
+        for blocked in UNSUPPORTED_LONG:
+            if blocked.startswith(name):
+                return (f"refusing {name}: getopt_long accepts it as an"
+                        f" abbreviation of {blocked}, which cannot be"
+                        " supervised. Spell the option you meant in full.")
     if BUNDLED_SHORT_RE.match(option):
         return (f"refusing {option}: bundled short options cannot be checked"
                 " here, because getopt reads -bv as -b -v. Pass them one at a"
@@ -733,8 +767,22 @@ def main():
     # list because it is executed too: the bootstrap checked it before loading,
     # and stating it here as well keeps the whole set visible in one place
     # rather than split between a loader and a main().
+    #
+    # Ownership is part of the question, not just permissions. "The
+    # unprivileged user owns it" is the design; *which* unprivileged user is
+    # the thing to check, because an owner can rewrite their own file whatever
+    # its mode. pkexec puts the caller's real uid in PKEXEC_UID; root is
+    # allowed too, since a root-owned install is strictly safer than the
+    # documented one. If PKEXEC_UID is absent or unparseable we are not under
+    # pkexec, so fall back to the real uid -- and never to an empty set, which
+    # would refuse every path.
+    trusted = {0}
+    try:
+        trusted.add(int(os.environ["PKEXEC_UID"]))
+    except (KeyError, ValueError):
+        trusted.add(os.getuid())
     for path in (HERE, os.path.abspath(__file__), NOTIFY, CONTRACT):
-        reason = C.unsafe_write_access(path)
+        reason = C.unsafe_write_access(path, trusted_uids=trusted)
         if reason:
             fatal(f"refusing to run: {path} is {reason}")
             return 26

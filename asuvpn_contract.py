@@ -47,14 +47,28 @@ CONTRACT_VERSION = 2
 # --------------------------------------------------------------- permissions
 
 
-def unsafe_write_access(path):
-    """Why `path` is writable by a principal other than its owner, or None.
+def unsafe_write_access(path, trusted_uids=None):
+    """Why `path` may be written by somebody we do not trust, or None.
 
     Group-writable is not automatically a finding. Debian and Ubuntu default to
     umask 002 with user-private groups, so a plain git checkout is 0775 with
     gid == uid — the "group" is one person, and refusing there would break
     --link mode for no gain. A *shared* group is a second principal, and
     world-writable always is.
+
+    **The owner is a principal too.** The mode bits say who *besides* the owner
+    may write; they say nothing about who the owner is, and an owner may always
+    rewrite their own file whatever the mode. So a file belonging to another
+    user at a perfectly ordinary 0644 passed this test for as long as it only
+    looked at permissions — and `install.sh --link` from a checkout somebody
+    else owns is a documented, supported way to arrive at exactly that. Their
+    next edit would then run as root at our next connect.
+
+    `trusted_uids` is who may own it: root, and the human who invoked us. It is
+    passed in rather than discovered here because only the caller knows which
+    human that is — under pkexec it is PKEXEC_UID, not geteuid(). When it is
+    None the ownership question is not asked at all, which is right for an
+    unprivileged caller checking its own files.
     """
     try:
         st = os.stat(path)
@@ -64,6 +78,9 @@ def unsafe_write_access(path):
         return "world-writable"
     if st.st_mode & stat.S_IWGRP and st.st_gid != st.st_uid:
         return f"writable by group {st.st_gid}"
+    if trusted_uids is not None and st.st_uid not in trusted_uids:
+        return (f"owned by uid {st.st_uid}, who is neither root nor the user"
+                " asking for this — its owner can rewrite it at any time")
     return None
 
 

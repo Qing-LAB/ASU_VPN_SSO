@@ -70,9 +70,15 @@ the only version question with an answer.
   repository, and please do not test against it as though it were;
 - the user editing files they own that later run as root. That is the
   documented design: the helper lives in a directory you own, so you and root
-  are the same principal here. A *second* account being able to write those
-  files **is** in scope, and the helper already refuses to run in that case —
-  see [`unsafe_write_access`](asuvpn_contract.py) and the `sec.sh` scenario.
+  are the same principal here. A *second* account reaching those files **is**
+  in scope, in either of two ways — being able to write them, or owning them —
+  and the helper refuses both: `unsafe_write_access` rejects world- and
+  shared-group-writable paths, and, when the caller is privileged, any path
+  owned by a uid that is neither root nor the person who invoked `pkexec`. An
+  owner can rewrite their own file whatever its permissions, so ownership is
+  part of the question and not a separate one. See
+  [`asuvpn_contract.py`](asuvpn_contract.py), the `sec.sh` scenario, and the
+  logic tier's ownership checks.
 
 ## Where the design is written down
 
