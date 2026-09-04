@@ -1108,7 +1108,7 @@ the log. Wording is not an interface, here either.
 | `25` | a refused option: one that would detach `openconnect` from the helper (`--background`, `--syslog`, `--pid-file`), one that runs a program as root (`--csd-wrapper`), one that reads more options from a file (`--config`), one that leaves no device to tear down (`--script-tun`), a bundled short option, **or any unambiguous abbreviation of those** — `getopt_long` accepts `--backg`, so refusing only the full spelling refused nothing. `--script` is the one exact spelling that is permitted, being the extension point the helper itself chains through |
 | `26` | the helper, its directory, `asuvpn-notify` or `asuvpn_contract.py` is writable by another principal |
 | `27` | a negative dead-peer interval reached the helper; the config parser cannot produce one, so it came from a direct caller |
-| `28` | `--host` or `--fingerprint` was not one. `--host` becomes the last element of `openconnect`'s argv and `getopt_long` permutes, so a value starting with `-` is an *option* there — `-b` is `--background`, `--config=…` re-admits everything the blocklist refuses. `UNSUPPORTED_OPTIONS` only ever saw the passthrough arguments |
+| `28` | `--host`, `--fingerprint` or `--ac-version` failed its rule in `ARGUMENT_RULES`, the one table of everything caller-controlled that reaches `openconnect`'s command line. `--host` becomes the last element of `openconnect`'s argv and `getopt_long` permutes, so a value starting with `-` is an *option* there — `-b` is `--background`, `--config=…` re-admits everything the blocklist refuses. `UNSUPPORTED_OPTIONS` only ever saw the passthrough arguments |
 | other | `openconnect`'s own exit status; `128 + n` if it was killed by signal *n* |
 
 ### `asuvpn-selftest`

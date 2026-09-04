@@ -164,6 +164,62 @@ syslog.openlog("asuvpn-helper", syslog.LOG_PID, syslog.LOG_DAEMON)
 closing = threading.Event()
 
 
+# Every caller-controlled value that reaches openconnect's command line, with
+# the rule it has to satisfy, in one table.
+#
+# A table and not a run of `if`s, because a run of `if`s is what was here and
+# what let two of these through. --host had no rule at all, and it is the last
+# element of the argv -- getopt_long permutes, so `--host=-b` is --background,
+# the single option UNSUPPORTED_OPTIONS exists to refuse, and
+# `--host=--config=…` re-admits every other one out of a file. The blocklist
+# was applied only to the passthrough arguments, so it was guarding one door
+# of three. --ac-version still had none after that was fixed, because fixing
+# it meant adding two more `if`s rather than asking where the list of things
+# to check lived.
+#
+# openconnect_command() below is the only place the argv is built, so adding
+# an element means passing through here; `check_every_argument_has_a_rule` in
+# the self-test fails if a value reaches the command line without one.
+ARGUMENT_RULES = (
+    ("--host", "host", C.valid_gateway, "not a server name"),
+    ("--fingerprint", "fingerprint", C.valid_fingerprint,
+     "not a certificate pin"),
+    ("--ac-version", "ac_version", C.valid_ac_version, "not a client version"),
+)
+
+
+def unacceptable_argument(args):
+    """The first caller-controlled value that fails its rule, as a sentence."""
+    for flag, attribute, acceptable, why in ARGUMENT_RULES:
+        value = getattr(args, attribute)
+        if not acceptable(value):
+            return f"refusing {flag}: {value!r} is {why}"
+    return None
+
+
+def openconnect_command(binary, args, extra):
+    """The one place openconnect's argv is built.
+
+    One place so that "what reaches the command line" and "what has a rule"
+    are the same list, and can be checked against each other. `extra` is the
+    caller's passthrough, already held to UNSUPPORTED_OPTIONS; everything else
+    here is either a constant this program wrote or a value ARGUMENT_RULES
+    has accepted.
+    """
+    return [
+        binary,
+        "--useragent",
+        f"AnyConnect Linux_64 {args.ac_version}",
+        "--version-string",
+        args.ac_version,
+        "--cookie-on-stdin",
+        "--servercert",
+        args.fingerprint,
+        *extra,
+        args.host,
+    ]
+
+
 def unsupported_option(option):
     """Why this openconnect option cannot be supervised, or None.
 
@@ -866,18 +922,9 @@ def main():
             fatal(f"refusing to run: {path} is {reason}")
             return 26
 
-    # Before anything is spawned, and separately from UNSUPPORTED_OPTIONS,
-    # which only ever inspected the passthrough arguments. --host lands as the
-    # last element of openconnect's argv and getopt_long permutes, so a value
-    # beginning with "-" is read as an option there -- including --background,
-    # the one option the blocklist exists for, and --config, which re-admits
-    # all the others out of a file. The blocklist was guarding one door.
-    if not C.valid_gateway(args.host):
-        fatal(f"refusing a gateway that is not a server name: {args.host!r}")
-        return 28
-    if not C.valid_fingerprint(args.fingerprint):
-        fatal("refusing a certificate pin that is not one:"
-              f" {args.fingerprint!r}")
+    refusal = unacceptable_argument(args)
+    if refusal:
+        fatal(refusal)
         return 28
 
     openconnect = find_openconnect()
@@ -991,18 +1038,7 @@ def main():
             " a server that negotiates it off leaves a dropped tunnel"
             " looking connected")
 
-    command = [
-        openconnect,
-        "--useragent",
-        f"AnyConnect Linux_64 {args.ac_version}",
-        "--version-string",
-        args.ac_version,
-        "--cookie-on-stdin",
-        "--servercert",
-        args.fingerprint,
-        *extra,
-        args.host,
-    ]
+    command = openconnect_command(openconnect, args, extra)
 
     # Announced explicitly rather than left to be parsed out of the command line
     # below. The tray watches this device's health, and it needs the name even

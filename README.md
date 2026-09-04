@@ -387,7 +387,7 @@ so this does not depend on how any of them happen to be worded:
 | `25` | an option was passed that would detach `openconnect` from the helper |
 | `26` | the helper, its directory, `asuvpn-notify` or the shared `asuvpn_contract.py` is writable by someone else, or owned by someone else |
 | `27` | a negative dead-peer interval was passed |
-| `28` | `--host` or `--fingerprint` was not one — a value that `openconnect` would read as an option rather than as a server |
+| `28` | `--host`, `--fingerprint` or `--ac-version` was not one — a value `openconnect` would read as an option rather than as what it is |
 
 ```bash
 asuvpn status >/dev/null || asuvpn connect --wait

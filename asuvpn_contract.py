@@ -288,6 +288,20 @@ GATEWAY_RE = re.compile(r"^(?:https?://)?"
 FINGERPRINT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9:+/=_.-]{0,200}\Z")
 
 
+# The AnyConnect version this client claims to be. It cannot become an option
+# -- it is the argument of --version-string, and the text of --useragent -- so
+# this is narrow because it should look like a version, not because anything
+# is exploitable through it. It is here because it reaches openconnect's
+# command line, and the point of the table in asuvpn-helper is that reaching
+# the command line is what obliges a value to have a rule.
+AC_VERSION_RE = re.compile(r"^[0-9][0-9A-Za-z._-]{0,31}\Z")
+
+
+def valid_ac_version(value):
+    """Does this look like a client version rather than anything else?"""
+    return bool(AC_VERSION_RE.match(str(value or "").strip()))
+
+
 def valid_gateway(value):
     """Is this safe to hand a root openconnect as the server to connect to?"""
     return bool(GATEWAY_RE.match(str(value or "").strip()))

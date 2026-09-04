@@ -3216,6 +3216,77 @@ def check_dns_takeover(notify, C, r):
                 calls == [] and "INTERNAL_IP4_DNS" in env, f"got {calls}")
 
 
+def check_every_argument_has_a_rule(helper, r):
+    """Nothing reaches openconnect's command line without a rule.
+
+    The invariant, rather than three separate checks that each rule works.
+    Validation used to be a run of `if`s in main(), and the list of things
+    validated drifted from the list of things that reach the argv: --host had
+    no rule (and is the element getopt_long permutes into an option), and
+    --ac-version still had none after that was found.
+
+    This builds the real command from sentinels and insists every element is
+    either a constant the program wrote or a value ARGUMENT_RULES vouched for.
+    Adding a field to openconnect_command() without adding its rule breaks
+    this check -- by AttributeError if nothing else, because the Namespace
+    below is built *from* the table.
+    """
+    rules = helper.ARGUMENT_RULES
+    sentinels = {attribute: f"SENTINEL-{attribute}"
+                 for _, attribute, _, _ in rules}
+    args = argparse.Namespace(**sentinels)
+    extra = ["SENTINEL-extra"]
+    try:
+        command = helper.openconnect_command("/usr/bin/openconnect", args, extra)
+    except AttributeError as exc:
+        # The Namespace is built from the table, so a field the command reads
+        # but the table does not list is missing from it. That is the failure
+        # this check exists for, and it deserves the sentence rather than a
+        # traceback.
+        r.fail("every value on openconnect's command line has a rule",
+               f"the command reads {exc.name!r}, which ARGUMENT_RULES does not"
+               " list — a caller-controlled value reaches openconnect with"
+               " nothing vouching for it")
+        return
+
+    unvouched = []
+    for element in command[1:]:          # [0] is the binary this program found
+        if element.startswith("--"):
+            continue                     # a flag this program wrote itself
+        if any(sentinel in element for sentinel in sentinels.values()):
+            continue                     # a value the table has a rule for
+        if element in extra:
+            continue                     # the passthrough, held to the blocklist
+        unvouched.append(element)
+    r.check("every value on openconnect's command line has a rule",
+            not unvouched,
+            f"these reach the argv with nothing vouching for them:"
+            f" {unvouched} — the rules are a table so that this list and the"
+            " command can be compared; a value here means one was added to"
+            " the command without one")
+
+    # And the rules are not decorative: each must actually refuse the shape
+    # that made it necessary.
+    refused = []
+    for flag, attribute, _, _ in rules:
+        hostile = argparse.Namespace(**dict(sentinels, **{attribute: "-b"}))
+        if helper.unacceptable_argument(hostile) is None:
+            refused.append(flag)
+    r.check("each rule refuses a value that would become an option",
+            not refused,
+            f"these accepted '-b': {refused} — openconnect permutes, so any"
+            " of them would be read as --background")
+    # The contrast case, or a validator that refuses everything would satisfy
+    # the line above.
+    ordinary = argparse.Namespace(host="https://vpn.example.edu",
+                                  fingerprint="pin-sha256:AAAA=",
+                                  ac_version=helper.C.AC_VERSION)
+    r.check("the values a real sign-in produces are accepted",
+            helper.unacceptable_argument(ordinary) is None,
+            f"an ordinary connect was refused:"
+            f" {helper.unacceptable_argument(ordinary)}")
+
+
 def check_fatal_reporting(r):
     """A refusal must reach the user as a sentence, not as an exit number.
 
@@ -3521,6 +3592,7 @@ def main():
         guarded(check_notify_roundtrip, C, r)
         guarded(check_dns_takeover, notify, C, r)
         guarded(check_event_translation, helper, tray, C, r)
+        guarded(check_every_argument_has_a_rule, helper, r)
         guarded(check_fatal_reporting, r)
 
     # Last, and that is the whole point. It used to run at the end of the
