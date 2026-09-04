@@ -1367,7 +1367,7 @@ option's *presence* rather than its value is the switch.
 every source, test and document belongs in RFC 5737 (`192.0.2.x`,
 `198.51.100.x`, `203.0.113.x`) or RFC 3849 (`2001:db8::x`), and the only
 hostname allowed under the endpoint's own domain is the shipped default in
-`SETTINGS`. A CI grep catches the obvious cases and review catches the rest,
+`SCHEMA`. A CI grep catches the obvious cases and review catches the rest,
 because the tempting thing to do with a live session's log is paste it into a
 fixture, and that is how somebody's resolver ends up in a public repository.
 It already had: the first

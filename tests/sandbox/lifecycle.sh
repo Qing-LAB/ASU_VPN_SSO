@@ -45,6 +45,15 @@ must_contain "still connected across the probe window" "$s" "Connected"
 if cat "$LOG" "$LOG.1" 2>/dev/null | grep -q 'not usable'; then
     echo "  FAIL: a healthy tunnel was demoted" >&2; exit 1
 fi
+# The rest of what the block above prints, asserted rather than displayed. A
+# FATAL, an unasked-for sign-in or a stray "previous tunnel" line was shown
+# under "anything the watchdog complained about?" and the scenario still
+# printed "healthy throughout".
+if cat "$LOG" "$LOG.1" 2>/dev/null | grep -qE 'FATAL|signing in|previous tunnel'; then
+    echo "  FAIL: a clean lifecycle should raise none of these:" >&2
+    cat "$LOG" "$LOG.1" 2>/dev/null | grep -E 'FATAL|signing in|previous tunnel' >&2
+    exit 1
+fi
 # A clean run must not cry wolf: the event channel closing at teardown is
 # deliberate and must stay silent. (The flag that keeps it silent is pinned
 # deterministically by the selftest; this grep is the end-to-end net.)

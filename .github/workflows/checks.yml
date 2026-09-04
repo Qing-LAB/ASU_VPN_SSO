@@ -144,8 +144,23 @@ jobs:
           # the check reports "not installed from PyPI; nothing to fall
           # behind" -- a green tick for the one assertion this step exists to
           # make.
+          # Warnings too, not just failures. Eight checks degrade to a warn
+          # when a precondition is missing -- an unreachable gateway, an
+          # openconnect whose --help stopped describing an option -- and
+          # nothing asserted the count, so a check that quietly switched
+          # itself off forever still reported success. This runner has
+          # everything, so here a warning is a regression; the shipped
+          # self-check keeps its "skip rather than redden" behaviour for
+          # users, whose machines legitimately vary.
           PATH=/tmp/wheel-venv/bin:$PATH HOME=/tmp/wheel-home \
-            /tmp/wheel-home/.local/share/asuvpn/asuvpn-selftest
+            /tmp/wheel-home/.local/share/asuvpn/asuvpn-selftest \
+            | tee /tmp/selftest.out
+          if ! grep -qE '[0-9]+ passed, 0 failed, 0 warnings' /tmp/selftest.out; then
+            echo "the self-check warned on a runner that has every" >&2
+            echo "dependency, so a check has switched itself off:" >&2
+            grep -E '^\s*\[ warn \]' -A1 /tmp/selftest.out >&2 || true
+            exit 1
+          fi
           # The installers state the default endpoint in shell, because bash
           # cannot load the schema, and a comment promises they stay in sync.
           # That promise used to be checked by grepping install.sh for its own

@@ -379,6 +379,101 @@ def check_permission_rules(C, r):
         os.chmod(d, 0o755)  # nosec B103  # noqa: S103
 
 
+def check_credentials_probe_fails_closed(tray, r):
+    """A keyring that will not answer must never be read as "ready".
+
+    The applet answers openconnect-sso's TOTP prompt with a blank line, which
+    means "not required". The same code path asks for the *password* first
+    when the keyring has none, and a blank there would be saved as the
+    password and quietly break auto-fill -- so this probe exists to refuse to
+    guess, and the branch that matters most is the timeout, which is almost
+    always a locked keyring blocking on its unlock dialog.
+
+    None of it was covered: the sandbox's stand-in interpreter answers "ready"
+    to any `-c` whatsoever, so every scenario takes the one path that needs no
+    decision, and nothing asserted the mapping.
+    """
+    original_run = tray.subprocess.run
+    original_interpreter = tray.sso_interpreter
+
+    class Result:
+        def __init__(self, out):
+            self.stdout = out
+
+    outcomes = {}
+    try:
+        tray.sso_interpreter = lambda _path: "/fake/python"
+        for label, behaviour in (
+                ("ready", lambda *a, **k: Result("ready\n")),
+                ("no-password", lambda *a, **k: Result("no-password\n")),
+                ("no-credentials", lambda *a, **k: Result("no-credentials\n")),
+                ("silence", lambda *a, **k: Result("\n")),
+                ("gibberish", lambda *a, **k: Result("what?\n")),
+                ("locked", _raise(tray.subprocess.TimeoutExpired("x", 1))),
+                ("broken", _raise(OSError("no such interpreter")))):
+            tray.subprocess.run = behaviour
+            outcomes[label] = tray.probe_credentials("/fake/openconnect-sso")
+        tray.sso_interpreter = lambda _path: None
+        outcomes["no interpreter"] = tray.probe_credentials("/fake/x")
+    finally:
+        tray.subprocess.run = original_run
+        tray.sso_interpreter = original_interpreter
+
+    r.check("a keyring that will not answer is never read as ready",
+            outcomes["locked"] == tray.CREDENTIALS_LOCKED
+            and outcomes["silence"] == tray.CREDENTIALS_UNKNOWN
+            and outcomes["gibberish"] == tray.CREDENTIALS_UNKNOWN
+            and outcomes["broken"] == tray.CREDENTIALS_UNKNOWN
+            and outcomes["no interpreter"] == tray.CREDENTIALS_UNKNOWN,
+            f"{outcomes} — a timeout is a locked keyring, and treating it as"
+            " ready feeds our blank line to the password prompt, where it is"
+            " saved as the password")
+    r.check("and the answers it does understand are not flattened",
+            outcomes["ready"] == tray.CREDENTIALS_READY
+            and outcomes["no-password"] == tray.CREDENTIALS_NO_PASSWORD
+            and outcomes["no-credentials"] == tray.CREDENTIALS_NONE,
+            f"{outcomes} — otherwise the check above is satisfied by a probe"
+            " that says UNKNOWN to everything")
+
+
+def check_who_is_asking(C, r):
+    """Root, plus the human behind the root process, however they got there.
+
+    Every loader restates this rule because it lives in the file they are
+    about to load, and the helper's own check calls it -- so getting it wrong
+    is either a hole or a refusal of legitimate callers. It has been both: it
+    knew only PKEXEC_UID, so `sudo asuvpn selftest` was refused against the
+    user's own checkout, and so were the CI containers.
+    """
+    original = {name: os.environ.get(name)
+                for name in ("PKEXEC_UID", "SUDO_UID")}
+    try:
+        for name in original:
+            os.environ.pop(name, None)
+        bare = C.invoking_uids()
+        os.environ["SUDO_UID"] = "4242"
+        sudo = C.invoking_uids()
+        os.environ["PKEXEC_UID"] = "4343"
+        both = C.invoking_uids()
+        os.environ["PKEXEC_UID"] = "not a number"
+        nonsense = C.invoking_uids()
+    finally:
+        for name, value in original.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+    r.check("both ways of becoming root name the human behind it",
+            sudo == {0, 4242} and both == {0, 4343},
+            f"sudo={sudo} both={both} — pkexec exports PKEXEC_UID and sudo"
+            " exports SUDO_UID; knowing only the first refused `sudo asuvpn"
+            " selftest` against the user's own checkout")
+    r.check("with neither, only root is trusted, and never nobody",
+            bare == {0, os.getuid()} and 0 in nonsense,
+            f"bare={bare} nonsense={nonsense} — an empty set would refuse"
+            " every path, and an unparseable value must not widen the set")
+
+
 def check_owner_is_a_principal(C, r):
     """A file another user owns is not safe to run as root, however tidy it is.
 
@@ -663,6 +758,13 @@ def check_notifications(tray, r):
             stub.notes[-1] == "VPN reconnected",
             f"got {stub.notes[-1]!r} — the wording is how the user tells a"
             " recovery from a connection they asked for")
+
+
+def _raise(exception):
+    """A stand-in callable that raises. Named because a lambda cannot."""
+    def raiser(*_args, **_kwargs):
+        raise exception
+    return raiser
 
 
 def machine_stub(tray):
@@ -2638,7 +2740,7 @@ def check_standin_catalogue(binary, r):
             r.warn(name, "tests/ exists but tests/sandbox/bin/openconnect"
                    " does not; the honesty check has nothing to hold")
         else:
-            r.ok(name, "no sandbox beside this copy; installed copies have none")
+            r.info("no sandbox beside this copy; installed copies have none")
         return
     if not binary:
         r.warn(name, "openconnect itself is missing, so there is no catalogue"
@@ -2926,7 +3028,10 @@ def check_pipx_copy_is_the_running_one(C, r):
     # is absent.
     script = C.find_program("asuvpn-install", use_path=True, user_local=True)
     if script is None:
-        r.ok(name, "not installed from PyPI; nothing to fall behind")
+        # info, not ok: this is the answer on nearly every machine, and a
+        # pass that cannot fail only pads the total -- which is what info's
+        # own docstring says.
+        r.info("not installed from PyPI; nothing to fall behind")
         return
     try:
         with open(script, encoding="utf-8", errors="replace") as handle:
@@ -3857,6 +3962,8 @@ def main():
         guarded(check_log_scrubbing, tray, r)
         guarded(check_secret_redaction, tray, r)
         guarded(check_log_write_path, tray, r)
+        guarded(check_credentials_probe_fails_closed, tray, r)
+        guarded(check_who_is_asking, C, r)
         guarded(check_owner_is_a_principal, C, r)
         guarded(check_tunnel_health, tray, r)
         guarded(check_demotion_rules, tray, r)

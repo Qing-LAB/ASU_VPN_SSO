@@ -5,6 +5,12 @@
 SB="$(cd "$(dirname "$0")" && pwd)"; A="$SB/app/asuvpn-tray"
 # shellcheck source=tests/sandbox/lib.sh
 . "$SB/lib.sh"; sandbox_guard; fresh_home
+# Named, not defaulted. enter.sh gives the sandbox a user and mount
+# namespace but not a network one, so the stand-in's default `tun0`
+# is looked up in the *host's* interface list: on a developer machine
+# with any OpenVPN session up, this scenario silently changed meaning.
+# asuvpn99 is inside the applet's own naming rule and exists nowhere.
+export FAKE_TUNDEV=asuvpn99
 # Pinned off, not left to the default: this scenario is about the nudge-only
 # path, and a default that permits the sign-in rung would change what it
 # proves without changing a line of it.
