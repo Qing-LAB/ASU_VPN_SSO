@@ -1817,6 +1817,7 @@ def check_teardown_ownership(helper, r):
     # ifindex now lives in the contract, and each program loads its own copy of
     # that module, so patching this one reaches the helper and nothing else.
     original_index = helper.C.interface_index
+    original_resolvectl = helper.C.resolvectl_path
 
     def fake_run(command, timeout=5):
         deleted.append(list(command))
@@ -1846,15 +1847,56 @@ def check_teardown_ownership(helper, r):
         helper.verify_teardown("asuvpn0", set(), False, 7)
         broken_said = any(line.startswith("WARNING") for line in logged)
         Result.stdout = "default via 198.51.100.1 dev wlan0\n"
+
+        # The killed path. vpnc-script never ran, so nothing put anything
+        # back: deleting the device takes its routes, and the per-link
+        # resolver is the one remaining thing this can undo itself.
+        helper.interface_exists = lambda name: True
+        helper.C.resolvectl_path = lambda: "/fake/resolvectl"
+        deleted.clear()
+        helper.verify_teardown("asuvpn0", set(), True, 7, dns_on_link=True)
+        revert = ["/fake/resolvectl", "revert", "asuvpn0"]
+        delete = ["/fake/ip", "link", "delete", "asuvpn0"]
+        ordered = (revert in deleted and delete in deleted
+                   and deleted.index(revert) < deleted.index(delete))
+        # A device that is not this session's incarnation is not ours to
+        # revert either -- the same rule the deletion already follows, for the
+        # same reason: the name may belong to somebody else's tunnel by now.
+        deleted.clear()
+        helper.verify_teardown("asuvpn0", set(), True, 9, dns_on_link=True)
+        foreign_revert = [c for c in deleted if "revert" in c]
+        # And when the stock script owned DNS there is nothing to revert and
+        # nothing this can fix -- only /etc/resolv.conf, whose backup belongs
+        # to the disconnect that never ran. Saying nothing would be the worst
+        # outcome: it reads exactly like a clean teardown.
+        deleted.clear()
+        logged.clear()
+        helper.verify_teardown("asuvpn0", set(), True, 7, dns_on_link=False)
+        stock_revert = [c for c in deleted if "revert" in c]
+        stock_warned = any(line.startswith("WARNING") and "resolv.conf" in line
+                           for line in logged)
     finally:
         for name, value in originals.items():
             setattr(helper, name, value)
         helper.C.interface_index = original_index
+        helper.C.resolvectl_path = original_resolvectl
     r.check("only the device this session created is ever deleted",
             not foreign_deletes and left_alone and ours_deleted,
             f"foreign deletes={foreign_deletes} left_alone={left_alone}"
             f" ours_deleted={ours_deleted} — a name match without the ifindex"
             " match must never reach `ip link delete` as root")
+    r.check("a killed teardown drops the per-link resolver before the device",
+            ordered and not foreign_revert,
+            f"ordered={ordered} foreign_revert={foreign_revert} — the resolver"
+            " usually dies with the link, but not when the device is"
+            " persistent or the delete fails, and those are the runs nobody"
+            " is watching")
+    r.check("DNS the stock script owns is not claimed back, but is reported",
+            not stock_revert and stock_warned,
+            f"stock_revert={stock_revert} stock_warned={stock_warned}"
+            f" logged={logged} — /etc/resolv.conf is restored from a backup"
+            " only the disconnect that never ran would have used, so the one"
+            " honest thing left is to say so")
     r.check("a teardown that left no default route says so, as a warning",
             broken_said,
             f"logged={logged} — silence here reads exactly like a clean"

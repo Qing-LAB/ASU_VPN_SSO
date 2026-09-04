@@ -560,13 +560,37 @@ def interface_exists(name):
     return bool(name) and os.path.exists(f"/sys/class/net/{name}")
 
 
-def verify_teardown(ifname, before, was_killed, owned):
+def drop_link_dns(ifname):
+    """Take our per-link DNS off a link openconnect did not live to clear.
+
+    Quiet about the ordinary outcome and loud about the odd one: reverting a
+    link that is already gone is the common case and means nothing, while a
+    revert that fails leaves a resolver pointing into a dead tunnel and is
+    worth a line.
+    """
+    binary = C.resolvectl_path()
+    if binary is None:
+        return
+    result = run([binary, "revert", ifname], timeout=C.RESOLVECTL_TIMEOUT)
+    if result is not None and result.returncode == 0:
+        log(f"per-link DNS on {ifname} reverted")
+
+
+def verify_teardown(ifname, before, was_killed, owned, dns_on_link=False):
     """Confirm the network came back, and clear up if openconnect did not.
 
     openconnect restores routes and DNS by running vpnc-script on the way out,
     but only when it exits gracefully. If it had to be killed the script never
     ran, which is what leaves a machine with no working network until it is
     rebooted. Deleting the leftover tunnel interface takes its routes with it.
+
+    Routes and DNS are not symmetrical on that path, which this used to gloss
+    over with one vague warning. Deleting the device really does take its
+    routes, and a per-link resolver dies with the link too -- but a session
+    that fell back to /etc/resolv.conf leaves that file naming the tunnel's
+    resolvers, and no amount of interface deletion puts it back. So each case
+    is now said in its own words, and the one thing that can be undone from
+    here is undone rather than warned about.
 
     Only *our* device is ever deleted. `owned` is the ifindex captured once
     openconnect created it, so a name that has since been reused by somebody
@@ -584,6 +608,12 @@ def verify_teardown(ifname, before, was_killed, owned):
             log(f"WARNING: {ifname} outlived openconnect but 'ip' is missing;"
                 " it was not removed")
         else:
+            if was_killed and dns_on_link:
+                # Before the deletion, while there is still a link to name.
+                # Usually redundant -- the resolver goes when the link does --
+                # but not when the device is persistent or the delete below
+                # fails, and those are exactly the runs nobody is watching.
+                drop_link_dns(ifname)
             log(f"WARNING: {ifname} outlived openconnect; deleting it")
             result = run([ip, "link", "delete", ifname])
             if result is None or result.returncode != 0:
@@ -609,7 +639,20 @@ def verify_teardown(ifname, before, was_killed, owned):
         log("WARNING: no default route after teardown — network is likely broken")
         log("WARNING: try 'nmcli networking off && nmcli networking on'")
     if was_killed:
-        log("WARNING: openconnect was killed, so DNS may still need attention")
+        if dns_on_link:
+            # The link carried the resolver, so it went with the link -- unless
+            # this session had to hand DNS back to the stock script, which is
+            # logged at the time and is the one case a reader has to check.
+            log("openconnect was killed; the tunnel's resolver went with its"
+                " link. If the log shows DNS was handed back to the stock"
+                " script, check /etc/resolv.conf")
+        else:
+            # Nothing here can fix this: the backup belongs to the stock
+            # script and is only put back by the disconnect that never ran.
+            log("WARNING: openconnect was killed before it could restore DNS."
+                " /etc/resolv.conf may still name the tunnel's resolvers; a"
+                " clean connect-then-disconnect, or restarting NetworkManager,"
+                " puts it back")
 
 
 class Tunnel:
@@ -996,7 +1039,8 @@ def main():
         returncode = 128 - returncode
     else:
         log(f"openconnect exited with status {returncode}")
-    verify_teardown(ifname, interfaces_before, tunnel.killed, owned.get("ifindex"))
+    verify_teardown(ifname, interfaces_before, tunnel.killed,
+                    owned.get("ifindex"), args.dns_domains is not None)
     closing.set()  # the socket close below is deliberate, not a failure
     if events is not None:
         events.close()
