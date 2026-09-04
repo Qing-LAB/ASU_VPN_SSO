@@ -69,6 +69,29 @@ jobs:
             exit 1
           fi
 
+      # Another pair of lists that have to stay equal and are maintained
+      # apart: the helper's refusal codes, and the tables in README.md and
+      # DESIGN.md that document them. Adding a code means editing three
+      # places, and this is what notices when only one or two happened. A
+      # grep, and in CI rather than the shipped self-check, for the same
+      # reason the other hygiene rules are: reading documentation is not
+      # something a user's `asuvpn selftest` should be doing.
+      - name: every refusal code the helper can return is documented
+        run: |
+          codes=$(grep -oE '^ *return 2[0-9]$' asuvpn-helper \
+                  | grep -oE '2[0-9]' | sort -u)
+          missing=""
+          for code in $codes; do
+            for doc in README.md DESIGN.md; do
+              grep -qE "^\| \`$code\`" "$doc" || missing="$missing $code($doc)"
+            done
+          done
+          if [ -n "$missing" ]; then
+            echo "these exit codes are returned but not documented:$missing" >&2
+            exit 1
+          fi
+          echo "documented in both tables: $(echo "$codes" | tr '\n' ' ')"
+
       - name: the analysers (README "Checking it", verbatim)
         run: |
           mkdir -p /tmp/asuvpn-lint
