@@ -52,7 +52,24 @@ configuration:
 - **Another desktop.** The tray icon needs a StatusNotifier host. KDE has one
   built in; GNOME needs the AppIndicator extension, which `bootstrap.sh`
   installs. Untested outside GNOME.
-- **Another distribution.** `bootstrap.sh` checks what is *present* rather than
+- **Another distribution.** Honestly: **only Ubuntu/Debian is tested end to
+  end**, and only there does anyone run the tray, connect a tunnel and tear it
+  down. What *is* checked on Fedora, Arch, Debian and Ubuntu 22.04 on every
+  push is the portable half — the contract, the state machine and the split-DNS
+  rules, which are pure Python and need no desktop. That has already earned its
+  keep: its first run found a Python 3.12-only construct that made the shipped
+  self-check unparseable on Ubuntu 22.04 and Debian 12, both of which this
+  project claims to support.
+
+  Everything above that line — GTK, the tray icon, `openconnect`, `pkexec` —
+  is unverified outside Ubuntu/Debian. It is expected to work, since none of it
+  is Debian-specific, but expected is not tested. **If you run Fedora, Arch or
+  openSUSE and it works, or does not, please open an issue or a PR** — a report
+  from someone with the machine is worth more than any amount of guessing here,
+  and the package names below were written from each distribution's index
+  rather than from experience.
+
+  `bootstrap.sh` checks what is *present* rather than
   which Linux you are on, so a machine that already has GTK, `polkit` and
   `openconnect` installs with no packages and no password at all. Where
   something is missing it names the gap and the packages that fill it for

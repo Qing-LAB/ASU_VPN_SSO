@@ -128,7 +128,13 @@ jobs:
     strategy:
       fail-fast: false          # one distribution failing must not hide the rest
       matrix:
-        image: ["fedora:41", "archlinux:latest", "debian:12"]
+        # ubuntu:22.04 and debian:12 are here for their *Python*, not their
+        # branding: 3.10 and 3.11, the floor pyproject.toml claims. The first
+        # run of this job found a backslash inside an f-string -- legal only
+        # from 3.12 (PEP 701) -- which made the shipped self-check unparseable
+        # on both, and install.sh runs that self-check. The claim was false and
+        # nothing was testing it.
+        image: ["ubuntu:22.04", "debian:12", "fedora:41", "archlinux:latest"]
     container: ${{ matrix.image }}
     steps:
       - uses: actions/checkout@v4

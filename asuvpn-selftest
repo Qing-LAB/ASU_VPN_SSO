@@ -110,9 +110,15 @@ def check_contract(C, r):
     r.check("openconnect's output cannot forge a message through the frame",
             C.decode_message(forged) is None,
             f"a relayed line decoded as ours: {C.decode_message(forged)!r}")
+    # Held in names rather than inlined: a backslash inside an f-string
+    # expression is a SyntaxError before Python 3.12 (PEP 701 relaxed it), and
+    # this file is shipped and run by install.sh -- so one inlined escape made
+    # the whole self-check unparseable on Ubuntu 22.04 and Debian 12, which are
+    # exactly the systems this project claims to support.
+    folded = C.encode_message(C.KIND_NOTE, "one\ntwo\nthree")
     r.check("a message can never span two lines",
-            "\n" not in C.encode_message(C.KIND_NOTE, "one\ntwo\nthree")[:-1],
-            f"got {C.encode_message(C.KIND_NOTE, 'one\ntwo')!r}")
+            "\n" not in folded[:-1],
+            f"got {folded!r}")
     try:
         C.encode_message("INVENTED", "x")
     except ValueError:
