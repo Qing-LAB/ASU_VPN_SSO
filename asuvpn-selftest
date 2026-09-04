@@ -1414,6 +1414,49 @@ def check_log_scrubbing(tray, r):
         r.ok("hostile control sequences never reach the log")
 
 
+def check_secret_redaction(tray, r):
+    """No session token reaches the log, whoever wrote the line.
+
+    The cookie is kept out of argv and out of the log by construction: it
+    travels on a pipe into the tray and on stdin to the helper. But that holds
+    only for the paths this project wrote, and the log carries lines this
+    project did not write -- openconnect's own output, relayed verbatim.
+    `openconnect --authenticate` prints COOKIE= on stdout, and the
+    external-browser sign-in carries a token back through a redirect URL, so
+    the last gate before bytes reach the file is where this has to be enforced.
+
+    The useful half of a line has to survive, or the redaction gets turned off
+    the first time somebody needs to debug a connection.
+    """
+    leaky = [
+        "COOKIE='3311180634@13561856@1339425499@B315A0E29D16C6FD92EE'",
+        "HOST='192.0.2.1' COOKIE=abc123def FINGERPRINT='469bb424'",
+        "GET /?acSamlv2Token=eyJhbGciOiJIUzI1NiJ9.body.signature HTTP/1.1",
+        "Set-Cookie: webvpn=A1B2C3D4; path=/; secure",
+        "sso-token: 0123456789abcdef",
+    ]
+    secrets = ("3311180634", "abc123def", "eyJhbGciOiJIUzI1NiJ9",
+               "A1B2C3D4", "0123456789abcdef")
+    survived = [line for line in leaky
+                for secret in secrets
+                if secret in tray.redact_secrets(line)]
+    r.check("no session token survives into the log",
+            not survived,
+            f"these still carry their secret after redaction: {survived}")
+
+    kept = tray.redact_secrets("HOST='192.0.2.1' COOKIE=abc123 FINGERPRINT='469bb'")
+    r.check("redaction keeps the half of the line worth reading",
+            "192.0.2.1" in kept and "469bb" in kept and "COOKIE" in kept,
+            f"got {kept!r} — the key stays visible so the reader knows"
+            " something was removed, and the address and fingerprint are not"
+            " secrets; a redactor that eats them gets switched off")
+
+    ordinary = "[vpn] Connected to 192.0.2.4:443"
+    r.check("an ordinary line passes through untouched",
+            tray.redact_secrets(ordinary) == ordinary,
+            f"got {tray.redact_secrets(ordinary)!r}")
+
+
 def check_log_write_path(tray, r):
     """The scrubber must be wired where the log is written, not merely exist.
 
@@ -2595,6 +2638,7 @@ def main():
         guarded(check_permission_rules, C, r)
         guarded(check_state_payload, tray, r)
         guarded(check_log_scrubbing, tray, r)
+        guarded(check_secret_redaction, tray, r)
         guarded(check_log_write_path, tray, r)
         guarded(check_tunnel_health, tray, r)
         guarded(check_demotion_rules, tray, r)

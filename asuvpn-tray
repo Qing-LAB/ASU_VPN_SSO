@@ -308,6 +308,29 @@ ANSI_ESCAPE = re.compile(
     r"|[\x00-\x08\x0b-\x1f\x7f\u0080-\u009f]"    # bare C0, DEL, C1 controls
 )
 
+# Secrets must not reach the log, whatever produced the line. Today the session
+# cookie is kept out by construction -- it travels on a pipe into the tray and
+# on stdin to the helper, never argv, never a file -- but "by construction"
+# only covers the paths this project wrote. `openconnect --authenticate` prints
+# COOKIE= on stdout, an error path could put it on stderr, and the
+# external-browser sign-in carries a token back through a redirect URL. This is
+# the last gate before bytes reach the file, so it is the place to enforce it
+# rather than trusting every future producer to remember.
+#
+# The key is left visible and only the value replaced: a reader needs to know
+# that something was removed, and which something, or the log starts lying by
+# omission instead of leaking.
+SECRET_VALUE = re.compile(
+    r"(?i)\b(COOKIE|webvpn|acSamlv2Token|acSamlv2Error|sso-token|sessionid"
+    r"|jsessionid|X-CSTP-Session-ID)(\s*[=:]\s*)('[^']*'|\"[^\"]*\"|[^\s;&,'\"]+)"
+)
+
+
+def redact_secrets(line):
+    """Replace anything that looks like a session token with a marker."""
+    return SECRET_VALUE.sub(lambda m: f"{m.group(1)}{m.group(2)}<redacted>", line)
+
+
 # Deliberately narrow. A bare /Reconnect/ matched thirty message templates in
 # v9.12, two of which openconnect prints while the tunnel is perfectly healthy
 # ("DTLS Rehandshake failed; reconnecting.", and the reconnect-after-drop
@@ -1759,7 +1782,8 @@ class VpnTray(StateMachine):
     def log(self, line):
         """Safe to call from any thread."""
         # openconnect-sso renders its structured logs with colour codes.
-        line = f"{time.strftime('%H:%M:%S')}  {ANSI_ESCAPE.sub('', line).rstrip()}"
+        line = redact_secrets(ANSI_ESCAPE.sub("", line)).rstrip()
+        line = f"{time.strftime('%H:%M:%S')}  {line}"
         with self._log_lock:
             self.log_lines.append(line)
             del self.log_lines[:-MAX_LOG_LINES]
