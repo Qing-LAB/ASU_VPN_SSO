@@ -811,6 +811,7 @@ def machine_stub(tray):
             self.autoreconnect = False
             self.killed = 0
             self.pipes_closed = []
+            self.threads = []
             self.notes, self.sent, self.logged = [], [], []
             self.signins, self.published, self.started = [], [], []
 
@@ -836,6 +837,25 @@ def machine_stub(tray):
 
         def _kill_auth(self):
             self.killed += 1
+
+        # The teardown workers. The base class raises NotImplementedError for
+        # each, which is right for a class that must not be run half-stubbed
+        # -- but a handler that starts one does it in a daemon thread, so the
+        # exception lands on stderr *after* the check has already passed. It
+        # printed a traceback into the self-check that install.sh runs, on a
+        # perfectly good install. A stub has to stub every side effect,
+        # including the ones that fail quietly.
+        def _disconnect_thread(self):
+            self.threads.append("disconnect")
+
+        def _reconnect_thread(self):
+            self.threads.append("reconnect")
+
+        def _cancel_tunnel_thread(self):
+            self.threads.append("cancel")
+
+        def _quit_thread(self):
+            self.threads.append("quit")
 
         def _close_helper_stdin(self, proc):
             self.pipes_closed.append(proc)
