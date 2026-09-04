@@ -2140,6 +2140,44 @@ def check_liveness_probe(tray, r):
             " nothing is exactly what this check is for, and None would be"
             " discarded by _probe_result without ever striking")
 
+    # And the guard that decides what to do with each verdict. Its twin in
+    # the DNS source shipped broken this week -- one inconclusive answer read
+    # as a pass, which clears the strike count and can promote a broken
+    # tunnel -- so the identical guard here is worth a check of its own.
+    class Holder:
+        def __init__(self):
+            self.probe_in_flight = True
+            self.quitting = False
+            self.helper_generation = 0
+            self.dispatched = []
+
+        def dispatch(self, kind, **data):
+            self.dispatched.append((kind, data.get("reason")))
+
+    verdicts = {}
+    for label, value in (("alive", True), ("silent", False),
+                         ("inconclusive", None)):
+        holder = Holder()
+        tray.VpnTray._probe_result(holder, value, "detail", 0)
+        verdicts[label] = (holder.dispatched, holder.probe_in_flight)
+    stale = Holder()
+    tray.VpnTray._probe_result(stale, False, "detail", 99)
+    r.check("an inconclusive probe is not dispatched as a verdict",
+            verdicts["inconclusive"][0] == []
+            and len(verdicts["alive"][0]) == 1
+            and len(verdicts["silent"][0]) == 1,
+            f"{verdicts} — dispatching None reaches the clear path, which"
+            " zeroes the strikes and can promote a tunnel that is carrying"
+            " nothing")
+    r.check("every probe reply clears the in-flight flag, verdict or not",
+            not any(flag for _, flag in verdicts.values())
+            and not stale.probe_in_flight,
+            f"{verdicts} stale={stale.probe_in_flight} — a reply that left it"
+            " set would disable probing for the applet's lifetime")
+    r.check("a reply about a superseded tunnel changes nothing",
+            stale.dispatched == [],
+            f"{stale.dispatched}")
+
     alive, detail = tray.probe_tunnel("", 53, 3)
     # A name getaddrinfo cannot even encode raises UnicodeError, which is not
     # an OSError; unhandled it killed the probe thread, and probe_in_flight

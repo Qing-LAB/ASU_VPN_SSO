@@ -1,0 +1,41 @@
+#!/usr/bin/env python3
+# SANDBOX-MARKER
+"""A stand-in resolvectl, so a scenario can drive the DNS health source.
+
+The sandbox mounts a fresh tmpfs on /run, which hides the D-Bus system socket,
+so a real resolvectl answers "sd_bus_open_system: No such file or directory"
+on every call. The consequence was invisible and total: link_resolvers
+returned None for the whole of every scenario, resolver_health returned None,
+and the tray discarded it -- so no scenario had ever exercised a DNS
+demotion, a DNS recovery, or the /etc/resolv.conf second opinion. lifecycle.sh
+was silent about DNS for a reason that had nothing to do with the code.
+
+Two files drive it, both written by the scenario:
+
+  FAKE_LINK_DNS   what `dns <link>` reports the link is holding. Absent or
+                  empty means the link has no servers, which is what the
+                  applet reads as "the resolver is no longer in force".
+  FAKE_RESOLVECTL_LOG  every call, one per line, for the scenario to assert on.
+"""
+import os
+import sys
+
+argv = sys.argv[1:]
+log = os.environ.get("FAKE_RESOLVECTL_LOG")
+if log:
+    with open(log, "a", encoding="utf-8") as handle:
+        handle.write(" ".join(argv) + "\n")
+
+if not argv:
+    sys.exit(0)
+
+# `dns <link>` with no further arguments is the *question*; with servers after
+# it, it is the instruction. Only the question has an answer to fake.
+if argv[0] == "dns" and len(argv) == 2:
+    state = os.environ.get("FAKE_LINK_DNS", "")
+    servers = ""
+    if state and os.path.exists(state):
+        with open(state, encoding="utf-8") as handle:
+            servers = handle.read().strip()
+    print(f"Link 9 ({argv[1]}): {servers}".rstrip())
+sys.exit(0)

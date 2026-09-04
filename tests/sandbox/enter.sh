@@ -33,7 +33,7 @@ for f in asuvpn-tray asuvpn-helper asuvpn-notify asuvpn-selftest; do
     install -m 0755 "$REPO/$f" "$SB/app/$f"
 done
 install -m 0644 "$REPO/asuvpn_contract.py" "$SB/app/asuvpn_contract.py"
-for f in openconnect pkexec sso-python vpnc-script; do
+for f in openconnect pkexec sso-python vpnc-script resolvectl; do
     install -m 0755 "$SB/bin/$f" "$SB/rbin/$f"
 done
 { printf '#!%s\n' "$SB/rbin/sso-python"; tail -n +2 "$SB/bin/openconnect-sso"; } \
@@ -76,6 +76,10 @@ mount --bind "$SB/rbin/openconnect" /usr/sbin/openconnect
 mount --bind "$SB/rbin/pkexec" /usr/bin/pkexec
 mount --bind "$SB/rbin/openconnect-sso" "$REAL_SSO"
 mount --bind "$SB/rbin/vpnc-script" /usr/share/vpnc-scripts/vpnc-script
+# resolvectl is reached by absolute path (asuvpn_contract.RESOLVECTL_PATHS),
+# and the tmpfs on /run above hides the bus a real one needs -- so without a
+# stand-in the DNS source silently answers "cannot tell" in every scenario.
+[ -e /usr/bin/resolvectl ] && mount --bind "$SB/rbin/resolvectl" /usr/bin/resolvectl
 fail=0
 check(){ grep -qa 'SANDBOX-MARKER' "$1" 2>/dev/null || { echo "GUARD FAIL: $2" >&2; fail=1; }; }
 check /usr/sbin/openconnect openconnect
@@ -83,6 +87,7 @@ check /usr/sbin/openconnect openconnect
 check /usr/bin/pkexec pkexec
 check "$REAL_SSO" openconnect-sso
 check /usr/share/vpnc-scripts/vpnc-script vpnc-script
+[ ! -e /usr/bin/resolvectl ] || check /usr/bin/resolvectl resolvectl
 for b in openconnect openconnect-sso pkexec; do
     p="$(command -v "$b" || true)"
     case "$p" in "$SB/rbin/$b") ;; *) echo "GUARD FAIL: PATH resolves $b to ${p:-nothing}" >&2; fail=1;; esac
