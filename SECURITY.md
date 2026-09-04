@@ -83,6 +83,16 @@ the only version question with an answer.
   [`asuvpn_contract.py`](asuvpn_contract.py), the `sec.sh` scenario, and the
   logic tier's ownership checks.
 
+  With one honest exception, worth stating because the list above includes it:
+  `asuvpn-helper` also checks **itself**, and against an attacker that is not
+  a defence — `pkexec` has already executed the file before any of its code
+  runs, so anyone who could rewrite it would simply delete the check. It stays
+  on the list because it catches an accidentally widened mode before anyone
+  exploits it, and because the file's own permissions are worth reporting. The
+  real protection for the other three paths — the directory, `asuvpn-notify`
+  and `asuvpn_contract.py` — is genuine: those are read *after* the helper is
+  running, and `sec.sh` proves each one refuses before anything executes.
+
 ## Where the design is written down
 
 Reading these first will usually tell you whether something is a bug or a
