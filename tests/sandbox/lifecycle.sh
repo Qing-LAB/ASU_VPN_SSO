@@ -45,13 +45,19 @@ must_contain "still connected across the probe window" "$s" "Connected"
 if cat "$LOG" "$LOG.1" 2>/dev/null | grep -q 'not usable'; then
     echo "  FAIL: a healthy tunnel was demoted" >&2; exit 1
 fi
-# The rest of what the block above prints, asserted rather than displayed. A
-# FATAL, an unasked-for sign-in or a stray "previous tunnel" line was shown
+# The rest of what the block above prints, asserted rather than displayed: a
+# FATAL, an unasked-for sign-in, or a stray "previous tunnel" line was shown
 # under "anything the watchdog complained about?" and the scenario still
 # printed "healthy throughout".
-if cat "$LOG" "$LOG.1" 2>/dev/null | grep -qE 'FATAL|signing in|previous tunnel'; then
+#
+# The patterns name the *automatic* recoveries specifically. "tunnel closed,
+# signing in again" is the handoff of the reconnect this scenario asks for by
+# hand, and a first draft of this grep matched it -- an assertion has to know
+# the difference between the thing it is testing and the thing it forbids.
+unasked='FATAL|signing in again to rebuild|rebuilding the dropped tunnel|a previous tunnel closed'
+if cat "$LOG" "$LOG.1" 2>/dev/null | grep -qE "$unasked"; then
     echo "  FAIL: a clean lifecycle should raise none of these:" >&2
-    cat "$LOG" "$LOG.1" 2>/dev/null | grep -E 'FATAL|signing in|previous tunnel' >&2
+    cat "$LOG" "$LOG.1" 2>/dev/null | grep -E "$unasked" >&2
     exit 1
 fi
 # A clean run must not cry wolf: the event channel closing at teardown is

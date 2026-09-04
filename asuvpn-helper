@@ -586,12 +586,56 @@ def free_interface_name():
     return None
 
 
-def watch_for_interface(ifname, holder, deadline=60):
-    """Record the ifindex of our device once openconnect creates it."""
+def device_is_held_by(pid, ifname, proc_root="/proc"):
+    """Does this process hold the tun device `ifname` open?
+
+    The kernel answers it: a tun file descriptor's fdinfo carries `iff:` and
+    the device's name. That is proof of ownership, which nothing else here
+    has -- a name existing says only that *somebody* created it.
+
+    False on anything unreadable. The caller treats that as "not proven",
+    which is the safe direction: an unclaimed device is left alone at
+    teardown, and leaving a stray device behind is a smaller harm than
+    deleting somebody else's live tunnel as root.
+    """
+    fd_dir = os.path.join(proc_root, str(pid), "fd")
+    try:
+        entries = os.listdir(fd_dir)
+    except OSError:
+        return False
+    for entry in entries:
+        try:
+            with open(os.path.join(proc_root, str(pid), "fdinfo", entry),
+                      encoding="utf-8", errors="replace") as handle:
+                for line in handle:
+                    if line.startswith("iff:") and line.split()[-1] == ifname:
+                        return True
+        except (OSError, IndexError):
+            continue
+    return False
+
+
+def watch_for_interface(ifname, holder, pid, deadline=60):
+    """Record the ifindex of our device, once we can prove it is ours.
+
+    The proof is the point. This used to record whatever ifindex appeared at
+    the name, which is not the same claim: `free_interface_name` picks the
+    first unused asuvpnN, so two sessions starting together can both choose
+    asuvpn0 -- and the loser, whose openconnect then failed to create it,
+    latched the *winner's* ifindex and deleted a live tunnel belonging to
+    another account at teardown, as root. The ifindex comparison in
+    verify_teardown was supposed to prevent exactly that and could not,
+    because the number it compared had come from here.
+
+    The event channel claims the device authoritatively when it is available
+    (serve_events, on STATE_CONNECTED). This is the fallback for a session
+    running on log matching, and it now waits for the same standard of
+    evidence rather than a weaker one.
+    """
     end = time.monotonic() + deadline
     while time.monotonic() < end:
         index = C.interface_index(ifname)
-        if index is not None:
+        if index is not None and device_is_held_by(pid, ifname):
             holder["ifindex"] = index
             return
         time.sleep(0.25)
@@ -1116,9 +1160,10 @@ def main():
             target=serve_events, args=(events, token, ifname, owned), daemon=True
         ).start()
     # Kept as a second, independent source: if the script never fires we still
-    # learn the device's identity from the kernel.
+    # learn the device's identity from the kernel -- but only once the kernel
+    # can also confirm this openconnect is the process holding it open.
     threading.Thread(
-        target=watch_for_interface, args=(ifname, owned), daemon=True
+        target=watch_for_interface, args=(ifname, owned, proc.pid), daemon=True
     ).start()
 
     try:

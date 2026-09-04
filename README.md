@@ -489,6 +489,10 @@ take effect immediately. The checkout then has to stay where it is.
 
 ```bash
 asuvpn quit
+# If you have XDG_DATA_HOME, XDG_CONFIG_HOME or XDG_CACHE_HOME set to
+# somewhere other than the defaults, the installer honoured them and these
+# paths will not exist. `asuvpn selftest` prints where everything actually
+# went; so does the tail of `install.sh`.
 rm -rf ~/.local/share/asuvpn ~/.cache/asuvpn ~/.config/asuvpn
 rm -f  ~/.local/share/applications/asuvpn.desktop \
        ~/.local/share/icons/hicolor/scalable/apps/asuvpn.svg \

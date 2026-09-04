@@ -2495,6 +2495,32 @@ def check_teardown_ownership(helper, r):
             setattr(helper, name, value)
         helper.C.interface_index = original_index
         helper.C.resolvectl_path = original_resolvectl
+    # The proof the deletion rests on. `free_interface_name` picks the first
+    # unused asuvpnN, so two sessions starting together can both choose
+    # asuvpn0 -- and the loser used to latch the winner's ifindex simply
+    # because the name had appeared, then delete a live tunnel belonging to
+    # another account, as root. A tun fd's fdinfo names the device it holds,
+    # which is the one thing that actually settles ownership.
+    with tempfile.TemporaryDirectory() as proc_root:
+        for pid, iff in (("100", "asuvpn0"), ("200", "asuvpn1")):
+            os.makedirs(os.path.join(proc_root, pid, "fd"))
+            os.makedirs(os.path.join(proc_root, pid, "fdinfo"))
+            for fd, body in (("3", "pos:\t0\nflags:\t02\n"),
+                             ("7", f"pos:\t0\niff:\t{iff}\n")):
+                open(os.path.join(proc_root, pid, "fd", fd), "w",
+                     encoding="utf-8").close()
+                with open(os.path.join(proc_root, pid, "fdinfo", fd), "w",
+                          encoding="utf-8") as handle:
+                    handle.write(body)
+        ours = helper.device_is_held_by(100, "asuvpn0", proc_root)
+        theirs = helper.device_is_held_by(200, "asuvpn0", proc_root)
+        gone = helper.device_is_held_by(999, "asuvpn0", proc_root)
+    r.check("a device is only ours if this openconnect is holding it open",
+            ours and not theirs and not gone,
+            f"ours={ours} the-other-session's={theirs} no-such-process={gone}"
+            " — the name existing says only that somebody created it, and the"
+            " loser of a name race deleted the winner's tunnel on that basis")
+
     r.check("only the device this session created is ever deleted",
             not foreign_deletes and left_alone and ours_deleted,
             f"foreign deletes={foreign_deletes} left_alone={left_alone}"
