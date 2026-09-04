@@ -14,11 +14,15 @@ So the checks come in three tiers, and the middle one is the point:
   environment  our assumptions put to the installed binaries themselves
   wiring       asuvpn-notify actually executed, end to end
 
-Nothing here needs privileges or talks to the VPN. The real openconnect is
-run only to describe itself — `--version` for its script path, `--help` for
-its retry default — and the network is touched only by two probe exercises
-that cannot leave anything behind: a loopback connect and a SYN to RFC 5737
-documentation space, which must never answer. Run it after installing, or
+Nothing here needs privileges, and nothing it does can change this machine or
+the tunnel. It does reach the network, three times and all read-only. The real
+openconnect is run only to describe itself — `--version` for its script path,
+`--help` for its retry default. Two probe exercises leave nothing behind: a
+loopback connect and a SYN to RFC 5737 documentation space, which must never
+answer. And one unauthenticated capability handshake asks the configured
+gateway which sign-in method it offers — the same first request any VPN client
+makes, carrying no credentials, and skipped rather than failed when the server
+cannot be reached. Run it after installing, or
 whenever something behaves oddly:
 
     asuvpn selftest
@@ -2247,22 +2251,25 @@ def check_resolver_health(tray, r):
     """
     original = tray.link_resolvers
     try:
+        # True / False / None, like probe_tunnel. The three are distinct on
+        # purpose: the caller may only clear a strike on True, because None
+        # means the question could not be asked.
         tray.link_resolvers = lambda device: ["192.0.2.53"]
-        reason, _ = tray.resolver_health("asuvpn0", "192.0.2.53")
+        healthy, _ = tray.resolver_health("asuvpn0", "192.0.2.53")
         r.check("a link still holding the pushed resolver is healthy",
-                reason is None, f"got {reason!r}")
+                healthy is True, f"got {healthy!r}, wanted True")
 
         tray.link_resolvers = lambda device: []
-        reason, detail = tray.resolver_health("asuvpn0", "192.0.2.53")
+        healthy, detail = tray.resolver_health("asuvpn0", "192.0.2.53")
         r.check("a link the resolver was taken off is a verdict",
-                reason is not None and "no resolvers" in detail,
-                f"got {reason!r} / {detail!r} — this is the exact state"
+                healthy is False and "no resolvers" in detail,
+                f"got {healthy!r} / {detail!r} — this is the exact state"
                 " systemd-resolved rewriting its stub file leaves behind")
 
         tray.link_resolvers = lambda device: ["198.51.100.1"]
-        reason, _ = tray.resolver_health("asuvpn0", "192.0.2.53")
+        healthy, _ = tray.resolver_health("asuvpn0", "192.0.2.53")
         r.check("a link holding somebody else's resolver is a verdict",
-                reason is not None, f"got {reason!r}")
+                healthy is False, f"got {healthy!r}, wanted False")
 
         # The parsing half of the same question. link_resolvers feeds every
         # case above, and the half that can be got wrong quietly is how one
@@ -2281,18 +2288,20 @@ def check_resolver_health(tray, r):
                 " mean the question could not be asked")
 
         tray.link_resolvers = lambda device: None
-        reason, _ = tray.resolver_health("asuvpn0", "192.0.2.53")
+        healthy, _ = tray.resolver_health("asuvpn0", "192.0.2.53")
         r.check("an unanswerable question is not a verdict",
-                reason is None, f"got {reason!r}")
+                healthy is None,
+                f"got {healthy!r}, wanted None — and None must never reach"
+                " _check_clear, which would read it as a pass")
 
         original_conf = tray.resolv_conf_lists
         try:
             tray.link_resolvers = lambda device: []
             tray.resolv_conf_lists = lambda resolver: True
-            reason, _ = tray.resolver_health("asuvpn0", "192.0.2.53")
+            healthy, _ = tray.resolver_health("asuvpn0", "192.0.2.53")
             r.check("a resolver in force the old way is still in force",
-                    reason is None,
-                    f"got {reason!r} — asuvpn-notify hands DNS back to"
+                    healthy is True,
+                    f"got {healthy!r} — asuvpn-notify hands DNS back to"
                     " vpnc-script whenever it cannot configure the link, and"
                     " demoting that tunnel would walk the ladder to a Duo push"
                     " every five minutes with nothing wrong")
@@ -2300,9 +2309,9 @@ def check_resolver_health(tray, r):
             tray.resolv_conf_lists = original_conf
 
         tray.link_resolvers = lambda device: []
-        reason, _ = tray.resolver_health("asuvpn0", "")
+        healthy, _ = tray.resolver_health("asuvpn0", "")
         r.check("a VPN that pushed no resolver is not judged for losing one",
-                reason is None, f"got {reason!r}")
+                healthy is None, f"got {healthy!r}")
     finally:
         tray.link_resolvers = original
 

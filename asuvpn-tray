@@ -502,7 +502,12 @@ def resolv_conf_lists(resolver):
 
 
 def resolver_health(device, expected):
-    """Why the tunnel's resolver is not in force anywhere, or None. Third check.
+    """Is the tunnel's resolver in force? True, False, or None if unanswerable.
+
+    Three outcomes, not two, and the third is the one that matters: "resolved
+    did not answer" is not the same as "the resolver is fine", and collapsing
+    them hands the caller a pass it has not earned. probe_tunnel above returns
+    the same shape for the same reason.
 
     This is the failure the other two cannot see, and the reason it needed its
     own source: the device is up, the routes are installed, packets cross the
@@ -526,10 +531,10 @@ def resolver_health(device, expected):
     if servers is None:
         return None, "systemd-resolved did not answer"
     if expected in servers:
-        return None, f"{expected} is still on {device}"
+        return True, f"{expected} is still on {device}"
     if resolv_conf_lists(expected):
-        return None, f"{expected} is in /etc/resolv.conf, not on {device}"
-    return ("the resolver the VPN pushed is no longer in force",
+        return True, f"{expected} is in /etc/resolv.conf, not on {device}"
+    return (False,
             f"{device} has {' '.join(servers) or 'no resolvers'} and"
             f" /etc/resolv.conf does not name {expected} either")
 
@@ -2304,7 +2309,7 @@ class VpnTray(StateMachine):
         openconnect's dead peer detection covers the far end going away. It
         cannot see a break that is local — a resume, a WiFi change, another
         daemon rewriting the table — and when the server never asked for DPD it
-        cannot see anything at all. Two independent sources cover that: what the
+        cannot see anything at all. Three independent sources cover that: what the
         kernel says about the device and its routes, which is free, and whether
         anything actually answers through the tunnel, which is not.
         """
@@ -2404,25 +2409,38 @@ class VpnTray(StateMachine):
 
         def work():
             try:
-                reason, detail = resolver_health(device, expected)
+                healthy, detail = resolver_health(device, expected)
             except Exception as exc:
                 # The reply has to arrive whatever happened: the in-flight flag
                 # is cleared only in _dns_check_result, so a thread that died
                 # here would disable this check for the applet's lifetime.
-                reason, detail = None, f"dns check error: {exc.__class__.__name__}"
-            GLib.idle_add(self._dns_check_result, reason, detail, generation)
+                # None, not False: our own bug is not evidence about the link.
+                healthy, detail = None, f"dns check error: {exc.__class__.__name__}"
+            GLib.idle_add(self._dns_check_result, healthy, detail, generation)
 
         threading.Thread(target=work, daemon=True).start()
 
-    def _dns_check_result(self, reason, detail, generation):
+    def _dns_check_result(self, healthy, detail, generation):
         self.dns_check_in_flight = False
         if self.quitting or generation != self.helper_generation:
             return False  # an answer about a tunnel that is no longer the live one
+        if healthy is None:
+            # Inconclusive is not a pass. Dispatching it would reach
+            # _check_clear, which zeroes the strike count and -- if this source
+            # is the one holding a demotion -- promotes the badge back and says
+            # "carrying traffic again". One resolvectl timeout between two bad
+            # checks would then reset the count for ever, and a genuinely
+            # broken link would flap instead of escalating. _probe_result has
+            # had this guard from the start; this is the same rule.
+            return False
         # A verdict like any other. The table weighs it, and stands aside in
         # RECOVERING -- openconnect is rebuilding the link, and the resolver
         # goes back on it when `reconnect` runs asuvpn-notify again, which is
         # also precisely how a demotion from here gets repaired.
-        self.dispatch(MSG_CHECK, source="dns", reason=reason, detail=detail)
+        self.dispatch(MSG_CHECK, source="dns",
+                      reason=None if healthy else
+                      "the resolver the VPN pushed is no longer in force",
+                      detail=detail)
         return False
 
     def _probe_target(self):

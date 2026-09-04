@@ -399,11 +399,30 @@ def parent_domain(host):
     derived from the endpoint the user actually configured rather than written
     into the source, so this file holds no opinion about whose VPN this is.
 
-    A bare hostname or a public-suffix-length name yields nothing: better no
-    routing domain, and DNS that plainly does not resolve, than a domain so
-    broad that every query on the machine is sent down the tunnel.
+    A bare hostname or a two-label name yields nothing: better no routing
+    domain, and DNS that plainly does not resolve, than a domain so broad that
+    every query on the machine is sent down the tunnel.
+
+    An address is not a name. DOMAIN_RE accepts "129.219.1.1" -- every label is
+    alphanumeric -- so without this an endpoint configured by IP produced the
+    routing domain "219.1.1": a name nothing will ever match, silently scoping
+    the link to nothing while the log reported success. Refusing here falls
+    through to the no-domains branch, which at least resolves.
+
+    Known limit: this counts labels, so a name under a two-part public suffix
+    (vpn.co.uk) yields "co.uk", which is too broad. Resolving that properly
+    needs the public suffix list, which is not worth a dependency here -- set
+    dns-domains explicitly on such an endpoint.
     """
-    labels = split_domains(str(host or "").strip().strip("."))
+    import ipaddress
+
+    text = str(host or "").strip().strip(".")
+    try:
+        ipaddress.ip_address(text)
+        return ""          # an address has no parent domain
+    except ValueError:
+        pass
+    labels = split_domains(text)
     if not labels:
         return ""
     parts = labels[0].split(".")
@@ -603,7 +622,16 @@ def parse_settings(text):
 def load_settings(path):
     """(values, problems) for a config file that need not exist."""
     try:
-        with open(path, encoding="utf-8") as handle:
+        # errors="replace", not strict. A file saved in latin-1 -- or any byte
+        # that is not UTF-8 -- otherwise raises UnicodeDecodeError, which is
+        # neither FileNotFoundError nor OSError and so escapes both handlers
+        # below. This function is called at import time by the tray and as the
+        # first statement of every health check, so that exception stopped the
+        # applet starting *and* killed the watchdog of a running one. The rule
+        # this file states a few lines up is absolute: a config file is not a
+        # reason to be unable to connect. A mangled byte becomes a mangled
+        # line, which parse_settings already reports and survives.
+        with open(path, encoding="utf-8", errors="replace") as handle:
             return parse_settings(handle.read())
     except FileNotFoundError:
         return defaults(), []

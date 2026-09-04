@@ -679,7 +679,9 @@ answering. Nothing below the applet can see this.
 
 Every check runs on the GLib main loop every `health-interval` seconds (a
 setting, like every tunable in this section) and is a couple of reads from
-`/sys` and `/proc` — no packets, no subprocess. Two consecutive bad checks are
+`/sys` and `/proc` — no packets, no subprocess. The probe and the resolver
+check below are the exceptions: each runs on a worker thread, and the resolver
+check spawns `resolvectl`. Two consecutive bad checks are
 required (`health-strikes`), because routes are briefly absent while
 `openconnect` reinstalls them during a legitimate reconnect.
 

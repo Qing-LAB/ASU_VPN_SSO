@@ -1356,7 +1356,6 @@ teardown, and logged precisely so a declined action never reads as a hang.
 | [`install.sh`](install.sh) | Copies the app into `~/.local` and registers it. No system changes. |
 | [`asuvpn.svg`](asuvpn.svg) | App icon. |
 | [`tests/sandbox/`](tests/sandbox/README.md) | Scenario tests: the real programs run whole lifetimes against stand-ins, in a namespace. |
-| [`DESIGN.md`](DESIGN.md) | Internals: state machine, concurrency, invariants, how it is tested. |
 | [`IMPLEMENTATION_GUIDE.md`](IMPLEMENTATION_GUIDE.md) | Read before changing anything: what is proven and what is only believed, the traps, and the lessons each bug paid for. |
 | [`ruff.toml`](ruff.toml) | Lint config. Its `ignore` list records which rules are off and why. |
 | [`DESIGN.md`](DESIGN.md) | How the code works: the state machine and its full as-built transition table, who owns DNS, the invariants, and how it is all tested. |
@@ -1376,12 +1375,16 @@ asuvpn selftest --tier environment
 asuvpn selftest --quiet          # only failures and warnings
 ```
 
-It exits 0 if nothing failed, 1 otherwise. Nothing in it needs privileges or
-talks to the VPN: the real `openconnect` is run only to describe itself
-(`--version` for its script path, `--help` for its give-up-retrying default),
-and the network is touched
-only by two probe exercises that cannot leave anything behind — a loopback
-connect, and a SYN to RFC 5737 documentation space, which must never answer.
+It exits 0 if nothing failed, 1 otherwise. Nothing in it needs privileges, and
+nothing it does can change this machine or the tunnel. It does reach the
+network three times, all read-only: the real `openconnect` is run only to
+describe itself (`--version` for its script path, `--help` for its
+give-up-retrying default); a loopback connect and a SYN to RFC 5737
+documentation space exercise the liveness probe and leave nothing behind; and
+one unauthenticated capability handshake asks your gateway which sign-in method
+it offers. That last one carries no credentials — it is the first request any
+VPN client makes — and it is skipped, not failed, when the server is
+unreachable.
 
 The reason it is shaped the way it is: **ordinary unit tests would not have
 caught a single one of the bugs that hurt this project.** Matching on
@@ -1399,7 +1402,8 @@ the middle one is the point:
 | `wiring` | `asuvpn-notify` actually executed: the event arrives with the right token and fields, the real `vpnc-script` still runs with its environment intact, the token is scrubbed before it sees it, no event can emit more than one line — and the DNS handover driven against a stand-in `resolvectl`, asserting the call order, the revert on every failure path, and that a failure always leaves the stock script its DNS job |
 
 CI adds one thing the three tiers cannot do on a single machine: it runs the
-`logic` tier inside Fedora, Arch and Debian containers. That tier is pure
+`logic` tier inside Ubuntu 22.04, Debian 12, Fedora and Arch containers. That
+tier is pure
 Python — the GUI stack is imported behind a `try`/`except`, so a machine with
 no GTK at all still loads every module and runs the contract, the state machine
 and the split-DNS rules. It proves the portable half is portable. It proves
