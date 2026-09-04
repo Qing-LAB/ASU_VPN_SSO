@@ -28,6 +28,12 @@ which:
   real ASU sign-in browser — and the guard is why that cannot recur;
 - the caller is mapped to uid 0, so the helper's privileged paths (the
   permission refusals, `/run/asuvpn`, teardown as root) are live;
+- one run at a time. `enter.sh` takes a lock and exits 91 rather than sharing
+  the directory: every scenario wipes and re-stages `home/`, `app/` and
+  `rbin/`, so two running together destroy each other's state — and the
+  results still look like scenario failures. That cost an afternoon once, a
+  `lifecycle.sh` log full of `rebuild.sh`'s stand-in giving up, chased as a
+  product bug;
 - the caller's `/etc/subgid` block is mapped as well (`--map-auto`), so gids
   other than our own exist inside. That is what lets [`sec.sh`](sec.sh) create
   a file owned by a **second group** and watch the real helper refuse it —

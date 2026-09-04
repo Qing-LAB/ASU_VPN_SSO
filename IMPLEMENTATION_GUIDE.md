@@ -37,6 +37,7 @@ before believing a bug report from your own desktop.
 | Checks | `asuvpn selftest` — three tiers, count in its own summary line; scenario suite in [tests/sandbox](tests/sandbox/README.md), every scenario asserting its outcome |
 | Analysers | ruff, pyflakes, pylint, mypy, bandit, vulture, shellcheck — all clean |
 | Tested against | openconnect v9.12-3.3, Ubuntu, GNOME, ASU's `sslvpn.asu.edu` |
+| Released | `v0.12.0` — the first release with a gate: a tag push runs neither of `checks.yml`'s triggers, so until 0.12.0 the publish could finish before the tests reported, or after they failed. `workflow.yml` now has a `verify` job the publish `needs` |
 
 **It works.** A real tunnel has been established, run, watched and torn down
 cleanly, with `default route restored:` confirmed on the way out.
@@ -128,6 +129,23 @@ not, and each cost a round of rework.
 
 - Anything on a distribution other than Ubuntu/Debian, or a desktop other than
   GNOME.
+- **The DNS health source, end to end.** The predicate is covered in the logic
+  tier — `resolver_health`'s three outcomes, `parse_link_dns` against real
+  `resolvectl` output, and `_dns_check_result` refusing to read an
+  unanswerable check as a pass — but no scenario has ever produced a DNS
+  verdict. The reason is environmental: `enter.sh` mounts a fresh tmpfs on
+  `/run`, which hides the bus a real `resolvectl` needs, so the source answers
+  "cannot tell" on every tick of every scenario and the tray discards it. A
+  stand-in and a `dnsdrop.sh` were written on 2026-09-04 and got as far as a
+  demotion and a recovery on the badge, then removed: the staging was wrong
+  twice in ways that read as product bugs, and the applet's view of the
+  stand-in's store disagreed with the scenario's for reasons that were not
+  pinned down. Worth another attempt by someone with fresh eyes; the shape of
+  the answer is a store every process in the namespace certainly shares.
+- **`asuvpn connect --wait`.** `wait_until_settled` and `wait_until_gone` are
+  never entered by anything. Deliberate: it is a polling loop whose worst
+  failure is a wrong exit code, and the machinery to drive it costs more than
+  that is worth. Revisit if anything starts scripting against those codes.
 
 ---
 
@@ -251,6 +269,32 @@ small loader in each program is the *only* thing duplicated on purpose, because
 code cannot be shared before the sharing mechanism is loaded — and the copies
 are not quite identical: the tray resolves its symlink with `realpath`, the
 others use `abspath`, and the reference copy in the contract says which.
+
+### 7. A guard that refuses the wrong caller is the same size of bug
+
+The ownership check added in 0.12.0 was wrong twice in one day, in opposite
+directions. First it was not asked at all before the contract was executed as
+root — a hole. Then, once asked, it knew only `PKEXEC_UID`, so `sudo asuvpn
+selftest` was refused against the user's own checkout and every container CI
+job refused to start — a wall. Both shipped because the question "who is the
+human behind this root process" had no test, in either direction.
+
+`C.invoking_uids()` is the one answer now, and the self-check drives both
+halves: the right caller accepted, the wrong one refused.
+
+### 8. A test harness that can lie costs more than a missing test
+
+Every sandbox scenario wipes and re-stages the same directory, and nothing
+stopped two runs doing it at once. The result was not an error message — it was
+plausible failures: a `lifecycle.sh` log full of `rebuild.sh`'s stand-in giving
+up after six seconds, chased for an hour as a product bug, with two patches
+written for it before the cause was found. `enter.sh` takes a lock now and
+exits 91 rather than sharing.
+
+The same day, a scenario for the DNS health source was written, most of the way
+proven, and then removed — twice its own staging had been mistaken for a
+product bug, and a scenario nobody can explain is worse than a gap everybody
+knows about. That gap is listed under *Not proven at all*.
 
 ---
 

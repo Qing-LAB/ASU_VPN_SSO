@@ -162,12 +162,19 @@ On Ubuntu or Debian, the whole thing:
 
 ```bash
 pipx install asuvpn
-asuvpn-bootstrap                # system packages, then the app. Uses sudo.
+asuvpn-bootstrap                # system packages, then the app
 ```
 
 `asuvpn-bootstrap` is `bootstrap.sh` — the same apt packages, the same
 `openconnect-sso` on Python 3.12, the same GNOME extension — and it finishes by
 running the user-half install itself, so that is the only command you need.
+
+**Run it as yourself, not with `sudo`.** It asks for `sudo` where it needs it,
+one command at a time. Run the whole thing under `sudo` and `$HOME` is
+`/root`, so the programs, the launcher, the `asuvpn` command and the
+`openconnect-sso` venv all land there instead of in your account — and it
+would still print "done". Both installers now refuse rather than let that
+happen.
 
 If you would rather handle the system half yourself, or you are not on apt:
 
@@ -445,6 +452,15 @@ program is **copied**, so the checkout can be moved or deleted afterwards.
 The `.desktop` file is what puts **ASU VPN** in the Activities overview and app
 grid. `install.sh` refreshes the desktop and icon caches, so it appears without
 a logout.
+
+The paths above are the defaults. All three XDG base directories are honoured
+— `XDG_DATA_HOME`, `XDG_CONFIG_HOME` and `XDG_CACHE_HOME` — on the rule the
+spec gives: an absolute value is used, anything else is ignored. So on a
+relocated home (home-manager, Nix, Guix) everything follows, and the installer
+and the applet agree about where, which CI checks on every run by installing
+with those variables set and asking the applet where it reads. `install.sh`
+prints the paths it actually used at the end of every install, and
+`asuvpn selftest` prints them too.
 
 Runtime state lives elsewhere, and is created on demand:
 
