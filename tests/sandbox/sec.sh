@@ -102,6 +102,30 @@ if [ -e "$marker" ]; then
     exit 1
 fi
 refused "a contract owned by another uid" "$rc" "$out"
+echo "--- e4) the same, against asuvpn-notify, the other program root runs ---"
+# The loader guard is duplicated in every program that loads the contract,
+# because code cannot be shared before the mechanism that shares it is
+# loaded. That duplication is irreducible, so the four copies drifting is a
+# standing risk -- and they had: the ownership half was missing from all of
+# them until today. asuvpn-notify is the second program that runs as root
+# (openconnect executes it, not pkexec), and nothing exercised its copy.
+rm -f "$marker"
+cp "$A/asuvpn_contract.py" "$A/real_contract.py"
+{ printf 'import pathlib; pathlib.Path(%s).write_text("ran")\n' "\"$marker\"";
+  cat "$A/real_contract.py"; } > "$A/asuvpn_contract.py"
+chown 65534 "$A/asuvpn_contract.py"; chmod 0644 "$A/asuvpn_contract.py"
+out="$(env reason=pre-init TUNDEV=lo "$A/asuvpn-notify" 2>&1)"; rc=$?
+printf '%s\n' "$out" | head -1 | sed 's/^/      /'
+rm -f "$A/asuvpn_contract.py"; mv "$A/real_contract.py" "$A/asuvpn_contract.py"
+if [ -e "$marker" ]; then
+    rm -f "$marker"
+    echo "      FAIL: asuvpn-notify RAN a foreign-owned contract as root" >&2
+    exit 1
+fi
+if [ "$rc" -eq 0 ] || ! printf '%s' "$out" | grep -q 'refusing'; then
+    echo "      FAIL: asuvpn-notify did not refuse it (exit=$rc)" >&2; exit 1
+fi
+echo "      refused (exit=$rc) without executing anything"
 # There is no case (e): the dpd refusals that carried the letter moved to
 # sec3.sh, and the letters after it are cross-referenced from sec2.sh and
 # the design notes, so they keep their names; e2 fills the hole with the
