@@ -616,7 +616,7 @@ def run(command, timeout=5):
 
 def tunnel_interfaces():
     try:
-        names = os.listdir("/sys/class/net")
+        names = os.listdir(C.SYS_CLASS_NET)
         return {n for n in names if n.startswith(TUNNEL_PREFIXES)}
     except OSError:
         return set()
@@ -629,7 +629,7 @@ def interface_exists(name):
     caller-supplied --interface can be called anything, so neither is guaranteed
     to match the tun/tap/vpn prefixes used for spotting strays.
     """
-    return bool(name) and os.path.exists(f"/sys/class/net/{name}")
+    return bool(name) and os.path.exists(f"{C.SYS_CLASS_NET}/{name}")
 
 
 def dns_owner(event_dir):

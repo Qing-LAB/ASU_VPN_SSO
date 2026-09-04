@@ -430,6 +430,25 @@ def check_owner_is_a_principal(C, r):
                 "the older, blunter finding must not be masked by the new one")
 
 
+def first_routed_device():
+    """A device this machine has an IPv4 route through, or None.
+
+    `lo` is not one: it has no entry in /proc/net/route at all. Two checks
+    need a device that really carries routes, and asking the kernel is the
+    only way to name one that is true on this machine rather than on mine.
+    """
+    try:
+        with open("/proc/net/route", encoding="utf-8") as handle:
+            next(handle, "")
+            for line in handle:
+                fields = line.split()
+                if fields:
+                    return fields[0]
+    except OSError:
+        pass
+    return None
+
+
 def check_tunnel_health(tray, r):
     """The watchdog's verdicts, against devices that are certainly present.
 
@@ -441,15 +460,28 @@ def check_tunnel_health(tray, r):
     cry wolf on every session.
     """
     try:
-        with open("/sys/class/net/lo/ifindex") as fh:
+        with open(f"{tray.C.SYS_CLASS_NET}/lo/ifindex") as fh:
             lo_index = int(fh.read().strip())
     except (OSError, ValueError):
         r.warn("a healthy device is not reported as broken", "no lo to test with")
         return
-    reason, facts = tray.tunnel_health("lo", lo_index)
+    # A device that actually has routes, which `lo` need not: it has no entry
+    # in /proc/net/route at all, so on a machine with IPv6 disabled its counts
+    # are (0, None) and the healthy case failed for a reason that had nothing
+    # to do with the code. This suite ships to users and runs in containers,
+    # where that is a normal configuration.
+    healthy, healthy_index = "lo", lo_index
+    counts = tray.route_count("lo")
+    if not [count for count in counts if count]:
+        routed = first_routed_device()
+        if routed:
+            index = tray.C.interface_index(routed)
+            if index is not None:
+                healthy, healthy_index = routed, index
+    reason, facts = tray.tunnel_health(healthy, healthy_index)
     r.check("a healthy device is not reported as broken", reason is None,
-            f"lo was called broken: {reason!r} ({facts}) — a watchdog that"
-            " false-alarms on a working link is worse than none")
+            f"{healthy} was called broken: {reason!r} ({facts}) — a watchdog"
+            " that false-alarms on a working link is worse than none")
     reason, _ = tray.tunnel_health("asuvpn99", None)
     r.check("a missing device is reported",
             reason is not None and "gone" in reason, f"got {reason!r}")
@@ -473,6 +505,40 @@ def check_tunnel_health(tray, r):
             leaked.append(name)
     r.check("a device name that could not name a device is never used as a path",
             not leaked, f"these were used unvalidated: {leaked}")
+    # The one verdict no real device can stage: a tunnel that exists and is
+    # administratively down. The sandbox shares the host's network namespace
+    # and cannot create devices, so this points the kernel-facts directory at
+    # one the check builds. Deleting the IFF_UP branch used to change nothing
+    # anywhere in the suite.
+    original_sys = tray.C.SYS_CLASS_NET
+    with tempfile.TemporaryDirectory() as fake_sys:
+        os.makedirs(os.path.join(fake_sys, "asuvpn0"))
+        with open(os.path.join(fake_sys, "asuvpn0", "ifindex"), "w",
+                  encoding="utf-8") as handle:
+            handle.write("42\n")
+
+        def flags(value):
+            with open(os.path.join(fake_sys, "asuvpn0", "flags"), "w",
+                      encoding="utf-8") as handle:
+                handle.write(value + "\n")
+
+        try:
+            tray.C.SYS_CLASS_NET = fake_sys
+            flags("0x1002")          # IFF_BROADCAST, no IFF_UP
+            down, _ = tray.tunnel_health("asuvpn0", 42)
+            flags("0x1003")          # the same device, up
+            up, _ = tray.tunnel_health("asuvpn0", 42)
+        finally:
+            tray.C.SYS_CLASS_NET = original_sys
+    r.check("a device that is administratively down is a verdict",
+            down is not None and "down" in down,
+            f"got {down!r} — one of the four things the watchdog is built on,"
+            " and no real device can be staged to prove it")
+    r.check("the same device, up, is not a verdict on its flags",
+            up is None or "down" not in up,
+            f"got {up!r} — otherwise the check above would pass against a"
+            " predicate that always says down")
+
     fake = tray.route_count("asuvpn-nope")
     r.check("routes are counted for a real device and not for a fake one",
             tray.route_count("lo") != (0, 0) and fake[0] == 0 and not fake[1],
@@ -482,17 +548,7 @@ def check_tunnel_health(tray, r):
     # and blinding the IPv4 branch left the whole suite green. IPv4 is the
     # half that matters most -- `ip route flush dev X` removes only IPv4, and
     # that is the break this watchdog was built for.
-    routed = None
-    try:
-        with open("/proc/net/route", encoding="utf-8") as fh:
-            next(fh, "")
-            for line in fh:
-                fields = line.split()
-                if fields:
-                    routed = fields[0]
-                    break
-    except OSError:
-        routed = None
+    routed = first_routed_device()
     if routed is None:
         r.warn("IPv4 routes are counted, not just IPv6 ones",
                "no device on this machine has an IPv4 route to count")
@@ -1940,6 +1996,28 @@ def check_liveness_probe(tray, r):
     r.check("a refused connection counts as a live tunnel", alive is True,
             f"got alive={alive!r} ({detail}) — a RST is a reply, and treating"
             " it as death would condemn a working tunnel")
+    # Silence, which is the probe's whole reason to exist and the one verdict
+    # the suite never asserted: `is not True` was as far as it went, so
+    # turning the timeout branch into "inconclusive" changed nothing here and
+    # disabled black-hole detection with only a five-minute display scenario
+    # standing between it and shipping. Staged by making the connect time out
+    # rather than by aiming at an address and hoping this network drops it —
+    # a network that answers or rejects would otherwise decide the result.
+    original_connect = tray.socket.create_connection
+
+    def never_answers(*_args, **_kwargs):
+        raise TimeoutError("staged")
+
+    try:
+        tray.socket.create_connection = never_answers
+        silent, silent_detail = tray.probe_tunnel("192.0.2.1", 53, 3)
+    finally:
+        tray.socket.create_connection = original_connect
+    r.check("silence is a failure, not an inconclusive answer", silent is False,
+            f"got alive={silent!r} ({silent_detail}) — a tunnel that carries"
+            " nothing is exactly what this check is for, and None would be"
+            " discarded by _probe_result without ever striking")
+
     alive, detail = tray.probe_tunnel("", 53, 3)
     # A name getaddrinfo cannot even encode raises UnicodeError, which is not
     # an OSError; unhandled it killed the probe thread, and probe_in_flight
@@ -2927,8 +3005,17 @@ def check_no_bytecode(r):
 
 
 def check_installed_permissions(C, r):
-    """The helper's own refusal criteria, applied now instead of at first connect."""
+    """The helper's own refusal criteria, applied now instead of at first connect.
+
+    *Its* criteria, which means the ownership half too. This passed no
+    trusted uids, and None is exactly what switches that half off -- so on a
+    checkout owned by another user the self-check reported "nothing the helper
+    runs as root is writable by anyone else" and the first connect then died
+    with exit 26. The whole point of running it now is to say what will happen
+    then.
+    """
     problems = []
+    trusted = C.invoking_uids()
     # asuvpn_contract.py is on this list because the helper *executes* it as
     # root. It was missed when the contract was introduced: the check listed the
     # programs it knew about, and a new file that runs with the same privilege
@@ -2936,10 +3023,10 @@ def check_installed_permissions(C, r):
     for path in (HERE, os.path.join(HERE, "asuvpn-helper"),
                  os.path.join(HERE, "asuvpn-notify"),
                  os.path.join(HERE, "asuvpn_contract.py")):
-        reason = C.unsafe_write_access(path)
+        reason = C.unsafe_write_access(path, trusted_uids=trusted)
         if reason:
             problems.append(f"{path} is {reason}")
-    r.check("nothing the helper runs as root is writable by anyone else",
+    r.check("nothing the helper runs as root is writable or owned by another",
             not problems,
             "; ".join(problems) + "\n            the helper refuses to start"
             " like this. Fix with: chmod go-w " + HERE)
@@ -3458,6 +3545,25 @@ def check_every_argument_has_a_rule(helper, r):
         if element in extra:
             continue                     # the passthrough, held to the blocklist
         unvouched.append(element)
+    # The other direction, which this could not see: the assertion above is
+    # "no unvouched element", and deleting an element makes that *more* true.
+    # Removing --servercert -- the only authentication of the gateway, since
+    # this deployment's chain is not in the system trust store -- left the
+    # whole suite green, and lifecycle.sh green with it. So the command's
+    # required parts are pinned as parts, not merely permitted.
+    required = ("--useragent", "--version-string", "--cookie-on-stdin",
+                "--servercert")
+    absent = [flag for flag in required if flag not in command]
+    pinned = ("--servercert" in command
+              and command.index("--servercert") + 1 < len(command)
+              and sentinels["fingerprint"]
+              in command[command.index("--servercert") + 1])
+    r.check("the command still carries what makes it safe to run",
+            not absent and pinned,
+            f"missing={absent} pin_follows_servercert={pinned} —"
+            " --servercert is the only thing authenticating the gateway here,"
+            " and --cookie-on-stdin is what keeps the session out of argv and"
+            " off an interactive prompt")
     r.check("every value on openconnect's command line has a rule",
             not unvouched,
             f"these reach the argv with nothing vouching for them:"

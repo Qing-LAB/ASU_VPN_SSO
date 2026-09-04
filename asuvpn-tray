@@ -656,7 +656,7 @@ def tunnel_health(device, ifindex, routes_seen=None):
     if ifindex is not None and current != ifindex:
         return "the tunnel device was replaced by a different one", facts
     try:
-        with open(f"/sys/class/net/{device}/flags") as fh:
+        with open(f"{C.SYS_CLASS_NET}/{device}/flags") as fh:
             flags = int(fh.read().strip(), 16)
         facts["flags"] = f"0x{flags:x}"
         if not flags & IFF_UP:

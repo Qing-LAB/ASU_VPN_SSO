@@ -307,6 +307,13 @@ REASON_STATES = {
 # before a trailing newline, so "asuvpn0\n" passed as a device name.
 INTERFACE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,14}\Z")
 
+# Where the kernel publishes what it knows about a network device. A constant
+# because four places build paths under it, and because a test cannot stage a
+# device that is administratively down -- the self-check points this at a
+# directory it made instead, which is the only way that verdict can be
+# exercised at all.
+SYS_CLASS_NET = "/sys/class/net"
+
 # A gateway, as the sign-in hands it over and as openconnect will be given it.
 #
 # Anchored, and it must not start with "-". That is the whole point: this value
@@ -387,7 +394,7 @@ def interface_index(name):
     read is still a fact.
     """
     try:
-        with open(f"/sys/class/net/{name}/ifindex") as fh:
+        with open(f"{SYS_CLASS_NET}/{name}/ifindex") as fh:
             return int(fh.read().strip())
     except (OSError, ValueError):
         return None
