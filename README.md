@@ -1593,7 +1593,7 @@ the measured window.
 The stand-in exercises earlier in this section — the launch races, the exit
 code sweep, the arbitrary-directory installs — predate the committed suite
 and were run with earlier versions of the same fakes before the harness moved into the
-repository; the sixteen committed scenarios are the ones tabulated in
+repository; the fifteen committed scenarios are the ones tabulated in
 [tests/sandbox](tests/sandbox/README.md).
 
 What is proven live against the real gateway (full connects and teardowns,

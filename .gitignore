@@ -19,6 +19,7 @@ tests/sandbox/tray.err
 tests/sandbox/evil_contract.py
 tests/sandbox/ctl
 tests/sandbox/prompt.pid
+tests/sandbox/.lock
 
 # packaging build output
 dist/
