@@ -126,7 +126,12 @@ jobs:
           # install produced, which is the only form that cannot be satisfied
           # by the text alone.
           schema=$(python3 -c 'import importlib.util as u; s=u.spec_from_file_location("c","asuvpn_contract.py"); m=u.module_from_spec(s); s.loader.exec_module(m); print(m.SETTINGS_BY_NAME["server"].default)')
-          wrote=$(sed -n 's/^server = //p' /tmp/wheel-home/.config/asuvpn/asuvpn.conf)
+          # Asked of the contract rather than assumed: the runner exports
+          # XDG_CONFIG_HOME, so the config does not land under the throwaway
+          # HOME at all, and hardcoding that path made this step fail against
+          # a perfectly good install.
+          conf=$(HOME=/tmp/wheel-home python3 -c 'import importlib.util as u; s=u.spec_from_file_location("c","asuvpn_contract.py"); m=u.module_from_spec(s); s.loader.exec_module(m); print(m.config_path())')
+          wrote=$(sed -n 's/^server = //p' "$conf")
           if [ "$schema" != "$wrote" ]; then
             echo "the schema default is '$schema' but a fresh install wrote" >&2
             echo "'$wrote' -- the installers' hand-copied default has drifted." >&2
@@ -200,6 +205,13 @@ jobs:
             echo "no package manager recognised in this image" >&2; exit 1
           fi
           python3 -V
+
+      # The job runs as root while actions/checkout leaves the tree owned by
+      # uid 1001, and a root process about to execute another user's code is
+      # exactly what the loader refuses -- correctly. CI is not an exception
+      # to that rule; it was accidentally staging it.
+      - name: the checkout belongs to the user running it
+        run: chown -R 0:0 .
 
       - name: the logic tier, on a machine with no desktop at all
         run: python3 -I asuvpn-selftest --tier logic

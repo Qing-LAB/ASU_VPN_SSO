@@ -71,11 +71,17 @@ def _contract():
         # by another user was run and only then refused. An owner can rewrite
         # their own file whatever its mode, so the two questions are one
         # question and both have to be asked before exec_module.
+        # PKEXEC_UID and SUDO_UID both name the human behind a root process;
+        # sudo was missing, and `sudo asuvpn selftest` is a usage this project
+        # anticipates in its own code. Restates C.invoking_uids(), which lives
+        # in the file this is about to load.
         trusted = {0}
-        try:
-            trusted.add(int(os.environ["PKEXEC_UID"]))
-        except (KeyError, ValueError):
-            pass
+        for variable in ("PKEXEC_UID", "SUDO_UID"):
+            try:
+                trusted.add(int(os.environ[variable]))
+                break
+            except (KeyError, ValueError):
+                continue
         for target in (here, path):
             info = os.stat(target)
             if info.st_mode & stat.S_IWOTH or (
@@ -901,16 +907,10 @@ def main():
     # Ownership is part of the question, not just permissions. "The
     # unprivileged user owns it" is the design; *which* unprivileged user is
     # the thing to check, because an owner can rewrite their own file whatever
-    # its mode. pkexec puts the caller's real uid in PKEXEC_UID; root is
-    # allowed too, since a root-owned install is strictly safer than the
-    # documented one. If PKEXEC_UID is absent or unparseable we are not under
-    # pkexec, so fall back to the real uid -- and never to an empty set, which
-    # would refuse every path.
-    trusted = {0}
-    try:
-        trusted.add(int(os.environ["PKEXEC_UID"]))
-    except (KeyError, ValueError):
-        trusted.add(os.getuid())
+    # its mode. Who that is has one answer, in the contract, so that this and
+    # the loader above cannot come to different conclusions about the same
+    # process.
+    trusted = C.invoking_uids()
     for path in (HERE, os.path.abspath(__file__), NOTIFY, CONTRACT):
         reason = C.unsafe_write_access(path, trusted_uids=trusted)
         if reason:

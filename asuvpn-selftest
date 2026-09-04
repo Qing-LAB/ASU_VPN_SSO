@@ -208,11 +208,17 @@ def load(name, filename):
         # by another user was run and only then refused. An owner can rewrite
         # their own file whatever its mode, so the two questions are one
         # question and both have to be asked before exec_module.
+        # PKEXEC_UID and SUDO_UID both name the human behind a root process;
+        # sudo was missing, and `sudo asuvpn selftest` is a usage this project
+        # anticipates in its own code. Restates C.invoking_uids(), which lives
+        # in the file this is about to load.
         trusted = {0}
-        try:
-            trusted.add(int(os.environ["PKEXEC_UID"]))
-        except (KeyError, ValueError):
-            pass
+        for variable in ("PKEXEC_UID", "SUDO_UID"):
+            try:
+                trusted.add(int(os.environ[variable]))
+                break
+            except (KeyError, ValueError):
+                continue
         for target in (HERE, path):
             info = os.stat(target)
             if info.st_mode & stat.S_IWOTH or (

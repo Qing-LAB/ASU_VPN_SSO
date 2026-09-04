@@ -48,6 +48,32 @@ CONTRACT_VERSION = 2
 # --------------------------------------------------------------- permissions
 
 
+def invoking_uids():
+    """Root, plus the human who asked for this -- however they asked.
+
+    pkexec exports PKEXEC_UID and sudo exports SUDO_UID; both sanitise the
+    environment they set it in, which is the same trust the helper already
+    placed in PKEXEC_UID alone. With neither, the real uid is the answer, and
+    for a process that is genuinely root that is just root again.
+
+    One function because the question has one answer and three askers -- the
+    helper before it runs openconnect, and the loader in each program before
+    it executes the contract as root. The loaders cannot call this (it lives
+    in the file they are about to load), so they restate the rule; that
+    duplication is irreducible and is proved per program by sec.sh rather
+    than promised by a comment.
+    """
+    trusted = {0}
+    for variable in ("PKEXEC_UID", "SUDO_UID"):
+        try:
+            trusted.add(int(os.environ[variable]))
+            return trusted
+        except (KeyError, ValueError):
+            continue
+    trusted.add(os.getuid())
+    return trusted
+
+
 def unsafe_write_access(path, trusted_uids=None):
     """Why `path` may be written by somebody we do not trust, or None.
 
