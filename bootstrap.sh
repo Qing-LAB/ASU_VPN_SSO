@@ -530,7 +530,7 @@ $(say "the app is installed; the system packages above are not")
   What works right now:
 
       asuvpn selftest       # what this machine still needs, checked live
-      asuvpn --write-config # print a settings file
+      asuvpn --write-config "$SERVER"   # print a settings file
 
   The tray applet and connecting need the packages listed above. Install them
   with your own package manager -- nothing here has to be run again afterwards.

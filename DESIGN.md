@@ -248,7 +248,7 @@ stateDiagram-v2
     demoted --> demoted: tunnel-up — adopt only, incident kept
     demoted --> connected: the demoting source passes again
     connected --> disconnecting: disconnect, reconnect, quit
-    recovering --> disconnecting: disconnect, cancel, quit
+    recovering --> disconnecting: disconnect, cancel, quit, reconnect, connect
     demoted --> disconnecting: disconnect, reconnect, connect, quit, watchdog sign-in
     connecting --> disconnecting: cancel, disconnect
     disconnecting --> disconnected: helper exited
@@ -368,6 +368,8 @@ row would be a button that logs `ignoring …` and does nothing.
 | --- | --- | --- |
 | `disconnected`, `failed` | Connect | nothing to tear down |
 | `failed`, rebuild owed | Connect, **Stop reconnecting** | something *is* pending, so there has to be a way to call it off that is not "change a setting". The row is `(failed, disconnect)`, which already did exactly this |
+| `failed`, helper still alive | Connect, **Disconnect** | a teardown that timed out lands here holding a live root `openconnect`. The panel otherwise offered Connect and Quit, and Connect spent a Duo push to arrive at "a tunnel is already running" |
+| `authenticating`, `connecting` | Cancel, and the CLI's Connect/Reconnect | the menu keeps Cancel as the only *button*, but the CLI has no menu and its verbs now have rows: dropping them answered `ok` and did nothing |
 | `authenticating`, `connecting` | Cancel | an attempt is in flight and nothing is established yet |
 | `recovering` | Cancel | openconnect owns the retry; stopping it is abandoning an attempt, not closing a session |
 | `connected`, `demoted` | Disconnect, Reconnect | both are established sessions. Cancel is the wrong word for tearing one down, which is why `demoted` had to become a real state |
@@ -427,7 +429,7 @@ Three sources, in strict order of authority.
 | --- | --- | --- |
 | **Script contract** (`asuvpn-notify` → helper → `[helper] STATE …`) | `reason`, device, assigned address | always, when the channel is up |
 | **`/sys/class/net/<dev>/ifindex`** | proof the device is the one we created | teardown ownership only |
-| **Log patterns** | a guess | fallback only, disabled the moment a real event arrives |
+| **Log patterns** | a guess | fallback only. The *state* half is disabled the moment a real event arrives, and re-armed if the helper reports the event channel has died — its warning says the tray will fall back, and for a long time the tray did not. The *failure* half always runs: gating it behind the same latch once reported a post-connect failure as a bare "exited with status 1" |
 
 `openconnect` runs `vpnc-script` at every transition with the state in the
 environment. The mapping the helper applies:
@@ -944,8 +946,8 @@ rebuild is owed, labelled **Stop reconnecting**: "Disconnect" is the wrong
 word for a tunnel that is already gone, and what is being stopped is a
 sign-in that has not happened yet.
 
-The three ways a rebuild is called off without a state change of its own all
-go through `_disarm`, which rewrites only the badge's trailing promise and
+Two of the three ways a rebuild is called off without a state change of its
+own go through `_disarm`, which rewrites only the badge's trailing promise and
 keeps the failure that caused it. Outside the log that detail is the only
 record of *why*, and it reaches `asuvpn status` as well as the panel.
 
@@ -1110,7 +1112,7 @@ the log. Wording is not an interface, here either.
 | `22` | the requested interface name could not name a device |
 | `23` | the requested interface already exists; refusing to take over a device we did not create |
 | `24` | no free `asuvpnN` name |
-| `25` | a refused option: one that would detach `openconnect` from the helper (`--background`, `--syslog`, `--pid-file`), one that runs a program as root (`--csd-wrapper`), one that reads more options from a file (`--config`), one that leaves no device to tear down (`--script-tun`), a bundled short option, **or any unambiguous abbreviation of those** — `getopt_long` accepts `--backg`, so refusing only the full spelling refused nothing. `--script` is the one exact spelling that is permitted, being the extension point the helper itself chains through |
+| `25` | a refused option: one that would detach `openconnect` from the helper (`--background`, `--syslog`, `--pid-file`), one that runs a program as root (`--csd-wrapper`), one that reads more options from a file (`--config`), one that leaves no device to tear down (`--script-tun`), one that ends the run before a tunnel exists (`--cookieonly`, `--authenticate`), a bundled short option, **or any unambiguous abbreviation of those** — `getopt_long` accepts `--backg`, so refusing only the full spelling refused nothing. `--script` is the one exact spelling that is permitted, being the extension point the helper itself chains through |
 | `26` | the helper, its directory, `asuvpn-notify` or `asuvpn_contract.py` is writable by another principal |
 | `27` | a negative dead-peer interval reached the helper; the config parser cannot produce one, so it came from a direct caller |
 | `28` | `--host`, `--fingerprint` or `--ac-version` failed its rule in `ARGUMENT_RULES`, the one table of everything caller-controlled that reaches `openconnect`'s command line. `--host` becomes the last element of `openconnect`'s argv and `getopt_long` permutes, so a value starting with `-` is an *option* there — `-b` is `--background`, `--config=…` re-admits everything the blocklist refuses. `UNSUPPORTED_OPTIONS` only ever saw the passthrough arguments |
@@ -1143,7 +1145,7 @@ where it can be, checked by `asuvpn selftest`.
 | No unattended wait is unbounded | `signin-timeout` bounds the browser sign-in *and* the polkit prompt after it — a polkit agent does not time out, so `connecting` was the one state a rebuild could wedge in, and the watchdog does not run there | `authprompt.sh` stages a prompt nobody answers and asserts the applet leaves `connecting`, dismisses the dialog and says why; the logic tier drives the row |
 | Recovery never costs a Duo push while a free option remains | `SIGUSR2` first — waited for if rate-limited, never skipped — the sign-in rung is unreachable until the nudge is spent | `escalate.sh` **asserts** exactly one nudge and one sign-in over 115s; the held-nudge rule in the logic tier |
 | openconnect cannot drive the control channel | it is spawned with its own `stdin` pipe | `fdcheck.sh` asserts `/proc/<pid>/fd/0` of the two are distinct (the child's open mode is printed for the reader) |
-| A refusal is reported as a sentence, not a number | `[helper] FATAL ` marker, set by the helper | wiring tier, by running three refused connects |
+| A refusal is reported as a sentence, not a number | `[helper] FATAL ` marker, set by the helper | wiring tier, by running six refused connects and one that must not be |
 | Everything executed as root is unwritable by a second principal | every loader's bootstrap check, the helper's runtime list (exit 26), `install.sh`'s `go-w` sweep | environment tier, by making each file writable in turn, and end to end for a shared group in the sandbox (`sec.sh` b/b2) |
 | The VPN's resolver stays in force for the life of the tunnel | per-link configuration through `systemd-resolved`, never `/etc/resolv.conf`; a third watchdog source asserts it every check and the ladder reconfigures it | logic tier drives every `resolver_health` verdict; the wiring tier drives `asuvpn-notify` against a stand-in `resolvectl` and asserts the call order, the revert on every failure, and that `INTERNAL_IP4_DNS` survives each one |
 | The version the programs print is the version the wheel carries | `VERSION` in the contract is read at runtime by the menu, the log, `--version` and the self-test, and at build time by hatchling out of the same line; the release workflow refuses a tag that disagrees with it | CI builds the wheel, installs it, and compares the installed `asuvpn --version` with the artifact — a result, not a reading of `pyproject.toml` |
@@ -1351,7 +1353,7 @@ transcribed, so a hand-edit is how it starts describing a program that does not
 exist. Nothing checks this for you; that is deliberate, and *Adding a check*
 below says why.
 
-**Adding a setting.** One `Setting(...)` in `SETTINGS` in
+**Adding a setting.** One `Setting(...)` in `SCHEMA` in
 `asuvpn_contract.py` is the whole of it: the generated config file, its
 documentation and its defaults all come from that entry, and a config written
 by an older version still loads because absent keys take defaults. If the

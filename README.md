@@ -233,8 +233,11 @@ The menu shows only what applies to the current state: **Connect** when down,
 **Disconnect** and **Reconnect** when up, and **Cancel** while signing in or
 connecting. While the applet is waiting to retry a connection that dropped,
 **Stop reconnecting** appears — it calls the retries off without changing any
-setting. Nothing can be cancelled during teardown, which must not be
-interrupted. **Show log…** opens a live log window, and **Quit** closes the
+setting. **Disconnect** also appears in one other place: after a teardown that
+timed out, where the applet is still holding a live tunnel it could not close,
+so there has to be a way to try again. The teardown itself is never
+interrupted — but `asuvpn disconnect` during a *reconnect* now stops the
+sign-in that would have followed it. **Show log…** opens a live log window, and **Quit** closes the
 tunnel first. The bottom of the menu names the running build — the same
 answer `asuvpn --version` gives, and the applet logs it once at startup.
 
@@ -1273,7 +1276,8 @@ first on `PATH`, because a conda or pyenv install will shadow it and will not
 have `gi`.
 
 **Python 3.10 or newer** for the applet itself — the floor Ubuntu 22.04 sets,
-and CI runs the portable half on 3.10, 3.11 and 3.12+ on every push so the
+and CI runs the portable half on 3.10, 3.11 and 3.12+ on every push to
+`main` and every pull request, so the
 claim is tested rather than asserted. Note this is a *different* requirement
 from the Python 3.12 `openconnect-sso` needs below: that one lives in its own
 pipx venv and the applet never runs on it.
@@ -1392,7 +1396,7 @@ teardown, and logged precisely so a declined action never reads as a hang.
 | [`DESIGN.md`](DESIGN.md) | How the code works: the state machine and its full as-built transition table, who owns DNS, the invariants, and how it is all tested. |
 | [`SECURITY.md`](SECURITY.md) | How to report a vulnerability privately, what is in scope, and what belongs upstream. |
 | [`pyproject.toml`](pyproject.toml) + [`asuvpn_dist/`](asuvpn_dist/install.py) | The PyPI delivery channel: a wheel carrying these same files, plus `asuvpn-bootstrap` and `asuvpn-install`, which run the bundled `bootstrap.sh` and `install.sh`. No second installer. |
-| [`.github/workflows/`](.github/workflows) | CI: the self-test and analysers on every push and PR; the scenario sandbox on main; PyPI publishing on a `v*` tag. |
+| [`.github/workflows/`](.github/workflows) | CI: the self-test and analysers on every push to `main` and every PR; the scenario sandbox on main; PyPI publishing on a `v*` tag, gated on a `verify` job because a tag push runs neither of the other two. |
 | [`LICENSE`](LICENSE) | MIT. |
 
 ### Checking it
@@ -1476,7 +1480,7 @@ shellcheck -S style bootstrap.sh install.sh tests/sandbox/*.sh \
 All of these are expected to be clean. None of them need installing: `pipx run
 <tool>` runs each from pipx's own cache and touches nothing else (the last one
 as `pipx run --spec shellcheck-py shellcheck`). CI runs this same list plus
-the full self-test on every push and pull request
+the full self-test on every push to `main` and every pull request
 ([checks.yml](.github/workflows/checks.yml)), and the whole scenario sandbox
 on pushes to main ([scenarios.yml](.github/workflows/scenarios.yml)). mypy's `--ignore-missing-imports`
 is for `gi`, which ships no stubs.

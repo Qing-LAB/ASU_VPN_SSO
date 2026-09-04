@@ -335,7 +335,8 @@ asuvpn log -f                   # what it is actually doing
 
 Analysers (all expected clean) are listed in the README's
 [Checking it](README.md#checking-it) section; CI runs them plus the full
-self-test on every push (`checks.yml`) and the scenario sandbox on main
+self-test on every push to `main` and every pull request (`checks.yml`),
+and the scenario sandbox on main
 (`scenarios.yml`). Releases: bump `VERSION` in
 `asuvpn_contract.py` (the single source — the build, `--version`, the menu
 and the startup log all read it), commit, then push a matching `v*` tag and

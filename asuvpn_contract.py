@@ -869,18 +869,36 @@ def config_path():
 #         here = os.path.dirname(os.path.abspath(__file__))   # the tray: realpath
 #         path = os.path.join(here, "asuvpn_contract.py")
 #         if os.geteuid() == 0:          # running privileged: verify before exec
+#             trusted = {0}              # restates invoking_uids(), which lives
+#             for variable in ("PKEXEC_UID", "SUDO_UID"):   # in the very file
+#                 try:                                      # about to be loaded
+#                     trusted.add(int(os.environ[variable]))
+#                     break
+#                 except (KeyError, ValueError):
+#                     continue
 #             for target in (here, path):
 #                 info = os.stat(target)
 #                 if info.st_mode & stat.S_IWOTH or (
 #                         info.st_mode & stat.S_IWGRP and info.st_gid != info.st_uid):
 #                     raise SystemExit(f"refusing to load {target}: writable by others")
+#                 if info.st_uid not in trusted:
+#                     raise SystemExit(f"refusing to load {target}: owned by uid"
+#                                      f" {info.st_uid}, who is neither root nor"
+#                                      " the user asking for this")
 #         loader = importlib.machinery.SourceFileLoader("asuvpn_contract", path)
 #         spec = importlib.util.spec_from_loader("asuvpn_contract", loader)
 #         module = importlib.util.module_from_spec(spec)
 #         loader.exec_module(module)
 #         return module
 #
-# The permission test is skipped when unprivileged. Loading a file you own, as
+# Both halves are load-bearing, and the ownership one is the newer. Permissions
+# say who may write a file *besides* its owner; an owner rewrites their own file
+# whatever the mode. Asking only the first meant a contract owned by another
+# user was executed as root and refused *afterwards*, by the copy of the
+# question that lives in main(). Anyone writing a fifth loader has to copy both,
+# and the `sys.dont_write_bytecode = True` that precedes it.
+#
+# The whole test is skipped when unprivileged. Loading a file you own, as
 # yourself, crosses no boundary -- and refusing there would break --link mode
 # from an ordinary umask-002 checkout for no gain, which is a false positive
 # this project has already had once.
