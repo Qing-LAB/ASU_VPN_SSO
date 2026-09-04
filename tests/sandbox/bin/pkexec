@@ -11,6 +11,12 @@
 # stand-in that talks while pretending to be a dialog nobody answered is
 # staging the wrong thing.
 if [ -n "$FAKE_PKEXEC_HANG" ]; then
+  # The variable is a path, and the pid goes in it. The scenario used to find
+  # this process with `pgrep -f "^sleep 3600$"`, and enter.sh gives the
+  # sandbox a user and mount namespace but no PID namespace -- so that search
+  # saw the whole host, took the lowest match, and failed against an unrelated
+  # sleep somebody had left running. Which is exactly what happened.
+  echo $$ > "$FAKE_PKEXEC_HANG"
   exec sleep 3600
 fi
 exec "$@"

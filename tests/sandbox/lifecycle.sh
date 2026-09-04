@@ -12,7 +12,23 @@ start_tray
 await_status "Connected" 30 "connected after connect"
 "$A" reconnect >/dev/null 2>&1
 await_status "Connected" 60 "connected again after reconnect"
+# A positive control for the whole quiet half of this scenario. Everything
+# below is a negative grep, and a watchdog that never ran produces exactly
+# the same silence as a healthy one -- proved by stubbing the tick out, after
+# which this scenario still passed with "healthy throughout". The tick
+# re-reads the config every cycle and reports a problem when one appears, so
+# a deliberately bad value is a tick's heartbeat with no new logging in the
+# product.
+CONF="$SB/home/.config/asuvpn/asuvpn.conf"
+printf 'dpd = not-a-number\n' >> "$CONF"
 sleep 65
+if ! grep -q '\[config\]' "$LOG"; then
+  echo "  FAIL: the watchdog tick never re-read the config, so every" >&2
+  echo "  'nothing was wrong' below is the silence of a tick that did not run" >&2
+  exit 1
+fi
+echo "  ok: the watchdog tick is running (it noticed a bad config line)"
+sed -i '/^dpd = not-a-number$/d' "$CONF"
 s="$("$A" status)"; echo "  after probes : $s"
 "$A" disconnect >/dev/null 2>&1
 await_status "Disconnected" 60 "disconnected on request"

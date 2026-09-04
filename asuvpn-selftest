@@ -472,6 +472,30 @@ def check_tunnel_health(tray, r):
     r.check("routes are counted for a real device and not for a fake one",
             tray.route_count("lo") != (0, 0) and fake[0] == 0 and not fake[1],
             f"lo={tray.route_count('lo')} fake={fake}")
+    # The IPv4 half, separately, because `lo` has no entry in /proc/net/route
+    # at all: the assertion above was carried entirely by lo's two ::1 routes,
+    # and blinding the IPv4 branch left the whole suite green. IPv4 is the
+    # half that matters most -- `ip route flush dev X` removes only IPv4, and
+    # that is the break this watchdog was built for.
+    routed = None
+    try:
+        with open("/proc/net/route", encoding="utf-8") as fh:
+            next(fh, "")
+            for line in fh:
+                fields = line.split()
+                if fields:
+                    routed = fields[0]
+                    break
+    except OSError:
+        routed = None
+    if routed is None:
+        r.warn("IPv4 routes are counted, not just IPv6 ones",
+               "no device on this machine has an IPv4 route to count")
+    else:
+        r.check("IPv4 routes are counted, not just IPv6 ones",
+                tray.route_count(routed)[0] > 0,
+                f"{routed} has an IPv4 route in /proc/net/route and"
+                f" route_count says {tray.route_count(routed)}")
     # The rule, staged deterministically: a family this tunnel was seen to
     # have, wholly gone, is a verdict even while the other family survives.
     # `ip route flush dev X` removes only IPv4, and a summed count sat green
@@ -1708,21 +1732,35 @@ def check_config_editing(tray, r):
                 problems.append(f"the user's lines were not preserved: {lines}")
             if "autoreconnect = off" not in lines:
                 problems.append(f"the toggle did not land: {lines}")
-            if os.geteuid() != 0:  # root reads through a 0000 mode
-                os.chmod(tray.CONFIG_FILE, 0)
-                try:
-                    tray.write_setting("autoreconnect", True)
-                except OSError:
-                    pass
-                else:
-                    problems.append("an unreadable config was quietly replaced"
-                                    " with defaults")
-                finally:
-                    os.chmod(tray.CONFIG_FILE, 0o600)
-                after = tray.CONFIG_FILE.read_text().splitlines()
-                if after != lines:
-                    problems.append("the refused edit still changed the file:"
-                                    f" {after}")
+            # A config that cannot be read must not be replaced with
+            # defaults: `asuvpn autoreconnect on` would then discard the
+            # user's server, dpd and everything else, silently.
+            #
+            # Staged as a symlink to itself, and both halves of that matter.
+            # Mode 0 stops nobody when euid is 0, so this whole block used to
+            # sit under `if os.geteuid() != 0` while still reporting a plain
+            # ok -- and the four portable CI jobs run as root, so the one
+            # assertion guarding against losing a user's entire config was
+            # green there and untested. A loop is ELOOP for root as well. A
+            # directory would also be unreadable, but writing to one fails
+            # too, so the check would pass either way and prove nothing; a
+            # dangling symlink is a path that *can* be written, which is what
+            # makes "was it replaced?" a real question.
+            unreadable = parent / "asuvpn-unreadable.conf"
+            os.symlink(unreadable.name, unreadable)
+            was = tray.CONFIG_FILE
+            tray.CONFIG_FILE = unreadable
+            try:
+                tray.write_setting("autoreconnect", True)
+            except OSError:
+                pass
+            else:
+                problems.append("an unreadable config was quietly replaced"
+                                " with defaults")
+            finally:
+                tray.CONFIG_FILE = was
+            if not os.path.islink(unreadable):
+                problems.append("the refused edit replaced the config anyway")
             leftovers = sorted(p.name for p in parent.glob("*.tmp"))
             if leftovers:
                 problems.append(f"scratch files left behind: {leftovers}")
@@ -1885,18 +1923,25 @@ def check_secret_redaction(tray, r):
 
 
 def check_log_write_path(tray, r):
-    """The scrubber must be wired where the log is written, not merely exist.
+    """Both scrubbers must be wired where the log is written, not merely exist.
 
-    The regex check above proves the pattern; this proves the binding. A
-    hostile line pushed through the real VpnTray.log must land clean in the
-    file, and a file the logger creates must be born 0600 — a plain append
-    would create it with umask permissions, and the log holds the assigned
-    address, the routes and the DNS.
+    The regex checks above prove the patterns; this proves the bindings. A
+    hostile line and a session cookie pushed through the real VpnTray.log must
+    both land clean in the file, and a file the logger creates must be born
+    0600 — a plain append would create it with umask permissions, and the log
+    holds the assigned address, the routes and the DNS.
+
+    The secret half was missing, and its absence was invisible: the docstring
+    claimed the binding was proven while only the control-character scrubber
+    was pushed through. Deleting the redact_secrets() call from log() left the
+    whole suite green and every COOKIE= line openconnect prints landing
+    verbatim in a file `asuvpn log` prints to a terminal.
+
+    Runs without GTK too, now that log() does. That matters more than it
+    looks: the containers and any ssh session are exactly where this used to
+    skip, so on those machines *neither* scrubber had a wiring proof.
     """
     name = "the log file receives scrubbed lines only, and is born 0600"
-    if tray.GUI_ERROR is not None:
-        r.warn(name, "GTK bindings unavailable, so VpnTray.log cannot run here")
-        return
 
     class Holder:
         def __init__(self):
@@ -1914,6 +1959,9 @@ def check_log_write_path(tray, r):
         try:
             tray.VpnTray.log(
                 holder, "\x1b]0;evil\x07x " + chr(0x9B) + "gone \x1b[31mred")
+            # The other scrubber, through the same one call. Spelled the way
+            # openconnect prints it, because that is the line this exists for.
+            tray.VpnTray.log(holder, "COOKIE=NOT-A-REAL-COOKIE-example-value")
             # A multi-byte line: the rotation threshold is a file size, so
             # the meter must count bytes — counting characters undercounts
             # every em-dash in the applet's own wording by two.
@@ -1928,6 +1976,9 @@ def check_log_write_path(tray, r):
            if (ord(ch) < 0x20 and ch not in "\t\n") or 0x7f <= ord(ch) <= 0x9f]
     if bad or "red" not in text:
         problems.append(f"the written line was not scrubbed: {text!r}")
+    if "NOT-A-REAL-COOKIE" in text or "<redacted>" not in text:
+        problems.append("a session cookie reached the log file:"
+                        f" {text!r} — redact_secrets is not wired to log()")
     if mode != 0o600:
         problems.append(f"a file created by the logger is {oct(mode)}, not 0600")
     if holder._log_bytes != size:
@@ -2353,6 +2404,29 @@ def check_standin_catalogue(binary, r):
         r.fail(name, "the stand-in prints through single quotes, which this"
                " check cannot read; keep its output double-quoted")
         return
+    # Every say()/print() must hand over a double-quoted literal, and this is
+    # what makes the rest of the check mean anything: it reads literals at the
+    # call site, so one level of indirection --
+    #
+    #     banner = "Connected as fake-user on a tunnel that does not exist"
+    #     say(banner)
+    #
+    # sailed straight past it, which is the direct successor of the bug the
+    # whole sandbox was built around. The rule is not a style preference: this
+    # file exists to imitate another program's output, and an imitation that
+    # cannot be read is one nothing is holding to the original.
+    # The definitions of say() and note() are not imitation -- they are the
+    # plumbing that carries it -- so the line that defines each is skipped.
+    speaking = "\n".join(line for line in source.splitlines()
+                         if not re.match(r"\s*def (?:say|note)\b", line))
+    indirect = re.findall(r'(?:\bsay|\bprint)\((?!f?")([^)\n]*)\)', speaking)
+    indirect = [call for call in indirect if call.strip()]
+    if indirect:
+        r.fail(name, "the stand-in prints something this check cannot read"
+               " back to the catalogue: "
+               + "; ".join(repr(call) for call in indirect[:5])
+               + " — pass double-quoted literals at the call site")
+        return
     literals = re.findall(r'(?:\bsay|\bprint)\(f?"([^"]*)"', source)
     if not literals:
         r.fail(name, "no printed literals found in the stand-in; this check no"
@@ -2667,36 +2741,6 @@ def check_pipx_copy_is_the_running_one(C, r):
                f" {packaged}" + ("" if packaged == C.VERSION else
                                  " — older, so nothing is owed"))
 
-
-def check_install_scripts(C, r):
-    """The shell installers' hand-copied server default, held to the schema.
-
-    bash cannot load this schema, so install.sh and bootstrap.sh each state
-    the default once, with a comment promising to stay in sync by hand. This
-    is that promise, enforced. Installed copies have no scripts beside them
-    and nothing to drift, so the check passes vacuously there; it bites in a
-    checkout, which is where the default would be edited.
-    """
-    name = "the shell installers' server default matches the schema"
-    default = C.SETTINGS_BY_NAME["server"].default
-    scripts = [os.path.join(HERE, s) for s in ("install.sh", "bootstrap.sh")]
-    present = [s for s in scripts if os.path.exists(s)]
-    if not present:
-        r.ok(name, "no installer scripts beside this copy; nothing to drift")
-        return
-    wrong = []
-    for script in present:
-        try:
-            with open(script, encoding="utf-8") as fh:
-                text = fh.read()
-        except OSError as exc:
-            r.warn(name, f"cannot read {script}: {exc}")
-            return
-        if f'SERVER="{default}"' not in text:
-            wrong.append(os.path.basename(script))
-    r.check(name, not wrong,
-            f"{', '.join(wrong)}: no SERVER=\"{default}\" line — the by-hand"
-            " sync with the schema's default has drifted")
 
 
 def check_no_bytecode(r):
@@ -3470,9 +3514,7 @@ def main():
         guarded(check_sso_method, C, r)
         guarded(check_desktop_stack, tray, r)
         guarded(check_installed_permissions, C, r)
-        guarded(check_install_scripts, C, r)
         guarded(check_pipx_copy_is_the_running_one, C, r)
-        guarded(check_no_bytecode, r)
 
     if "wiring" in tiers:
         r.section("wiring — asuvpn-notify executed end to end")
@@ -3480,6 +3522,14 @@ def main():
         guarded(check_dns_takeover, notify, C, r)
         guarded(check_event_translation, helper, tray, C, r)
         guarded(check_fatal_reporting, r)
+
+    # Last, and that is the whole point. It used to run at the end of the
+    # *environment* tier, before the wiring tier had executed asuvpn-notify
+    # and asuvpn-helper as subprocesses -- which is when a stray __pycache__
+    # would appear. Deleting sys.dont_write_bytecode from both programs left
+    # the suite green and a .pyc behind, reported only by the *next* run, as
+    # the previous run's damage.
+    guarded(check_no_bytecode, r)
 
     counts = r.counts
     print(f"\n{counts[PASS]} passed, {counts[FAIL]} failed, {counts[WARN]} warnings")

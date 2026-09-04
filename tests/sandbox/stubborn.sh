@@ -14,11 +14,23 @@ echo "  a stand-in that ignores SIGINT; teardown must wait out the grace"
 # The sleep holds the control pipe open while the stand-in boots: an instant
 # EOF starts teardown before python has installed the signal handlers, and
 # the SIGINT then kills the not-yet-stubborn process mid-startup.
+began=$SECONDS
 out=$( { printf 'COOKIE\n'; sleep 2; } | timeout 40 "$A/asuvpn-helper" \
       --host https://x --fingerprint pin-sha256:x 2>&1); rc=$?
+elapsed=$(( SECONDS - began ))
 printf '%s\n' "$out" | grep -E 'SIGINT|SIGTERM|SIGKILL|killing|exited' | sed 's/^/      /'
 [ "$rc" -eq 0 ] || { echo "  FAIL: the helper exited $rc" >&2; exit 1; }
-must_contain "SIGTERM followed after the grace" "$out" "sending SIGTERM"
+must_contain "SIGTERM was sent at all" "$out" "sending SIGTERM"
+# The grace itself, which the line above does not prove and this scenario
+# used to claim anyway: with the SIGINT grace shortened to 0 the whole run
+# finished in 2s and still printed "followed after the grace". The floor is
+# the helper's own first rung (15s) less the 2s the pipe is held open, and
+# is a floor rather than a window so a loaded machine cannot fail it.
+if [ "$elapsed" -lt 15 ]; then
+  echo "  FAIL: the whole teardown took ${elapsed}s; the SIGINT grace alone" >&2
+  echo "  is 15s, so it was not waited out" >&2; exit 1
+fi
+echo "  ok: SIGTERM followed a full grace (${elapsed}s elapsed)"
 case "$out" in *SIGKILL*|*"killing it"*)
   echo "  FAIL: escalated to SIGKILL against a peer that yields to SIGTERM" >&2; exit 1;;
 esac

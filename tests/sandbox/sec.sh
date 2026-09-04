@@ -125,6 +125,13 @@ fi
 # Asserted, not just shown: the clean run in (f) opened a session channel
 # under /run/asuvpn, and its teardown must have removed it. This case used
 # to print whatever was there and could not fail.
+# The precondition, asserted rather than assumed: an empty find is also what
+# a directory that was never created looks like, so with event_channel()
+# stubbed out to fail this case passed while reporting "(never created)".
+if [ ! -d /run/asuvpn ]; then
+  echo "      FAIL: the clean run in (f) opened no event channel at all," >&2
+  echo "      so this case has nothing to say about teardown" >&2; exit 1
+fi
 leftovers=$(find /run/asuvpn -mindepth 1 -maxdepth 1 2>/dev/null)
 if [ -n "$leftovers" ]; then
   echo "      FAIL: session channels left behind in /run/asuvpn: $leftovers" >&2

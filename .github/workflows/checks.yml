@@ -117,6 +117,22 @@ jobs:
           # exits 0 whatever the self-check said. Here, where the runner has
           # every dependency, a red self-check is a broken wheel.
           HOME=/tmp/wheel-home /tmp/wheel-home/.local/share/asuvpn/asuvpn-selftest
+          # The installers state the default endpoint in shell, because bash
+          # cannot load the schema, and a comment promises they stay in sync.
+          # That promise used to be checked by grepping install.sh for its own
+          # wording -- which passes against an installer that carries the
+          # right string and then assigns a different one two lines later
+          # (demonstrated). This reads the value back out of the config a real
+          # install produced, which is the only form that cannot be satisfied
+          # by the text alone.
+          schema=$(python3 -c 'import importlib.util as u; s=u.spec_from_file_location("c","asuvpn_contract.py"); m=u.module_from_spec(s); s.loader.exec_module(m); print(m.SETTINGS_BY_NAME["server"].default)')
+          wrote=$(sed -n 's/^server = //p' /tmp/wheel-home/.config/asuvpn/asuvpn.conf)
+          if [ "$schema" != "$wrote" ]; then
+            echo "the schema default is '$schema' but a fresh install wrote" >&2
+            echo "'$wrote' -- the installers' hand-copied default has drifted." >&2
+            exit 1
+          fi
+          echo "a fresh install wrote server = $wrote, matching the schema"
 
   # Proves the portable half is portable, and claims nothing more. The logic
   # tier is pure Python: it drives the contract, the state machine and the

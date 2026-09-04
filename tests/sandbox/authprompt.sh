@@ -7,7 +7,8 @@
 SB="$(cd "$(dirname "$0")" && pwd)"; A="$SB/app/asuvpn-tray"
 # shellcheck source=tests/sandbox/lib.sh
 . "$SB/lib.sh"; sandbox_guard; fresh_home
-export FAKE_PKEXEC_HANG=1
+export FAKE_PKEXEC_HANG="$SB/prompt.pid"
+rm -f "$FAKE_PKEXEC_HANG"
 CONF="$SB/home/.config/asuvpn/asuvpn.conf"
 "$A" --write-config sslvpn.asu.edu > "$CONF"
 # 60 is the floor the schema allows, not a number this scenario invented:
@@ -19,7 +20,7 @@ echo "  config: $(grep -E '^(signin-timeout|health-interval) =' "$CONF" | tr '\n
 start_tray
 "$A" connect >/dev/null 2>&1
 await_status "Connecting" 40 "the sign-in finished and the prompt went up"
-hung=$(pgrep -f "^sleep 3600$" | head -1)
+hung=$(cat "$FAKE_PKEXEC_HANG" 2>/dev/null || true)
 [ -n "$hung" ] || { echo "  FAIL: no stand-in prompt is waiting" >&2; exit 1; }
 # The deadline is 60s and the tick runs every 3s; 100 is margin for a loaded
 # machine, not more behaviour.

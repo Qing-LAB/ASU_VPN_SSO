@@ -2059,8 +2059,15 @@ class VpnTray(StateMachine):
                 self._log_bytes += len(line.encode("utf-8")) + 1
             except OSError:
                 pass
-        # The window is GTK, so it may only be touched from the main loop.
-        GLib.idle_add(self._append_to_log_window, line)
+        # The window is GTK, so it may only be touched from the main loop --
+        # and on a machine with no GTK at all there is no window and no GLib
+        # to reach it with. Guarded rather than assumed: the CLI half of this
+        # program is supported without the bindings, and this was also the one
+        # line that made the log path unrunnable in the self-check on exactly
+        # those machines, so nothing there could prove the scrubbers are
+        # wired to it.
+        if GUI_ERROR is None:
+            GLib.idle_add(self._append_to_log_window, line)
 
     def _rotate_log_locked(self):
         """Rotate session.log → .1 → .2 …; the caller holds _log_lock.
