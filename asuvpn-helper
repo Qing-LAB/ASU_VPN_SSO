@@ -575,6 +575,25 @@ def interface_exists(name):
     return bool(name) and os.path.exists(f"/sys/class/net/{name}")
 
 
+def dns_took_over(event_dir):
+    """Did asuvpn-notify actually put DNS on this link, or only mean to?
+
+    A fact now, read from the marker asuvpn-notify writes into our own session
+    directory. It used to be inferred from `--dns-domains is not None`, which
+    is "the user asked for link DNS" -- true on every run that then fell back
+    to the stock script, so a killed teardown reported that the resolver had
+    gone with its link on exactly the runs where DNS was instead sitting in
+    /etc/resolv.conf with its backup orphaned, and suppressed the warning that
+    says so.
+
+    None when there is no session directory: nothing could have been recorded,
+    so the teardown says it cannot tell rather than picking a story.
+    """
+    if not event_dir:
+        return None
+    return os.path.exists(os.path.join(event_dir, C.DNS_MARKER))
+
+
 def drop_link_dns(ifname):
     """Take our per-link DNS off a link openconnect did not live to clear.
 
@@ -591,7 +610,7 @@ def drop_link_dns(ifname):
         log(f"per-link DNS on {ifname} reverted")
 
 
-def verify_teardown(ifname, before, was_killed, owned, dns_on_link=False):
+def verify_teardown(ifname, before, was_killed, owned, dns_on_link=None):
     """Confirm the network came back, and clear up if openconnect did not.
 
     openconnect restores routes and DNS by running vpnc-script on the way out,
@@ -623,7 +642,7 @@ def verify_teardown(ifname, before, was_killed, owned, dns_on_link=False):
             log(f"WARNING: {ifname} outlived openconnect but 'ip' is missing;"
                 " it was not removed")
         else:
-            if was_killed and dns_on_link:
+            if was_killed and dns_on_link is not False:
                 # Before the deletion, while there is still a link to name.
                 # Usually redundant -- the resolver goes when the link does --
                 # but not when the device is persistent or the delete below
@@ -655,12 +674,14 @@ def verify_teardown(ifname, before, was_killed, owned, dns_on_link=False):
         log("WARNING: try 'nmcli networking off && nmcli networking on'")
     if was_killed:
         if dns_on_link:
-            # The link carried the resolver, so it went with the link -- unless
-            # this session had to hand DNS back to the stock script, which is
-            # logged at the time and is the one case a reader has to check.
-            log("openconnect was killed; the tunnel's resolver went with its"
-                " link. If the log shows DNS was handed back to the stock"
-                " script, check /etc/resolv.conf")
+            log("openconnect was killed; the tunnel's resolver was on its link"
+                " and went with it")
+        elif dns_on_link is None:
+            # No session channel, so nothing recorded which way DNS went. Say
+            # that, rather than pick the reassuring half of it.
+            log("WARNING: openconnect was killed before it could restore DNS,"
+                " and there is no record of how DNS was configured. If names"
+                " stop resolving, check /etc/resolv.conf")
         else:
             # Nothing here can fix this: the backup belongs to the stock
             # script and is only put back by the disconnect that never ran.
@@ -1069,7 +1090,7 @@ def main():
     else:
         log(f"openconnect exited with status {returncode}")
     verify_teardown(ifname, interfaces_before, tunnel.killed,
-                    owned.get("ifindex"), args.dns_domains is not None)
+                    owned.get("ifindex"), dns_took_over(event_dir))
     closing.set()  # the socket close below is deliberate, not a failure
     if events is not None:
         events.close()

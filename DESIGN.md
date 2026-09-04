@@ -711,8 +711,9 @@ quietly healthy check logs nothing, because a line every twenty seconds
 forever would bury the log — so the next silent break arrives with evidence
 attached rather than as a mystery.
 
-Five words this section leans on: a **source** is one of the two independent
-judges, `device` (kernel facts) or `probe` (a packet); a **strike** is one
+Five words this section leans on: a **source** is one of the three independent
+judges — `device` (kernel facts), `probe` (a packet), and `dns` (whether the
+resolver the tunnel pushed is still in force); a **strike** is one
 failing check from one source; a **demotion** takes the badge out of Connected
 after `health-strikes` consecutive strikes from a single source; an
 **incident** is one demotion, lasting until the *demoting* source passes

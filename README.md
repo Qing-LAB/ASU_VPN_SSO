@@ -895,7 +895,7 @@ is just as good an answer, because it proves a packet crossed in each
 direction. Only silence means the tunnel is not carrying traffic. Whether the
 service behind the probe is up is none of our business.
 
-The two sources are tracked separately, so a probe failure is only cleared by a
+The three sources are tracked separately, so a probe failure is only cleared by a
 successful probe. Letting the device check promote the badge back would flap it
 every twenty seconds against a tunnel that is genuinely carrying nothing. The
 same rule holds against openconnect's own word: the reconnect a nudge produces
@@ -1575,7 +1575,7 @@ the measured window.
 The stand-in exercises earlier in this section — the launch races, the exit
 code sweep, the arbitrary-directory installs — predate the committed suite
 and were run with earlier versions of the same fakes before the harness moved into the
-repository; the fourteen committed scenarios are the ones tabulated in
+repository; the fifteen committed scenarios are the ones tabulated in
 [tests/sandbox](tests/sandbox/README.md).
 
 What is proven live against the real gateway (full connects and teardowns,

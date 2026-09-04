@@ -1973,6 +1973,18 @@ def check_teardown_ownership(helper, r):
             f"foreign deletes={foreign_deletes} left_alone={left_alone}"
             f" ours_deleted={ours_deleted} — a name match without the ifindex"
             " match must never reach `ip link delete` as root")
+    # And the helper's half of that agreement.
+    with tempfile.TemporaryDirectory() as session:
+        no_record = helper.dns_took_over(session)
+        open(os.path.join(session, helper.C.DNS_MARKER), "w",
+             encoding="utf-8").close()
+        recorded = helper.dns_took_over(session)
+    r.check("the teardown reads whether DNS was ours, or says it cannot tell",
+            recorded is True and no_record is False
+            and helper.dns_took_over(None) is None,
+            f"recorded={recorded} no_record={no_record}"
+            f" no_channel={helper.dns_took_over(None)} — inferring this from"
+            " the setting made the reassuring answer the default")
     r.check("a killed teardown drops the per-link resolver before the device",
             ordered and not foreign_revert,
             f"ordered={ordered} foreign_revert={foreign_revert} — the resolver"
@@ -2900,6 +2912,80 @@ def check_dns_takeover(notify, C, r):
                 "revert asuvpn0" in calls and "INTERNAL_IP4_DNS" in env,
                 f"got {calls}")
         os.remove(os.path.join(faildir, "dns"))
+
+        # A reconnect is not a connect, and the difference is the fallback.
+        # The stock script's `reconnect` branch runs hooks and nothing else
+        # (checked against the installed script), so there is nobody to hand
+        # DNS back to -- and reverting would take a working configuration off
+        # the link over a transient resolvectl failure, leaving DNS owned by
+        # no one on a tunnel that is fine.
+        open(os.path.join(faildir, "dns"), "w", encoding="utf-8").close()
+        calls, env = run({}, reason="reconnect")
+        r.check("a reconnect that half fails keeps what the link already had",
+                "revert asuvpn0" not in calls,
+                f"got {calls} — the previous configuration was working a"
+                " second ago and nothing else will put one back")
+        calls, env = run({}, reason="connect")
+        r.check("a connect that half fails still reverts and hands back",
+                "revert asuvpn0" in calls and "INTERNAL_IP4_DNS" in env,
+                f"got {calls} — on a connect the revert *is* the handover")
+        os.remove(os.path.join(faildir, "dns"))
+
+        # A full tunnel: every packet goes down it, so leaving every lookup
+        # outside the scoped domain with the local network's resolver would
+        # send it in clear over the one link the VPN exists to stop using.
+        # Detected the way the stock script decides to install a default
+        # route, because it is the same question.
+        calls, env = run({"INTERNAL_IP4_ADDRESS": "192.0.2.9"})
+        r.check("a full tunnel takes every lookup, not just the scoped ones",
+                "default-route asuvpn0 yes" in calls
+                and "domain asuvpn0 example.com" in calls,
+                f"got {calls} — the script this replaces would have made the"
+                " tunnel's resolver the only one")
+        calls, env = run({"INTERNAL_IP4_ADDRESS": "192.0.2.9",
+                          "CISCO_SPLIT_INC": "1",
+                          "CISCO_SPLIT_INC_0_ADDR": "198.51.100.0"})
+        r.check("a split tunnel is still scoped, address or no address",
+                "default-route asuvpn0 no" in calls,
+                f"got {calls} — a split tunnel carries named networks and"
+                " has no business answering for every name on the machine")
+        calls, env = run({"INTERNAL_IP4_ADDRESS": "192.0.2.9",
+                          "CISCO_SPLIT_INC": "1",
+                          "CISCO_SPLIT_INC_0_ADDR":
+                              "0.0.0.0"})  # nosec B104  # noqa: S104
+        r.check("a split list containing the default route is a full tunnel",
+                "default-route asuvpn0 yes" in calls,
+                f"got {calls} — the stock script reads 0.0.0.0 in that list"
+                " as set_default_route, and so must this")
+        calls, env = run({"INTERNAL_IP4_ADDRESS": "192.0.2.9",
+                          "CISCO_SPLIT_INC": "not a number"})
+        r.check("an unreadable split list keeps the narrower behaviour",
+                "default-route asuvpn0 no" in calls,
+                f"got {calls} — an unexpected value is not evidence of a"
+                " full tunnel")
+
+        # Whether DNS ended up on the link is a fact, and the teardown has to
+        # read it rather than infer it from what the user asked for. The
+        # marker is how the two processes agree; without it a killed teardown
+        # reported "the resolver went with its link" on runs where DNS was
+        # sitting in /etc/resolv.conf with its backup orphaned.
+        marker = os.path.join(d, C.DNS_MARKER)
+        socket_env = {C.EVENT_SOCKET_VAR: os.path.join(d, "events.sock")}
+        run(socket_env)
+        wrote = os.path.exists(marker)
+        run(dict(socket_env), reason="disconnect")
+        cleared = not os.path.exists(marker)
+        r.check("taking DNS over is recorded, and giving it back clears it",
+                wrote and cleared,
+                f"wrote={wrote} cleared={cleared} — the teardown reads this"
+                " to tell a link resolver from a rewritten /etc/resolv.conf")
+        open(os.path.join(faildir, "dns"), "w", encoding="utf-8").close()
+        run(dict(socket_env))
+        os.remove(os.path.join(faildir, "dns"))
+        r.check("a handover that failed records nothing",
+                not os.path.exists(marker),
+                "the run fell back to the stock script, so DNS is not ours"
+                " and the teardown must not say it was")
 
         calls, env = run({}, reason="disconnect")
         r.check("a disconnect reverts the link",

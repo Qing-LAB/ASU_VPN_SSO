@@ -521,10 +521,18 @@ def resolv_conf_lists(resolver):
     """
     try:
         with open("/etc/resolv.conf", encoding="utf-8", errors="replace") as fh:
+            # Both sides canonicalized, because only one of them was.
+            # split_resolvers() normalises what the link reports, while the
+            # stock script writes `nameserver $i` in the gateway's own
+            # spelling -- so a resolver pushed as 2001:0DB8::1 and stored as
+            # 2001:db8::1 compared unequal, and the second opinion this
+            # function exists to give would have said "not in force" about a
+            # resolver that was.
+            wanted = C.split_resolvers(resolver)
             for line in fh:
                 fields = line.split("#", 1)[0].split()
                 if len(fields) >= 2 and fields[0] == "nameserver" \
-                        and fields[1] == resolver:
+                        and C.split_resolvers(fields[1]) == wanted and wanted:
                     return True
     except OSError:
         pass

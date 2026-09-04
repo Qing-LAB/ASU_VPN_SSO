@@ -189,7 +189,93 @@ def tunnel_domains(env):
     return C.split_domains(env.get(C.DNS_DOMAINS_VAR)), "configured locally"
 
 
-def apply_dns(env, device, binary):
+# What a gateway puts in a split-include list to mean "and everything else
+# too". Compared against, never bound to; the analysers cannot tell those
+# apart from the literal alone, hence the two suppressions.
+DEFAULT_ROUTE_ADDR = "0.0.0.0"  # nosec B104  # noqa: S104 - compared, not bound
+
+
+def full_tunnel(env):
+    """Did the gateway route *everything* through this tunnel?
+
+    Asked because scoping DNS to a domain and marking the link
+    not-a-default-route is right for a split tunnel and wrong for a full one.
+    With every packet already going down the tunnel, every lookup outside the
+    scoped domain would still be handed to whatever resolver the local network
+    advertised -- in clear, over the one link the VPN exists to stop using.
+    The stock script would have made the tunnel's resolver the only one, so
+    this was a regression in the configuration where it matters most.
+
+    Answered exactly the way the stock script decides whether to install a
+    default route, because that is the same question: no split-include list
+    plus an address of that family (vpnc-script's `elif [ -n
+    "$INTERNAL_IP4_ADDRESS" ]`), or a list that contains the default route
+    itself. Anything unparseable, or no evidence either way, reads as a split
+    tunnel -- the narrower answer, and the one this has always given.
+    """
+    def listed(var):
+        raw = (env.get(var) or "").strip()
+        if not raw:
+            return 0
+        try:
+            return max(0, int(raw))
+        except ValueError:
+            return -1
+
+    four = listed("CISCO_SPLIT_INC")
+    if four < 0:
+        return False
+    if four == 0:
+        if env.get("INTERNAL_IP4_ADDRESS"):
+            return True
+    elif any((env.get(f"CISCO_SPLIT_INC_{i}_ADDR") or "").strip()
+             == DEFAULT_ROUTE_ADDR for i in range(four)):
+        return True
+
+    six = listed("CISCO_IPV6_SPLIT_INC")
+    if six < 0:
+        return False
+    if six == 0:
+        return bool(env.get("INTERNAL_IP6_NETMASK")
+                    or env.get("INTERNAL_IP6_ADDRESS"))
+    return any((env.get(f"CISCO_IPV6_SPLIT_INC_{i}_MASKLEN") or "").strip() == "0"
+               for i in range(six))
+
+
+def marker_path(env):
+    """Where to record that this link's DNS is ours, for teardown to read.
+
+    The helper's per-session directory under /run/asuvpn, which is root-only
+    and removed with the session. It exists because the helper otherwise had to
+    *infer* the answer from whether the user asked for link DNS -- intent, not
+    fact -- and said "the resolver went with its link" on runs where DNS had in
+    truth been handed to the stock script and left in /etc/resolv.conf.
+
+    None when there is no event channel: then nothing can be recorded, and the
+    helper says it cannot tell rather than guessing.
+    """
+    socket_path = env.get(C.EVENT_SOCKET_VAR)
+    if not socket_path:
+        return None
+    return os.path.join(os.path.dirname(socket_path), C.DNS_MARKER)
+
+
+def set_marker(env, present):
+    """Record, or clear, "DNS on this link is ours". Best effort by design."""
+    path = marker_path(env)
+    if path is None:
+        return
+    try:
+        if present:
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write("1\n")
+        else:
+            os.unlink(path)
+    except OSError:
+        pass
+
+
+def apply_dns(env, device, binary, revert_on_failure=True):
     """Put the tunnel's resolver on the tunnel's link. True if DNS is now ours.
 
     False means nothing was changed and the caller must leave the real script's
@@ -213,32 +299,47 @@ def apply_dns(env, device, binary):
     # Ordered so the link is never briefly wrong. Scope first, servers last: a
     # link with domains and no servers resolves nothing, which is harmless,
     # while a link with servers and no scope catches every query on the machine.
-    if domains:
+    everything = full_tunnel(env)
+    if domains and not everything:
         # Explicit, though listing any domain already implies it. Saying so
         # costs one call and removes the need to know the implication.
         resolvectl(binary, "default-route", device, "no")
         if not resolvectl(binary, "domain", device, *domains):
-            resolvectl(binary, "revert", device, quiet=True)
+            if revert_on_failure:
+                resolvectl(binary, "revert", device, quiet=True)
             return False
     else:
-        # The gateway named no domains and none could be derived. Scoping to
-        # nothing would mean resolving nothing, so the link takes every query
-        # instead -- which is what the script this replaces would have done, and
-        # is never worse than it. Named as the compromise it is.
+        # Two ways to arrive here. Either the gateway named no domains and none
+        # could be derived -- scoping to nothing would resolve nothing, so the
+        # link takes every query instead, which is what the script this
+        # replaces would have done. Or this is a full tunnel, where taking
+        # every query is not a compromise at all but the only correct answer:
+        # all traffic is going down the tunnel already, and leaving the rest of
+        # DNS with the local network's resolver would send it in clear over the
+        # one link the VPN exists to stop using.
         resolvectl(binary, "default-route", device, "yes")
-        note(f"no domains for {device}: every lookup may go to the tunnel's"
-             " resolver. Set dns-domains to scope it.")
+        if domains and not resolvectl(binary, "domain", device, *domains):
+            if revert_on_failure:
+                resolvectl(binary, "revert", device, quiet=True)
+            return False
+        if not everything:
+            note(f"no domains for {device}: every lookup may go to the"
+                 " tunnel's resolver. Set dns-domains to scope it.")
     if not resolvectl(binary, "dns", device, *servers):
-        resolvectl(binary, "revert", device, quiet=True)
+        if revert_on_failure:
+            resolvectl(binary, "revert", device, quiet=True)
         return False
+    set_marker(env, True)
 
     where = " ".join(domains) if domains else "all names"
+    if everything:
+        where = f"{where} (the gateway routes everything through this tunnel)"
     note(f"DNS for {where} on {device} via {' '.join(servers)}"
          f" ({source}); /etc/resolv.conf left alone")
     return True
 
 
-def revert_dns(device, binary):
+def revert_dns(device, binary, env):
     """Drop whatever this put on the link, on the way out.
 
     Unconditional and quiet: the link is usually gone by now, reverting one that
@@ -252,6 +353,7 @@ def revert_dns(device, binary):
     run always is the only choice that is right in both cases.
     """
     resolvectl(binary, "revert", device, quiet=True)
+    set_marker(env, False)
 
 
 def handle_dns(environ, binary=None):
@@ -276,8 +378,18 @@ def handle_dns(environ, binary=None):
         return
     reason = environ.get("reason", "")
     if reason == "disconnect":
-        revert_dns(device, binary)
-    elif reason in ("connect", "reconnect") and apply_dns(environ, device, binary):
+        revert_dns(device, binary, environ)
+    elif reason in ("connect", "reconnect") and apply_dns(
+            environ, device, binary,
+            # Only a connect may revert on failure. On a connect the revert is
+            # the handover: the link goes back to untouched and the stock
+            # script picks DNS up from INTERNAL_IP4_DNS, which is still set. On
+            # a reconnect there is nobody to hand it to -- the stock script's
+            # `reconnect` branch runs hooks and nothing else (checked against
+            # the installed script) -- so reverting would take a working
+            # configuration off the link and leave DNS owned by no one, over a
+            # transient resolvectl failure on a tunnel that is perfectly fine.
+            revert_on_failure=(reason == "connect")):
         # The real script guards both its DNS branches on this one variable
         # (vpnc-script: `if [ -n "$INTERNAL_IP4_DNS" ]`), so removing it is how
         # it is told the job is done -- routing untouched, DNS entirely ours.

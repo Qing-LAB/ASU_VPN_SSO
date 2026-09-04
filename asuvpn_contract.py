@@ -173,6 +173,12 @@ def decode_control(line):
 
 # Set by the helper in openconnect's environment, which passes them through to
 # the script. Named here so the two ends cannot disagree about them.
+# Written by asuvpn-notify into the helper's own /run/asuvpn session directory
+# when it has put DNS on the link, removed when it takes it off again. The
+# helper reads it at teardown: whether DNS is ours is a fact about what
+# happened, and it used to be inferred from whether the user had asked for it.
+DNS_MARKER = "dns-on-link"
+
 EVENT_SOCKET_VAR = "ASUVPN_EVENT_SOCKET"
 EVENT_TOKEN_VAR = "ASUVPN_EVENT_TOKEN"
 REAL_SCRIPT_VAR = "ASUVPN_REAL_SCRIPT"
