@@ -348,7 +348,7 @@ def serve_events(server, token, ifname, owned):
             data, _ = server.recvfrom(C.EVENT_MAX_BYTES)
         except OSError as exc:
             if not closing.is_set():
-                log(f"WARNING: the state event channel stopped ({exc});"
+                log(f"WARNING: {C.EVENT_CHANNEL_STOPPED} ({exc});"
                     " the tray will fall back to reading openconnect's output")
             return
         event = C.decode_event(data)

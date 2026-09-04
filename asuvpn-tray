@@ -262,8 +262,13 @@ TRANSITIONS = {
     (DEMOTED, MSG_CONNECT): "connect_means_reconnect",
     (DISCONNECTED, MSG_RECONNECT): "start_signin",
     (FAILED, MSG_RECONNECT): "start_signin",
-    (CONNECTED, MSG_RECONNECT): "teardown_reconnect",
-    (DEMOTED, MSG_RECONNECT): "teardown_reconnect",
+    # "user_reconnect", not "teardown_reconnect": both end in the same place,
+    # but a human asking is a human taking over, and that refunds the rebuild
+    # budget exactly as Connect does. The ladder calls _tr_teardown_reconnect
+    # directly and so keeps its count, which is the distinction _clear_drop's
+    # docstring describes and the table could not previously express.
+    (CONNECTED, MSG_RECONNECT): "user_reconnect",
+    (DEMOTED, MSG_RECONNECT): "user_reconnect",
     # The menu hides Reconnect in RECOVERING, and the CLI is a second surface
     # with no such filter: `asuvpn reconnect` was dropped here while the IPC
     # answered "ok", so --wait then polled a busy state for its whole timeout
@@ -272,6 +277,16 @@ TRANSITIONS = {
     # reason the user might want one.
     (RECOVERING, MSG_RECONNECT): "teardown_reconnect",
     (RECOVERING, MSG_CONNECT): "connect_means_reconnect",
+    # The same gap in the other two busy states. The menu offers only Cancel
+    # there, but the CLI has no menu: the verb was dropped, the IPC still
+    # answered "ok", and `--wait` then polled a busy state for its whole
+    # timeout before reporting on an attempt it had not started. Starting over
+    # is what the user asked for, and _tr_start_signin already closes a live
+    # tunnel first.
+    (AUTHENTICATING, MSG_RECONNECT): "user_reconnect",
+    (AUTHENTICATING, MSG_CONNECT): "start_signin",
+    (CONNECTING, MSG_RECONNECT): "user_reconnect",
+    (CONNECTING, MSG_CONNECT): "start_signin",
     (DISCONNECTED, MSG_DISCONNECT): "already_disconnected",
     # Not "already_disconnected", which is what this was. A teardown that
     # timed out lands in FAILED with the helper handle still held and a root
@@ -281,6 +296,13 @@ TRANSITIONS = {
     # thing this used to, a live one and it tries the teardown again, which
     # is the only recovery there is.
     (FAILED, MSG_DISCONNECT): "teardown_disconnect",
+    # DISCONNECTING covers four intents, and dropping Disconnect there is only
+    # right for one of them. Mid-*reconnect* the machine is on its way to a
+    # sign-in, so swallowing the verb inverted it: `asuvpn disconnect` was
+    # answered "ok", the teardown finished, and the applet opened a browser
+    # and raised a Duo push. There was no verb at all, CLI or menu, that could
+    # stop a reconnect once its teardown had begun.
+    (DISCONNECTING, MSG_DISCONNECT): "stop_after_teardown",
     (AUTHENTICATING, MSG_DISCONNECT): "cancel_attempt",
     (CONNECTING, MSG_DISCONNECT): "cancel_attempt",
     (CONNECTED, MSG_DISCONNECT): "teardown_disconnect",
@@ -1025,6 +1047,18 @@ class StateMachine:
         self.log("[tray] disconnecting")
         threading.Thread(target=self._disconnect_thread, daemon=True).start()
 
+    def _tr_user_reconnect(self, data):
+        """Reconnect, asked for by a person rather than by the ladder.
+
+        The only difference is the refund. `asuvpn connect` on a demoted
+        tunnel already went through _tr_connect_means_reconnect, which clears
+        the drop; the Reconnect spelling did not, so after the ladder had
+        spent its three attempts, one verb restored automatic recovery for the
+        next tunnel and the other left it exhausted.
+        """
+        self._clear_drop()
+        self._tr_teardown_reconnect(data)
+
     def _tr_teardown_reconnect(self, data):
         keep = data.get("keep_log", False)
         if self.helper_proc is None or self.helper_proc.poll() is not None:
@@ -1202,6 +1236,19 @@ class StateMachine:
         # did not come back after teardown, but also degraded supervision —
         # the event channel dying, a vpnc-script it could not chain to. The
         # title says warning, not teardown, because not all of them are.
+        if C.EVENT_CHANNEL_STOPPED in data["sentence"]:
+            # Make the helper's sentence true. It tells the user the tray will
+            # fall back to reading openconnect's output, and the tray did not:
+            # `state_events` latched True on the first event and was cleared
+            # only when the *next* tunnel started, so the log-matching scan
+            # stayed disabled for the rest of the session. A tunnel that then
+            # re-established had no way to say so -- the event could not
+            # travel, the pattern scan was off, and the watchdog stands aside
+            # in RECOVERING -- leaving a working tunnel showing "Connecting…"
+            # until something else ended it.
+            self.state_events = False
+            self.log("[tray] the event channel is gone; reading openconnect's"
+                     " output for state again")
         self.notify("VPN warning", data["sentence"],
                     icon="dialog-warning-symbolic")
 
@@ -1461,6 +1508,22 @@ class StateMachine:
         # sampling that instant reported the reconnect finished.
         self._act_start_signin(keep_log=keep)
 
+    def _tr_stop_after_teardown(self, _data):
+        """Disconnect, asked while a teardown is already running.
+
+        The teardown itself is not interrupted -- it must not be, and there is
+        nothing to gain -- but what happens *after* it is. Downgrading the
+        intent to "disconnect" is the whole change: the helper's exit then
+        lands on the DISCONNECTED row instead of the handoff into a sign-in.
+        """
+        if self.teardown_intent == "reconnect":
+            self.reconnect_keep_log = False
+            self.teardown_intent = "disconnect"
+            self.log("[tray] disconnect asked for mid-reconnect;"
+                     " closing the tunnel and stopping there")
+            return
+        self.log("[tray] already disconnecting")
+
     def _tr_teardown_timed_out(self, data):
         if self.helper_proc is None or self.helper_proc.poll() is not None:
             # The deadline and the exit crossed. Event.wait returns the
@@ -1475,7 +1538,18 @@ class StateMachine:
             if data["during"] == "reconnect":
                 self._tr_teardown_finished(data)
             return
-        self.teardown_intent = None
+        # Kept, not cleared. teardown_intent is the only record that this
+        # teardown was asked for, and the helper usually exits *after* the
+        # deadline rather than instead of it. Clearing it meant that late exit
+        # arrived as an unexplained death: `was_connected` was still true, so
+        # `dropped` was armed and the next health tick signed back in -- a Duo
+        # push and a reconnected VPN for a user who had asked to disconnect
+        # and been told the disconnect failed.
+        #
+        # "disconnect" for every case, including an abandoned reconnect: we
+        # have given up on this tunnel either way, so its eventual exit is a
+        # closure and not a drop.
+        self.teardown_intent = "disconnect"
         if data["during"] == "reconnect":
             # Carrying on would null out our only handle on a live root
             # tunnel and then start a second one beside it.

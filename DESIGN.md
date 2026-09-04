@@ -301,14 +301,19 @@ things*). `any` is the `ANY` wildcard — the row applies in every state.
 | `demoted` | `connect` | `_tr_connect_means_reconnect` | Connect on an established session means Reconnect — there is a tunnel to tear down first. |
 | `disconnected` | `reconnect` | `_tr_start_signin` | Nothing to tear down; it is just a connect. |
 | `failed` | `reconnect` | `_tr_start_signin` | Same, keeping the log that explains the failure. |
-| `connected` | `reconnect` | `_tr_teardown_reconnect` | Tear the tunnel down, then sign in again — a Duo push and a password. |
-| `demoted` | `reconnect` | `_tr_teardown_reconnect` | The expensive rung of the ladder, reached by hand or by autoreconnect. |
+| `connected` | `reconnect` | `_tr_user_reconnect` | Tear the tunnel down, then sign in again — a Duo push and a password. A person asking hands the rebuild budget back, exactly as Connect does; the ladder calls the teardown row directly and keeps its count. |
+| `demoted` | `reconnect` | `_tr_user_reconnect` | The expensive rung of the ladder when a person asks for it. |
 | `recovering` | `reconnect` | `_tr_teardown_reconnect` | openconnect re-establishing is a reason the user might want a fresh session, not a reason to refuse one. The CLI has no menu to hide the verb, and dropping it left `--wait` polling a busy state. |
 | `recovering` | `connect` | `_tr_connect_means_reconnect` | Same reading as on a demoted tunnel: there is a session to replace. |
+| `authenticating` | `reconnect` | `_tr_user_reconnect` | Start over. The menu offers only Cancel here, but the CLI has no menu, and a dropped verb was answered `ok` while `--wait` polled a busy state to its timeout. |
+| `authenticating` | `connect` | `_tr_start_signin` | Same, spelled the other way. |
+| `connecting` | `reconnect` | `_tr_user_reconnect` | Same again, with a live helper: `_tr_start_signin` closes the tunnel before signing in. |
+| `connecting` | `connect` | `_tr_start_signin` | Same. |
 | `disconnected` | `disconnect` | `_tr_already_disconnected` | Idempotent: say so rather than guessing. |
 | `failed` | `disconnect` | `_tr_teardown_disconnect` | Usually nothing to close, and it says so — but a teardown that timed out lands here still holding the helper, so this tries again rather than claiming success. Also how a pending rebuild is called off. |
 | `authenticating` | `disconnect` | `_tr_cancel_attempt` | Kill the sign-in; nothing is established yet. |
 | `connecting` | `disconnect` | `_tr_cancel_attempt` | Terminate pkexec, and tear down if a helper already lives. |
+| `disconnecting` | `disconnect` | `_tr_stop_after_teardown` | The teardown is not interrupted; what follows it is. Mid-reconnect this is the only way to stop the sign-in that would otherwise come next — the verb used to be dropped while the IPC answered `ok`, and the reconnect carried on into a Duo push. |
 | `connected` | `disconnect` | `_tr_teardown_disconnect` | The ordinary teardown, through the signal ladder. |
 | `recovering` | `disconnect` | `_tr_teardown_disconnect` | Stop openconnect retrying and close the session. |
 | `demoted` | `disconnect` | `_tr_teardown_disconnect` | A demoted tunnel still closes cleanly — the `discon.sh` scenario. |

@@ -215,6 +215,14 @@ DNS_MARKER = "dns-owner"
 DNS_OWNER_LINK = "link"
 DNS_OWNER_SCRIPT = "script"
 
+# The helper says this when its event thread dies mid-tunnel, and the tray
+# tests for it to re-arm the log-matching fallback. Shared rather than spelled
+# out twice: the helper's sentence promises the tray will fall back, and for a
+# long time the tray did not -- the latch that disables log matching was set
+# on the first event and cleared only when the *next* tunnel started, so the
+# promise was false for the rest of the session.
+EVENT_CHANNEL_STOPPED = "the state event channel stopped"
+
 EVENT_SOCKET_VAR = "ASUVPN_EVENT_SOCKET"
 EVENT_TOKEN_VAR = "ASUVPN_EVENT_TOKEN"
 REAL_SCRIPT_VAR = "ASUVPN_REAL_SCRIPT"

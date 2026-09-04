@@ -980,6 +980,116 @@ def check_verbs_reach_every_state(tray, r):
             " the tick would start a second sign-in beside the first")
 
 
+def check_the_fallback_comes_back(tray, r):
+    """The helper's promise about the event channel has to be true.
+
+    When its event thread dies mid-tunnel the helper warns that "the tray will
+    fall back to reading openconnect's output". The tray did not: the latch
+    that disables log matching was set by the first event and cleared only
+    when the next tunnel started. So a tunnel that re-established after the
+    channel died had no way to say so — the event could not travel, the
+    pattern scan was off, and the watchdog stands aside in RECOVERING — and a
+    working tunnel showed "Connecting…" for the rest of the session.
+    """
+    Stub = machine_stub(tray)
+    stub = Stub()
+    stub.state_events = True
+    stub.dispatch(tray.MSG_WARNING,
+                  sentence=f"{tray.C.EVENT_CHANNEL_STOPPED} (closed)")
+    r.check("a dead event channel re-arms the log-matching fallback",
+            not stub.state_events,
+            "the helper tells the user this happens; it has to happen")
+
+    # And an unrelated warning must not turn the fallback on behind a channel
+    # that is working — the two sources would then both drive the badge.
+    other = Stub()
+    other.state_events = True
+    other.dispatch(tray.MSG_WARNING, sentence="no default route after teardown")
+    r.check("an unrelated warning leaves the event channel trusted",
+            other.state_events,
+            "log matching is the fallback, not a second opinion")
+
+
+def check_a_teardown_is_not_a_drop(tray, r):
+    """A teardown the user asked for must not become a reconnect.
+
+    The helper usually exits *after* the deadline rather than instead of it,
+    and teardown_intent is the only record of why the teardown was happening.
+    Clearing it on the timeout meant that late exit arrived as an unexplained
+    death: `dropped` was armed, and the next health tick opened a browser and
+    raised a Duo push -- for a user who had asked to disconnect and been told
+    the disconnect had failed.
+    """
+    Stub = machine_stub(tray)
+
+    class Live:
+        @staticmethod
+        def poll():
+            return None
+
+    for during in ("disconnect", "reconnect"):
+        stub = Stub()
+        stub.state = tray.DISCONNECTING
+        stub.teardown_intent = during
+        stub.helper_proc = Live()
+        stub.tunnel_ever_connected = True
+        stub.autoreconnect = True
+        stub.dispatch(tray.MSG_TEARDOWN_TIMEOUT, during=during)
+        # The helper finally dies, after the deadline.
+        stub.helper_proc = None
+        stub.dispatch(tray.MSG_HELPER_EXITED, status=1,
+                      generation=stub.helper_generation)
+        r.check(f"a {during} that timed out is still a teardown when it ends",
+                not stub.dropped and stub.signins == []
+                and stub.state == tray.DISCONNECTED,
+                f"during={during} dropped={stub.dropped}"
+                f" signins={stub.signins} state={stub.state!r} — arming a"
+                " rebuild here signs the user back in after they asked to"
+                " disconnect, and after being told it had failed")
+
+    # And Disconnect asked for while a reconnect's teardown is running: the
+    # teardown carries on, the sign-in after it does not.
+    mid = Stub()
+    mid.state = tray.DISCONNECTING
+    mid.teardown_intent = "reconnect"
+    mid.reconnect_keep_log = True
+    mid.dispatch(tray.MSG_DISCONNECT)
+    mid.dispatch(tray.MSG_HELPER_EXITED, status=0,
+                 generation=mid.helper_generation)
+    r.check("disconnect during a reconnect stops after the teardown",
+            mid.signins == [] and mid.state == tray.DISCONNECTED,
+            f"signins={mid.signins} state={mid.state!r} — the verb was"
+            " dropped and the reconnect carried on into a browser and a Duo"
+            " push, while the IPC answered ok")
+
+
+def check_a_human_taking_over_gets_the_budget_back(tray, r):
+    """Connect and Reconnect are the same intent and must cost the same.
+
+    Both land on the same teardown-then-sign-in, but only the Connect
+    spelling refunded the rebuild budget. So after the ladder had spent its
+    three attempts, `asuvpn connect` restored automatic recovery for the next
+    tunnel and `asuvpn reconnect` left it exhausted -- and the next demotion
+    announced "automatic sign-in gave up" without having tried once.
+    """
+    Stub = machine_stub(tray)
+    spent = {}
+    for verb, message in (("connect", tray.MSG_CONNECT),
+                          ("reconnect", tray.MSG_RECONNECT)):
+        stub = Stub()
+        stub.state = tray.DEMOTED
+        stub.rebuilds = tray.MAX_REBUILDS
+        stub.dropped = True
+        stub.giveup_notified = True
+        stub.dispatch(message)
+        spent[verb] = (stub.rebuilds, stub.dropped, stub.giveup_notified)
+    r.check("connect and reconnect hand the rebuild budget back alike",
+            spent["connect"] == spent["reconnect"] == (0, False, False),
+            f"connect={spent['connect']} reconnect={spent['reconnect']} —"
+            " a human is taking over either way, and the ladder keeps its"
+            " own count by calling the teardown row directly")
+
+
 def check_a_demotion_can_always_be_lifted(tray, r):
     """No verdict may outlive the check that can overturn it.
 
@@ -3645,6 +3755,9 @@ def main():
         guarded(check_tunnel_health, tray, r)
         guarded(check_demotion_rules, tray, r)
         guarded(check_verbs_reach_every_state, tray, r)
+        guarded(check_the_fallback_comes_back, tray, r)
+        guarded(check_a_teardown_is_not_a_drop, tray, r)
+        guarded(check_a_human_taking_over_gets_the_budget_back, tray, r)
         guarded(check_a_demotion_can_always_be_lifted, tray, r)
         guarded(check_teardown_rows, tray, r)
         guarded(check_signin_deadline, tray, r)
