@@ -133,6 +133,30 @@ jobs:
             exit 1
           fi
           echo "a fresh install wrote server = $wrote, matching the schema"
+          # The other thing bash has to restate because it cannot load the
+          # schema: the XDG base-directory rules. install.sh decides where the
+          # config and the log go; asuvpn_contract.py decides where the applet
+          # looks for them. Two implementations of one rule, and nothing
+          # compared them -- an installer that wrote to the wrong place would
+          # print success and the applet would silently use defaults.
+          #
+          # Driven with the variables actually set, and set to a *relative*
+          # value as well, because "a relative value is ignored" is the half
+          # of the rule most easily got wrong on one side only.
+          for value in /tmp/xdg-abs relative/not-absolute; do
+            rm -rf /tmp/xdg-home /tmp/xdg-abs
+            HOME=/tmp/xdg-home XDG_CONFIG_HOME="$value" \
+              /tmp/wheel-venv/bin/asuvpn-install > /dev/null
+            reads=$(HOME=/tmp/xdg-home XDG_CONFIG_HOME="$value" python3 -c \
+              'import importlib.util as u; s=u.spec_from_file_location("c","asuvpn_contract.py"); m=u.module_from_spec(s); s.loader.exec_module(m); print(m.config_path())')
+            if [ ! -f "$reads" ]; then
+              echo "with XDG_CONFIG_HOME=$value the installer did not write" >&2
+              echo "the file the applet reads ($reads); it wrote:" >&2
+              find /tmp/xdg-home /tmp/xdg-abs -name 'asuvpn.conf' >&2 || true
+              exit 1
+            fi
+            echo "XDG_CONFIG_HOME=$value -> both sides agree on $reads"
+          done
 
   # Proves the portable half is portable, and claims nothing more. The logic
   # tier is pure Python: it drives the contract, the state machine and the

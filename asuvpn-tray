@@ -19,7 +19,6 @@ import os
 import re
 import stat
 import shlex
-import shutil
 import signal
 import socket
 import struct
@@ -750,11 +749,14 @@ def configured_server():
 
 
 def find_openconnect_sso():
-    found = shutil.which("openconnect-sso")
-    if found:
-        return found
-    fallback = Path.home() / ".local" / "bin" / "openconnect-sso"
-    return str(fallback) if os.access(fallback, os.X_OK) else None
+    """PATH, then ~/.local/bin, which is where pipx puts it.
+
+    The ~/.local/bin half is the part that has to agree with everyone else:
+    bootstrap.sh applies the same rule in shell, and a self-check that looked
+    only at PATH would report the sign-in missing on a machine where the
+    applet uses it every day.
+    """
+    return C.find_program("openconnect-sso", use_path=True, user_local=True)
 
 
 # openconnect-sso asks for a TOTP secret on the terminal whenever the keyring

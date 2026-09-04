@@ -124,9 +124,12 @@ cd ASU_VPN_SSO
 
 `bootstrap.sh` installs whatever is missing, installs the app into `~/.local`,
 and registers the launcher. It is safe to re-run: nothing already satisfied is
-reinstalled. It runs `sudo apt-get update` on every run that has dependencies
-enabled (stale package lists otherwise cause packages to be silently skipped),
-so it asks for `sudo` each time; `--no-deps` skips that entirely. It asks
+reinstalled. It asks the machine what is
+missing before it reaches for `sudo` at all: on a desktop that already has
+everything, it installs nothing and asks for no password. When something *is*
+missing it runs `sudo apt-get update` first, because stale package lists cause
+packages to be silently skipped — so that is the run that asks for `sudo`.
+`--no-deps` skips the dependency half entirely. It asks
 before adding the deadsnakes PPA (see [Requirements](#requirements) for why
 Python 3.12 is needed).
 
@@ -176,8 +179,9 @@ asuvpn-install                  # user half only; accepts install.sh's flags
 That writes nothing outside `$HOME` and asks for no privileges. What it cannot
 do is the part no wheel can carry — the GTK bindings, `openconnect`, `pkexec`,
 the GNOME tray extension are apt packages and a shell extension, not Python
-distributions. On Ubuntu/Debian one line covers the minimum (this is a subset
-of what `asuvpn-bootstrap` does, minus the Python 3.12 story in
+distributions. On Ubuntu/Debian one line covers the minimum
+(`asuvpn-bootstrap` installs all of this except `vpnc-scripts`, which apt
+pulls in behind `openconnect` as a Recommends, plus the Python 3.12 story in
 [Requirements](#requirements)):
 
 ```bash
@@ -247,11 +251,14 @@ matters raises a desktop notification:
 | **VPN connected** | the tunnel came up for the first time | — |
 | **VPN connection lost** | `openconnect` lost the link and is re-establishing it | nothing — same session, no sign-in |
 | **VPN reconnected** | it came back, possibly on a new address | — |
-| **VPN not carrying traffic** | the watchdog's free re-establish did not help, or could not be tried | — |
+| **VPN not carrying traffic** | the watchdog's free re-establish did not help, or could not be tried — the `device` or `probe` source | — |
+| **VPN DNS not configured** | the same, when the source that objected was the resolver check | — |
 | **VPN reconnecting** | `openconnect` was nudged to rebuild the tunnel | nothing — same session |
 | **VPN carrying traffic again** | the tunnel recovered | — |
 | **VPN signing in again** | the free fix did not help — or the tunnel died outright and is being rebuilt — and automatic reconnection is on | **a Duo push and a password** |
-| **VPN still not connected** | automatic reconnection gave up after three attempts; it will wait to be asked | — |
+| **VPN still not connected** | automatic reconnection gave up after `MAX_REBUILDS` attempts at a tunnel that had died outright; it will wait to be asked | — |
+| **VPN still not usable** | the same budget, spent on a tunnel that was up and useless; it will wait to be asked | — |
+| **VPN not connected** | the authorization prompt went unanswered for `signin-timeout`, so it was dismissed | — |
 | **VPN disconnected** | the tunnel closed, with the reason if it was not you | — |
 | **Sign-in failed** | the sign-in step itself failed; the text says why | — |
 | **VPN warning** | the helper hit trouble — most seriously, the network may not have been restored after teardown | — |
@@ -877,7 +884,10 @@ internal names still resolve to whatever the public internet says, because the
 resolver the VPN pushed is no longer configured on the tunnel's link. Every
 20 seconds the applet asks `systemd-resolved` whether that resolver is still
 in force — on the tunnel's link, or in `/etc/resolv.conf` if the handover fell
-back to `vpnc-script`; either counts, because either works. It only reads;
+back to `vpnc-script`; either counts, because either works. Only while
+`dns = on`, which is the same setting that decides whether the applet
+configures DNS in the first place: with it off, nothing here is asked and no
+demotion can come from this source. It only reads;
 putting it back needs root, and the free re-establish does exactly that by
 running the script again. If `systemd-resolved` does not
 answer — a machine that does not run it never had this configured — that is not
@@ -1171,7 +1181,7 @@ the one thing guaranteed to stop `vpnc-script` from restoring the routing table.
 `reason=disconnect` on the way out — but only when it exits *gracefully*. If it
 is killed outright the script never runs, which is the classic way to end up
 with no working network until you reboot or toggle the interface. Three things
-guard against that:
+guard against that, and a fourth reports what they could not prevent:
 
 - **Gentle escalation.** Teardown sends the polite stop signal (`SIGINT`),
   waits 15 seconds, sends the firmer one (`SIGTERM`), waits 10 more, and only

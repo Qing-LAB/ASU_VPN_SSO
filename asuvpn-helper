@@ -499,17 +499,12 @@ def find_openconnect():
     could satisfy the polkit prompt had a one-line root exec of any file. The
     PATH fallback is safe because pkexec resets PATH to a sanitised value.
     """
-    for path in OPENCONNECT_CANDIDATES:
-        if os.access(path, os.X_OK):
-            return path
-    return shutil.which("openconnect")
+    return C.find_program("openconnect", OPENCONNECT_CANDIDATES, use_path=True)
 
 
 def find_ip():
-    for path in IP_CANDIDATES:
-        if os.access(path, os.X_OK):
-            return path
-    return None
+    """The absolute paths only: this runs as root and `ip` deletes devices."""
+    return C.find_program("ip", IP_CANDIDATES)
 
 
 def requested_interface(extra):

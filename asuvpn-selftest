@@ -48,7 +48,6 @@ import os  # noqa: E402
 import re  # noqa: E402
 import socket  # noqa: E402
 import stat  # noqa: E402
-import shutil  # noqa: E402
 import subprocess  # noqa: E402
 import tempfile  # noqa: E402
 import threading  # noqa: E402
@@ -2602,8 +2601,7 @@ def check_desktop_stack(tray, r):
         r.fail("GTK, AppIndicator and libnotify bindings are importable",
                f"{tray.GUI_ERROR}\n            the CLI still works; the tray"
                " icon will not. Re-run ./bootstrap.sh")
-    if any(os.access(os.path.join(d, "pkexec"), os.X_OK)
-           for d in os.environ.get("PATH", "").split(os.pathsep) if d):
+    if tray.C.find_program("pkexec", use_path=True):
         r.ok("pkexec is available")
     else:
         r.fail("pkexec is available",
@@ -2675,10 +2673,7 @@ def check_pipx_copy_is_the_running_one(C, r):
     # check is for: `~/.local/bin` off PATH is the case install.sh warns about
     # and the README documents, and it is no evidence at all that the package
     # is absent.
-    script = shutil.which("asuvpn-install")
-    if script is None:
-        fallback = os.path.expanduser("~/.local/bin/asuvpn-install")
-        script = fallback if os.access(fallback, os.X_OK) else None
+    script = C.find_program("asuvpn-install", use_path=True, user_local=True)
     if script is None:
         r.ok(name, "not installed from PyPI; nothing to fall behind")
         return

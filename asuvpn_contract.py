@@ -27,6 +27,7 @@ reading a file owned by somebody else.
 
 import os
 import re
+import shutil
 import stat
 
 # The release version, stated once. pyproject.toml reads it from this line at
@@ -361,18 +362,49 @@ RESOLVECTL_PATHS = ("/usr/bin/resolvectl", "/bin/resolvectl")
 RESOLVECTL_TIMEOUT = 5
 
 
+def find_program(name, candidates=(), use_path=False, user_local=False):
+    """Where a program is, or None. The one place that question is answered.
+
+    It was answered in five places with three different rules -- absolute
+    candidates only, candidates then PATH, PATH then ~/.local/bin -- and the
+    differences were real rather than accidental, which is exactly why they
+    belong in one function as arguments instead of in five bodies as habits:
+
+      * `candidates` are absolute paths, tried first. Code running as root
+        prefers them, and some of it deliberately stops there.
+      * `use_path` allows the PATH lookup. Safe under pkexec, which resets
+        PATH to a sanitised value, and the callers that do not run as root.
+      * `user_local` also accepts ~/.local/bin, which is where pipx puts
+        console scripts and where this project installs its own.
+
+    Two callers disagreeing about the last rule is not hypothetical: the tray
+    finds openconnect-sso there, and a self-check that looked only at PATH
+    would report it missing on a machine where the applet uses it every day.
+    """
+    for path in candidates:
+        if os.access(path, os.X_OK):
+            return path
+    if use_path:
+        found = shutil.which(name)
+        if found:
+            return found
+    if user_local:
+        fallback = os.path.expanduser(f"~/.local/bin/{name}")
+        if os.access(fallback, os.X_OK):
+            return fallback
+    return None
+
+
 def resolvectl_path():
     """Where resolvectl is, or None if this machine has none.
 
     Both ends of the DNS work ask this -- asuvpn-notify to configure a link,
     the tray to read one back -- and they asked it two different ways before
     this existed, which is two chances to disagree about whether the machine
-    has systemd-resolved on it.
+    has systemd-resolved on it. No PATH fallback: this runs as root from
+    asuvpn-notify, and the two absolute paths are where it lives.
     """
-    for path in RESOLVECTL_PATHS:
-        if os.access(path, os.X_OK):
-            return path
-    return None
+    return find_program("resolvectl", RESOLVECTL_PATHS)
 
 
 # ------------------------------------------------------------------ split DNS
