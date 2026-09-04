@@ -40,12 +40,15 @@ import sys
 sys.dont_write_bytecode = True
 
 import argparse  # noqa: E402
+import contextlib  # noqa: E402
+import io  # noqa: E402
 import importlib.machinery  # noqa: E402
 import importlib.util  # noqa: E402
 import os  # noqa: E402
 import re  # noqa: E402
 import socket  # noqa: E402
 import stat  # noqa: E402
+import shutil  # noqa: E402
 import subprocess  # noqa: E402
 import tempfile  # noqa: E402
 import threading  # noqa: E402
@@ -2412,6 +2415,74 @@ def check_sso_environment(tray, sso, r):
                "            pipx inject openconnect-sso 'setuptools<71' --force")
 
 
+def check_pipx_copy_is_the_running_one(C, r):
+    """After `pipx upgrade asuvpn`, is the copy that runs the new one?
+
+    The PyPI package is a delivery channel: `asuvpn-install` copies the
+    programs out of the wheel's payload into ~/.local/share/asuvpn, and that
+    copy is what the launcher, the CLI and the tray all run. `pipx upgrade`
+    replaces the payload and nothing else. So an upgrade appears to do
+    nothing, silently, and the next bug report is about a bug that was fixed
+    two releases ago -- the failure mode with no symptom, which is the kind
+    this whole suite exists for.
+
+    Found through the console script rather than by guessing at pipx's
+    layout: `asuvpn-install` exists on PATH exactly when the package is
+    installed, and its shebang names the interpreter that can import the
+    payload. Anything unexpected along the way means only that this question
+    cannot be answered here, and an unanswerable question is not a verdict.
+    """
+    name = "the installed programs are as new as the package they came from"
+    script = shutil.which("asuvpn-install")
+    if script is None:
+        r.ok(name, "not installed from PyPI; nothing to fall behind")
+        return
+    try:
+        with open(script, encoding="utf-8", errors="replace") as handle:
+            shebang = handle.readline()
+    except OSError as exc:
+        r.warn(name, f"cannot read {script}: {exc}")
+        return
+    interpreter = shebang[2:].strip() if shebang.startswith("#!") else ""
+    if not interpreter or not os.access(interpreter, os.X_OK):
+        r.warn(name, f"{script} does not name an interpreter this can run")
+        return
+    program = ("from importlib.resources import files;"
+               "import runpy, sys;"
+               "p = files('asuvpn_dist') / 'payload' / 'asuvpn_contract.py';"
+               "sys.stdout.write("
+               "runpy.run_path(str(p)).get('VERSION', ''))")
+    try:
+        # -I, and this is not incidental: without it `-c` puts the working
+        # directory first on sys.path, so running this from a checkout made
+        # the venv's python import the *checkout's* asuvpn_dist instead of
+        # its own -- the answer would then have come from the very tree the
+        # question is about. Isolated mode is also what keeps a stray
+        # PYTHONPATH out of a question whose whole point is "what does this
+        # venv carry".
+        out = subprocess.run([interpreter, "-I", "-c", program],
+                             capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError) as exc:
+        r.warn(name, f"could not ask {interpreter} what it carries: {exc}")
+        return
+    packaged = out.stdout.strip()
+    if out.returncode != 0 or not packaged:
+        r.warn(name, "the package is installed but does not carry a readable"
+                     f" payload version: {out.stderr.strip()[:200]}")
+        return
+    # Only one direction is a problem. A running copy *newer* than the package
+    # is an ordinary checkout install sitting beside an older PyPI one, which
+    # is what a developer's machine looks like and is nobody's bug.
+    if packaged != C.VERSION:
+        r.warn(name,
+               f"this copy is {C.VERSION} and the installed package carries"
+               f" {packaged}. `pipx upgrade asuvpn` replaces the package but"
+               " not the programs it installed; run `asuvpn-install` to"
+               " finish the upgrade")
+        return
+    r.ok(name, f"both are {C.VERSION}")
+
+
 def check_install_scripts(C, r):
     """The shell installers' hand-copied server default, held to the schema.
 
@@ -2726,8 +2797,17 @@ def check_dns_takeover(notify, C, r):
     can fail leaves the old behaviour intact: the real vpnc-script guards both
     its DNS branches on INTERNAL_IP4_DNS, so that variable surviving is the
     whole of "we did not take this over, carry on as before".
+
+    Its notes are captured rather than left to escape. `note()` writes to
+    stderr because that is the stream openconnect relays into the log, and it
+    is right to be loud in production -- but driving it here put seven lines
+    of "resolvectl domain exited 1" and "not touching DNS" on the terminal of
+    anyone who had just run install.sh, ahead of "self-check passed". A suite
+    that says 0 failed while printing what reads as a stack of errors is worse
+    than one that says nothing.
     """
-    with tempfile.TemporaryDirectory() as d:
+    with contextlib.redirect_stderr(io.StringIO()), \
+            tempfile.TemporaryDirectory() as d:
         os.chmod(d, 0o700)
         log = os.path.join(d, "calls")
         faildir = os.path.join(d, "fail")
@@ -3095,6 +3175,7 @@ def main():
         guarded(check_desktop_stack, tray, r)
         guarded(check_installed_permissions, C, r)
         guarded(check_install_scripts, C, r)
+        guarded(check_pipx_copy_is_the_running_one, C, r)
         guarded(check_no_bytecode, r)
 
     if "wiring" in tiers:

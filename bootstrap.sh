@@ -17,6 +17,14 @@ INSTALL_DEPS=1
 ASSUME_YES=0
 INSTALL_ARGS=()
 NEEDS_RELOGIN=0
+# Whether the missing pieces are ours to have installed. Set when the
+# dependency pass is skipped -- by --no-deps, or because this distribution is
+# not one this script installs for -- and read by verify_bindings, which must
+# not treat a gap the user was just told about as a failure of its own.
+# Declared here, above the option parsing that sets it: the first version of
+# this sat beside verify_bindings, three hundred lines below --no-deps, and
+# quietly reset it to 0 on every run.
+DEPS_SKIPPED=0
 
 # openconnect-sso needs Python 3.12: it pins lxml <5 and PyQt6-WebEngine <7,
 # and neither has wheels for 3.13+. Ubuntu 26.04 ships only 3.14, so 3.12 comes
@@ -55,7 +63,7 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --server) SERVER="${2:?--server needs a value}"; shift 2 ;;
     --server=*) SERVER="${1#*=}"; shift ;;
-    --no-deps) INSTALL_DEPS=0; shift ;;
+    --no-deps) INSTALL_DEPS=0; DEPS_SKIPPED=1; shift ;;
     --link) INSTALL_ARGS+=(--link); shift ;;
     -y|--yes) ASSUME_YES=1; shift ;;
     -h|--help) awk 'NR>1 && /^#/ {sub(/^# ?/, ""); print; next} NR>1 {exit}' "${BASH_SOURCE[0]}"; exit 0 ;;
@@ -174,7 +182,8 @@ report_missing() {               # $1 manager (may be empty)
   fi
   warn "on GNOME, also enable the AppIndicator extension:"
   warn "    gnome-extensions enable ubuntu-appindicators@ubuntu.com"
-  warn "then re-run this script with --no-deps, which installs only the app."
+  warn "the app itself is being installed now; nothing above needs this script"
+  warn "to be run again."
 }
 
 # --------------------------------------------------------------- apt helpers
@@ -303,6 +312,17 @@ verify_sso_venv() {
 # ------------------------------------------------------------------- checking
 
 verify_bindings() {
+  if ! have_gtk_bindings; then
+    # A hard error only when we just tried and failed. Otherwise the CLI, the
+    # config and the self-check all still install and all still work: the tray
+    # is the only part that needs these, and saying so beats refusing to
+    # install anything.
+    [ "$DEPS_SKIPPED" -eq 1 ] || die "the system python3 is missing GTK bindings after installing them; this is a bug -- please report it"
+    warn "no GTK bindings for the system python3: the tray applet will not"
+    warn "start until they are installed. The asuvpn command line and"
+    warn "'asuvpn selftest' work without them."
+    return 0
+  fi
   /usr/bin/python3 - <<'PY' || die "the system python3 is missing GTK bindings; re-run without --no-deps"
 import sys
 import gi
@@ -353,8 +373,17 @@ if [ "$INSTALL_DEPS" -eq 1 ]; then
     enable_extension
     INSTALL_DEPS=0
   elif [ "$MANAGER" != "apt" ]; then
+    # Report, then carry on rather than dying. Everything below this point is
+    # the user's own half -- ~/.local, no root, no distribution knowledge --
+    # and it works on any Linux. Stopping here left a Fedora or Arch user with
+    # nothing at all installed, and told them to re-run with --no-deps, which
+    # then died telling them to re-run *without* it: the two messages pointed
+    # at each other. One run now leaves `asuvpn` and `asuvpn selftest` in
+    # place, and the self-check is a far better guide to what this machine
+    # still needs than a list printed by a script that never looked at it.
     report_missing "$MANAGER"
-    die "cannot install automatically on this distribution"
+    DEPS_SKIPPED=1
+    INSTALL_DEPS=0
   fi
 fi
 
@@ -390,6 +419,23 @@ verify_bindings
 
 say "installing the app, the launcher and the asuvpn command"
 bash "$SRC_DIR/install.sh" --server "$SERVER" "${INSTALL_ARGS[@]+"${INSTALL_ARGS[@]}"}"
+
+if [ "$DEPS_SKIPPED" -eq 1 ] && [ -n "$(missing_capabilities)" ]; then
+  cat <<EOF
+
+$(say "the app is installed; the system packages above are not")
+
+  What works right now:
+
+      asuvpn selftest       # what this machine still needs, checked live
+      asuvpn --write-config # print a settings file
+
+  The tray applet and connecting need the packages listed above. Install them
+  with your own package manager -- nothing here has to be run again afterwards.
+
+EOF
+  exit 0
+fi
 
 cat <<EOF
 

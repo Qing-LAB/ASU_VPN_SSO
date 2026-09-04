@@ -73,10 +73,17 @@ configuration:
   which Linux you are on, so a machine that already has GTK, `polkit` and
   `openconnect` installs with no packages and no password at all. Where
   something is missing it names the gap and the packages that fill it for
-  `dnf`, `pacman` or `zypper` — then stops, because only the apt path is
-  exercised in CI and running a guessed package name through `sudo` on someone
-  else's machine is worse than a list they can read first. Install those, then
-  `./bootstrap.sh --no-deps`. The applet itself is plain Python and GTK 3.
+  `dnf`, `pacman` or `zypper`, and installs none of them: only the apt path is
+  exercised in CI, and running a guessed package name through `sudo` on someone
+  else's machine is worse than a list they can read first.
+
+  It does not stop there, though. Everything after that point is your own half
+  — `~/.local`, no root, no distribution knowledge — so it carries on and
+  installs it, and one run leaves you with `asuvpn` and `asuvpn selftest` even
+  where the packages are missing. Run the self-check: it inspects *this*
+  machine and is a better list than anything printed by a script that has not
+  looked at it. Install what it names with your own package manager; nothing
+  needs re-running afterwards. The applet itself is plain Python and GTK 3.
 
 > [!NOTE]
 > On a machine that is missing them, `bootstrap.sh` installs around thirty apt
@@ -453,7 +460,10 @@ how the files arrived.
 
 One consequence worth knowing: the copy under `~/.local/share/asuvpn/` is what
 runs, not the one in the pipx venv, so `pipx upgrade asuvpn` alone changes
-nothing — run `asuvpn-install` after it to copy the new version out.
+nothing — run `asuvpn-install` after it to copy the new version out. Forgetting
+that half is silent by nature, so `asuvpn selftest` asks the question for you:
+it compares the running copy against the version the installed package
+carries, and says which command finishes the job.
 
 ### Running from the checkout instead
 
