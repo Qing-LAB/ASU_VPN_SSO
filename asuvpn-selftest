@@ -393,7 +393,7 @@ def check_owner_is_a_principal(C, r):
                 "with no trusted set there is no privilege being granted, so"
                 " ownership is not the caller's business")
 
-        os.chmod(path, 0o646)  # noqa: S103 - the hazard is the point here
+        os.chmod(path, 0o646)  # nosec B103  # noqa: S103 — the hazard is the fixture
         r.check("world-writable still wins over the ownership test",
                 C.unsafe_write_access(path, trusted_uids={0, mine})
                 == "world-writable",
@@ -577,6 +577,7 @@ def machine_stub(tray):
             self.demoted_by = None
             self.strikes = tray.fresh_strikes()
             self.nudge_spent = self.failure_notified = False
+            self.giveup_notified = False
             self.routes_seen = {"routes4": False, "routes6": False}
             self.tunnel_device = None
             self.tunnel_ifindex = None
@@ -1194,6 +1195,121 @@ def check_rebuild_rules(tray, r):
                 " earlier reset let this run forever")
 
 
+    finally:
+        tray.SETTINGS["autoreconnect-min-gap"] = original_gap
+
+
+def check_ladder_is_bounded(tray, r):
+    """The expensive rung of the ladder is counted, not merely spaced.
+
+    The gap this closes: `_tr_rebuild_dropped` was capped and `_act_ladder`
+    was not, so the *cheaper* break -- a tunnel that dies outright -- was
+    bounded while the one that costs the same sign-in and lasts longer was
+    left to spacing alone. A tunnel that comes up, passes as usable, goes
+    bad and does it again bought a Duo push and a polkit dialog every
+    autoreconnect-min-gap, for as long as the machine stayed awake, with
+    nobody at the keyboard to see it.
+
+    Driven as the flap itself arrives: connect, strike to a demotion, let the
+    ladder spend its free nudge and then its expensive one, and do it again.
+    Nothing here reaches into the ladder; the laps are what the applet would
+    have lived through.
+    """
+    original_gap = tray.SETTINGS["autoreconnect-min-gap"]
+    tray.SETTINGS["autoreconnect-min-gap"] = 300
+    try:
+        Stub = machine_stub(tray)
+        strikes = max(1, tray.SETTINGS["health-strikes"])
+
+        def lap(stub, up_for=0.0):
+            """One turn of the flap: a tunnel arrives, then stops carrying.
+
+            `up_for` is how long it lasted before going bad -- the whole
+            question the refund asks. The rate limit is wound off because the
+            real thing waits it out in wall-clock time, and a fixture that
+            waited would test the clock instead of the count.
+            """
+            stub.state = tray.CONNECTING
+            stub._apply_state_event(
+                "connected dev=asuvpn0 addr=192.0.2.1 dns=192.0.2.53")
+            stub.tunnel_up_since = time.monotonic() - up_for
+            stub.last_autoreconnect = float("-inf")
+            for _ in range(2 * strikes):
+                stub.last_nudge = float("-inf")
+                stub.dispatch(tray.MSG_CHECK, source="probe",
+                              reason="nothing answers", detail="no reply")
+
+        stub = Stub()
+        stub.autoreconnect = True
+        for _ in range(tray.MAX_REBUILDS + 3):
+            lap(stub)
+        r.check("a flapping tunnel spends MAX_REBUILDS sign-ins and no more",
+                len(stub.signins) == tray.MAX_REBUILDS,
+                f"signins={stub.signins} rebuilds={stub.rebuilds}"
+                f" logged={stub.logged} — every one of these is a Duo push and"
+                " a password dialog raised at nobody")
+        # Said once per incident, like every other verdict on this ladder --
+        # this row runs on every health tick for as long as the tunnel stays
+        # demoted, and the point of giving up is to stop making noise. A
+        # reconnect between laps genuinely is a new incident and may speak
+        # again; twenty seconds of the same one may not.
+        said = stub.notes.count("VPN still not usable")
+        signins = len(stub.signins)
+        for _ in range(4 * strikes):
+            stub.last_nudge = float("-inf")
+            stub.last_autoreconnect = float("-inf")
+            stub.dispatch(tray.MSG_CHECK, source="probe",
+                          reason="nothing answers", detail="no reply")
+        r.check("a spent budget goes quiet instead of repeating itself",
+                stub.notes.count("VPN still not usable") == said
+                and len(stub.signins) == signins,
+                f"notes={stub.notes} signins={stub.signins} — the health tick"
+                " keeps arriving after the ladder has nothing left to try")
+        # And the ladder's free rung is untouched by any of this: it costs
+        # nothing, so a spent budget must not disable it.
+        r.check("the free re-establish outlives the budget",
+                stub.sent.count(tray.C.CONTROL_RECONNECT)
+                == tray.MAX_REBUILDS + 3,
+                f"sent={stub.sent} — the nudge asks openconnect to reuse the"
+                " session it already has: no sign-in, no push, nothing to ration")
+
+        # The other half of the fix. Nothing on this path exits openconnect
+        # the ordinary way, so the exit row's refund is unreachable here -- a
+        # cap without one would bar unattended recovery for the rest of the
+        # session after three unrelated incidents.
+        recovered = Stub()
+        recovered.autoreconnect = True
+        recovered.rebuilds = tray.MAX_REBUILDS
+        lap(recovered, up_for=tray.SETTINGS["autoreconnect-min-gap"] + 1)
+        r.check("a tunnel that lasted before going bad earns the budget back",
+                len(recovered.signins) == 1 and recovered.rebuilds == 1,
+                f"signins={recovered.signins} rebuilds={recovered.rebuilds} —"
+                " a session that outlived the gap is a recovery that worked and"
+                " later met something new, not a flap")
+
+        # One budget across both recoveries, which is why the ladder reads the
+        # counter the dropped-tunnel row writes rather than keeping its own.
+        shared = Stub()
+        shared.autoreconnect = True
+        shared.rebuilds = tray.MAX_REBUILDS - 1  # as if drops had spent them
+        lap(shared)
+        spent_last = len(shared.signins)
+        lap(shared)
+        r.check("the two automatic sign-ins draw on one budget",
+                spent_last == 1 and len(shared.signins) == 1,
+                f"signins={shared.signins} after two laps with"
+                f" {tray.MAX_REBUILDS - 1} already spent elsewhere — a tunnel"
+                " breaking in both shapes at once is not a reason to be asked"
+                " twice as often")
+
+        # Opting out still governs: the cap is a second bound, not a
+        # replacement for the setting.
+        off = Stub()
+        off.autoreconnect = False
+        lap(off)
+        r.check("automatic sign-in stays off when it is off",
+                off.signins == [] and off.rebuilds == 0,
+                f"signins={off.signins} rebuilds={off.rebuilds}")
     finally:
         tray.SETTINGS["autoreconnect-min-gap"] = original_gap
 
@@ -2833,6 +2949,7 @@ def main():
         guarded(check_teardown_rows, tray, r)
         guarded(check_signin_deadline, tray, r)
         guarded(check_rebuild_rules, tray, r)
+        guarded(check_ladder_is_bounded, tray, r)
         guarded(check_signin_races, tray, r)
         guarded(check_start_refusals_keep_promise, tray, r)
         guarded(check_log_rotation, tray, r)

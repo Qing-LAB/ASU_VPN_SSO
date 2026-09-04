@@ -109,10 +109,15 @@ AUTOSTART_FILE = (
     _xdg_dir("XDG_CONFIG_HOME", ".config") / "autostart" / "asuvpn-tray.desktop"
 )
 MAX_LOG_LINES = 4000  # the in-memory tail; the file's cap is the log-max-kb setting
-# How many times a tunnel that died on its own is rebuilt before the applet
-# stops and waits to be asked. Spacing alone is not a bound: a network that is
-# down stays down, and every attempt costs a browser window and a Duo push, so
-# the third one is where unattended recovery stops being a kindness.
+# How many unattended sign-ins the applet will spend before it stops and waits
+# to be asked. Spacing alone is not a bound: a network that is down stays down,
+# and every attempt costs a browser window and a Duo push, so the third one is
+# where unattended recovery stops being a kindness.
+#
+# One budget, not one per recovery path. Both spenders buy the same thing with
+# the same currency -- _tr_rebuild_dropped when the tunnel is gone, _act_ladder
+# when it is up and useless -- and a tunnel breaking in both shapes at once is
+# not a reason to be asked twice as often.
 MAX_REBUILDS = 3
 # What the badge appends while a rebuild is still owed. One spelling, because
 # it is written in one place and taken off again in another, and two copies of
@@ -802,6 +807,7 @@ class StateMachine:
     strikes: dict
     nudge_spent: bool
     failure_notified: bool
+    giveup_notified: bool
     routes_seen: dict
     tunnel_device: str | None
     tunnel_ifindex: int | None
@@ -1105,6 +1111,7 @@ class StateMachine:
             self.demoted_by = None
             self.nudge_spent = False
             self.failure_notified = False
+            self.giveup_notified = False
             self._set_state(CONNECTED, self.tunnel_address)
             self.notify("VPN carrying traffic again", self.server)
 
@@ -1370,13 +1377,54 @@ class StateMachine:
             self.log("[tray] automatic sign-in is off; staying demoted until a"
                      " check clears — Reconnect or Disconnect when ready")
             return
+        # Bounded like the dropped-tunnel rebuild, and for the same reason.
+        # This half was missing, which left the *expensive* recovery unbounded
+        # in the shape it is most likely to meet: a tunnel that connects,
+        # passes as usable, goes bad, and does it again. Nothing on this path
+        # exits openconnect the ordinary way -- the teardown carries intent
+        # "reconnect", which returns from _tr_helper_exited before the refund
+        # -- so without a cap here the gap was the only bound, and a flap
+        # bought a Duo push and a polkit dialog every five minutes, forever,
+        # for as long as the machine was awake.
+        #
+        # So the refund has to be restated here too, in the evidence this side
+        # has. The exit row asks whether the session that just died had
+        # lasted; the equivalent question with the tunnel still standing is
+        # whether it stayed *connected* longer than the gap before it went
+        # bad. That is a recovery that worked and later met something new, not
+        # a flap, and it earns the budget back.
+        if (self.tunnel_up_since is not None
+                and now - self.tunnel_up_since
+                >= SETTINGS["autoreconnect-min-gap"]):
+            self.rebuilds = 0
+            # The latch travels with the budget, wherever it is handed back:
+            # a give-up that has been refunded and spent again is a new one,
+            # and saying nothing the second time is how a bounded recovery
+            # turns into a silent one.
+            self.giveup_notified = False
+        if self.rebuilds >= MAX_REBUILDS:
+            # Once per incident. Unlike the dropped-tunnel row there is
+            # nothing to disarm -- the tunnel is still up and still being
+            # watched, and a check going clear is a genuine way out of this --
+            # so the row keeps running and the latch is what keeps it quiet.
+            if not self.giveup_notified:
+                self.giveup_notified = True
+                self.log(f"[tray] {MAX_REBUILDS} sign-ins did not fix this"
+                         " tunnel; waiting to be asked — Reconnect or"
+                         " Disconnect when ready")
+                self.notify("VPN still not usable",
+                            "automatic sign-in gave up — Reconnect when ready",
+                            icon="dialog-warning-symbolic")
+            return
         remaining = SETTINGS["autoreconnect-min-gap"] - (now - self.last_autoreconnect)
         if remaining > 0:
             self.log(f"[tray] automatic sign-in allowed again in"
                      f" {int(remaining)}s (autoreconnect-min-gap)")
             return
+        self.rebuilds += 1
         self.last_autoreconnect = now
-        self.log("[tray] signing in again to rebuild the tunnel")
+        self.log(f"[tray] signing in again to rebuild the tunnel"
+                 f" (attempt {self.rebuilds} of {MAX_REBUILDS})")
         # Announced, because it is about to raise a Duo push and a password
         # dialog and the user should know what asked for them.
         self.notify("VPN signing in again",
@@ -1465,9 +1513,11 @@ class StateMachine:
         that acting on the applet always hands the decision back. The one
         user verb missing from that list is Reconnect: `_tr_teardown_reconnect`
         is shared with the escalation ladder, and clearing the count from
-        there would let a demotion sign-in refund the drop budget every time
-        round. Nothing is lost -- a session that outlives the gap refunds it
-        anyway, judged on the way out.
+        there would let a demotion sign-in refund its own budget every time
+        round -- which is exactly the loop the cap in `_act_ladder` exists to
+        stop. Nothing is lost: both paths refund a session that outlived the
+        gap, the exit row judging it on the way out and the ladder judging the
+        tunnel still standing in front of it.
 
         A tunnel merely *coming up* clears the flag but not the count; see
         _announce_connected, where getting that wrong made the limit
@@ -1475,6 +1525,7 @@ class StateMachine:
         """
         self.dropped = False
         self.rebuilds = 0
+        self.giveup_notified = False
 
     def _clear_incident(self):
         """A clean slate for the watchdog: no strikes, no demoter, no latch.
@@ -1487,6 +1538,7 @@ class StateMachine:
         self.demoted_by = None
         self.nudge_spent = False
         self.failure_notified = False
+        self.giveup_notified = False
         self.routes_seen = {"routes4": False, "routes6": False}
 
     def _adopt_tunnel(self, device, address, dns=""):

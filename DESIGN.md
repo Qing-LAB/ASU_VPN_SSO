@@ -837,7 +837,7 @@ interchangeable:
 | --- | --- | --- |
 | `SIGUSR2` to `openconnect` via the control pipe | none — same session | once per incident; `nudge-min-gap`, default 120s, between incidents |
 | stay demoted, say the free option is spent | none | once per incident |
-| full sign-in (`reconnect`) | Duo approval **and** polkit password | `autoreconnect-min-gap`, default 300s; on by default, and one untick from off |
+| full sign-in (`reconnect`) | Duo approval **and** polkit password | `autoreconnect-min-gap`, default 300s; `MAX_REBUILDS`, three; on by default, and one untick from off |
 
 ```mermaid
 stateDiagram-v2
@@ -850,6 +850,27 @@ stateDiagram-v2
     Nudged --> SignIn: still demoted, autoreconnect on (the default), gap elapsed
     SignIn --> Healthy: fresh session up (a new tunnel starts with a clean slate)
 ```
+
+The count on that last row was missing for a long time, and its absence was
+the sharper of the two holes: the *cheaper* break — a tunnel gone outright —
+was capped at three attempts, while the one that costs the same sign-in and
+lasts longer had only spacing to bound it. A tunnel that comes up, passes as
+usable, goes bad and does it again bought a Duo push and a polkit dialog every
+five minutes, all day, with nobody at the keyboard to see them.
+
+The cap alone would have been wrong, though, because the refund below is
+judged at a tunnel's death and nothing here dies the ordinary way — the
+teardown carries intent `reconnect`, which returns from the exit row before
+the refund is reached. Three unrelated incidents would then have barred
+unattended recovery for the rest of the session. So the ladder asks the same
+question in the evidence it has: a tunnel that stayed **connected** longer
+than `autoreconnect-min-gap` before going bad is a recovery that worked and
+later met something new, not a flap, and it earns the budget back.
+
+One budget, shared with the rebuild below rather than one each: both spend the
+same Duo push, and a tunnel breaking in both shapes at once is not a reason to
+be asked twice as often. The free nudge is never rationed by it — it costs
+nothing, so a spent budget must not disable it.
 
 These are positions within one incident, not machine states: `Demoted` and
 `Nudged` are both the machine's `DEMOTED` (the nudge is bookkeeping inside
@@ -876,7 +897,7 @@ three separate bounds are what make retrying safe rather than rude:
 | --- | --- |
 | `dropped`, armed only by an exit that followed real traffic | a rejected cookie, a dismissed authorization or an unmatched certificate pin will do the same thing the second time — so they are never retried, and every rebuild has to re-earn the flag the same way |
 | `autoreconnect-min-gap`, shared with the ladder | the two automatic sign-ins cannot add up to more than the user allowed |
-| `MAX_REBUILDS`, three | a network that is down stays down, and spacing alone would keep opening browser windows all afternoon |
+| `MAX_REBUILDS`, three, shared with the ladder | a network that is down stays down, and spacing alone would keep opening browser windows all afternoon |
 
 The setting is read **at the drop** to arm it, and again before each attempt.
 Those two are not the same reading on purpose: a box ticked hours after a
@@ -895,6 +916,7 @@ things — which is the part that took two attempts to get right:
 | `MAX_REBUILDS` reached | cleared | — | said once, and the badge stops promising a rebuild that is not coming |
 | reaching `connected` | cleared | **kept** | there is a tunnel, so nothing is owed — but every rebuild reaches this line, including the ones whose tunnel falls over seconds later |
 | a session outliving the gap, judged at its death | — | cleared | it did not flap, so whatever produced it worked |
+| a demoted tunnel that had been up longer than the gap, judged while it still stands | — | cleared | the same question the row above asks, in the evidence the ladder has: nothing on that path dies the ordinary way, so without this the cap would never be refunded |
 
 That last pair is the load-bearing one. Refunding the count at `connected`
 instead — which is where it obviously belongs, and where it first went — made
