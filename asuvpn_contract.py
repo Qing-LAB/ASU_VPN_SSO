@@ -575,12 +575,14 @@ SETTINGS = (
             " tunnel's rebuild both spend it, so neither can starve the other"
             " of the gap the user asked for."),
     Setting("signin-timeout", "int", 300,
-            "Seconds a sign-in may take before it is abandoned. It opens a"
-            " browser window and waits on a Duo approval, so this is generous"
-            " -- but it has to end: a rebuild that runs with nobody at the"
-            " keyboard would otherwise sit in Signing in... behind a login"
-            " window forever, and only Cancel would clear it. Held to"
-            " 60-3600; there is deliberately no off.",
+            "Seconds each half of a connect may wait on a human before it is"
+            " abandoned: the browser window and its Duo approval, and then the"
+            " authorization prompt. Generous, because both are things somebody"
+            " has to do -- but each has to end. A rebuild that runs with nobody"
+            " at the keyboard would otherwise sit in Signing in... behind a"
+            " login window, or in Connecting... behind a password dialog"
+            " polkit will never time out, and only Cancel would clear it."
+            " Held to 60-3600; there is deliberately no off.",
             minimum=60, maximum=3600),
     Setting("teardown-timeout", "int", 75,
             "Seconds to wait for the helper to finish. Must outlast its own"

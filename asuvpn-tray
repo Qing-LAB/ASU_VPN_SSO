@@ -227,6 +227,8 @@ MSG_TEARDOWN_FINISHED = "teardown-finished"  # reconnect worker: old tunnel gone
 MSG_TEARDOWN_TIMEOUT = "teardown-timeout"    # any teardown worker: during
 MSG_REBUILD = "rebuild"                    # health tick: a dropped tunnel may
                                            # be worth rebuilding by itself
+MSG_AUTHORIZE_TIMEOUT = "authorize-timeout"  # health tick: the polkit prompt
+                                           # has gone unanswered
 
 ANY = "*"
 
@@ -256,6 +258,7 @@ TRANSITIONS = {
     (AUTHENTICATING, MSG_AUTH_OK): "start_tunnel",
     (AUTHENTICATING, MSG_AUTH_FAILED): "signin_failed",
     (CONNECTING, MSG_TUNNEL_UP): "tunnel_came_up",
+    (CONNECTING, MSG_AUTHORIZE_TIMEOUT): "authorize_timed_out",
     (RECOVERING, MSG_TUNNEL_UP): "tunnel_came_up",
     (CONNECTED, MSG_TUNNEL_UP): "refresh_address",
     (DEMOTED, MSG_TUNNEL_UP): "adopt_only",
@@ -815,6 +818,7 @@ class StateMachine:
     tunnel_dns: str
     tunnel_ever_connected: bool
     tunnel_up_since: float | None
+    connecting_since: float | None
     last_failure: str | None
     dropped: bool
     rebuilds: int
@@ -992,6 +996,41 @@ class StateMachine:
                              daemon=True).start()
             return
         self._set_state(DISCONNECTED)
+
+    def _tr_authorize_timed_out(self, _data):
+        """Nobody answered the authorization prompt, so stop waiting on it.
+
+        Terminating pkexec while its dialog is up dismisses the dialog -- it
+        is an ordinary process of ours until it becomes root, which is the
+        same move `_quit_thread` makes and for the same reason. Once it *has*
+        become root this fails with EPERM, and that is fine: it can only have
+        got there by being answered, and then `helper_spoke` would have
+        stopped us before here.
+
+        The generation is bumped first so the exit this kill produces is
+        retired rather than painting its own FAILED over this one -- a bare
+        "terminated by SIGTERM" would say nothing about the prompt.
+
+        What is deliberately *not* touched is `dropped`. A rebuild that timed
+        out here has spent one attempt and is still owed the rest, so the tick
+        tries again after the gap and MAX_REBUILDS ends it. Handing the budget
+        back, as Cancel does, would make this a loop: prompt, wait, refund,
+        prompt.
+        """
+        limit = SETTINGS["signin-timeout"]
+        self.helper_generation += 1
+        proc = self.helper_proc
+        self.helper_proc = None
+        if proc is not None:
+            try:
+                proc.terminate()
+            except (ProcessLookupError, PermissionError, OSError):
+                pass
+        message = f"authorization was not answered in {limit}s"
+        self._set_state(FAILED, message + (REBUILDING if self.dropped else ""))
+        self.log(f"[tray] {message}; the prompt was dismissed")
+        self.notify("VPN not connected", message,
+                    icon="dialog-warning-symbolic")
 
     def _tr_quit_everything(self, _data):
         if self.quitting:
@@ -1594,6 +1633,10 @@ class StateMachine:
         self.tunnel_dns = ""
         self.tunnel_ever_connected = False
         self.tunnel_up_since = None
+        # Not a rate limit: it only ever means "this authorization has been
+        # waiting since", and a stale value belonging to a tunnel that is gone
+        # would time out the next one early.
+        self.connecting_since = None
         self._clear_incident()
 
 
@@ -1637,6 +1680,7 @@ class VpnTray(StateMachine):
         # exactly when a tunnel brought up at login is most likely to need one.
         self.last_nudge = float("-inf")
         self.last_autoreconnect = float("-inf")
+        self.connecting_since = None
         # Whether the last tunnel died on its own, and how many times it has
         # been rebuilt for that death. Outside _reset_tunnel_state on purpose
         # -- see _clear_drop.
@@ -2261,6 +2305,13 @@ class VpnTray(StateMachine):
         self.state_events = False
         self.last_failure = None
         self._reset_tunnel_state()
+        # After the reset, which clears it, and immediately before the process
+        # that raises the prompt. Setting it up beside _set_state(CONNECTING)
+        # read better and was wrong: the reset ten lines later put it back to
+        # None and the deadline never armed at all. authprompt.sh is what
+        # caught that -- the row test could not, because a stub dispatching
+        # into the table never runs this starter.
+        self.connecting_since = time.monotonic()
         try:
             proc = subprocess.Popen(
                 command,
@@ -2394,6 +2445,24 @@ class VpnTray(StateMachine):
         # precisely so something is still here to notice.
         if self.state == FAILED and self.dropped:
             self.dispatch(MSG_REBUILD)
+            return True
+        # The other end of signin-timeout, and for the same reason. That one
+        # bounds the browser and the Duo push; this bounds the polkit prompt
+        # that follows, which nothing bounded at all -- polkit agents do not
+        # time out, so an unattended rebuild at three in the morning raised a
+        # password dialog, sat in "Connecting..." behind it, and stayed there.
+        # The watchdog does not run in that state, so a network that came back
+        # an hour later found nothing watching.
+        #
+        # `helper_spoke` is the whole condition: once the helper has said
+        # anything, pkexec is answered and openconnect owns the timing, with
+        # its own timeouts and an exit that reaches the table. Silence since
+        # we asked is the only case this may act on.
+        if (self.state == CONNECTING and not self.helper_spoke
+                and self.connecting_since is not None
+                and time.monotonic() - self.connecting_since
+                >= SETTINGS["signin-timeout"]):
+            self.dispatch(MSG_AUTHORIZE_TIMEOUT)
             return True
         if SETTINGS["health-interval"] <= 0:
             return True  # watchdog off: keep reading the config, check nothing

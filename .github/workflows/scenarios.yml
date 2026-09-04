@@ -78,7 +78,8 @@ jobs:
           trap 'kill $XVFB 2>/dev/null' EXIT
           sleep 1
           for s in lifecycle.sh discon.sh watchdog-test.sh escalate.sh \
-                   blackhole.sh rebuild.sh contract-test.sh ipc-gate.sh; do
+                   blackhole.sh rebuild.sh authprompt.sh contract-test.sh \
+                   ipc-gate.sh; do
             echo "::group::$s"
             tests/sandbox/enter.sh "$s"
             echo "::endgroup::"

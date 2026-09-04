@@ -107,6 +107,7 @@ staged HOME, the proven tray start, the assertion helpers) lives in
 | `watchdog-test.sh` | a gone device: strikes → demotion → exactly one nudge, its *delivery* proven by the stand-in's SIGUSR2 telemetry; the reconnect event adopts the tunnel but the badge stays demoted | yes |
 | `blackhole.sh` | device and routes healthy, probe target silent → demoted with the probe named in the verdict, one nudge, and a badge that stays demoted because only the probe can promote it | yes |
 | `rebuild.sh` | a tunnel that dies outright (`FAKE_DIE_AFTER` models openconnect giving up after its own reconnect timeout) is signed in again unasked — and, because every rebuilt tunnel here dies too, capped at `MAX_REBUILDS` attempts with the give-up said once | yes |
+| `authprompt.sh` | the authorization prompt nobody answers (`FAKE_PKEXEC_HANG`): the applet leaves `Connecting…` when `signin-timeout` expires, dismisses the dialog rather than orphaning it, and names the reason | yes |
 | `contract-test.sh` | the config file drives the helper (`--force-dpd 45` on the real command line) and the CLI autoreconnect toggle lands back in the file | yes |
 | `ipc-gate.sh` | the control socket's uid gate, against a real second uid (mapped via `/etc/subuid`): the foreign poke gets no reply and is logged with its uid, while the same raw poke from our own uid is answered — so the refusal is proven non-vacuous | yes |
 

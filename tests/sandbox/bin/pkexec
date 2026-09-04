@@ -1,3 +1,16 @@
 #!/bin/sh
 # SANDBOX-MARKER
+# FAKE_PKEXEC_HANG stages the prompt nobody answers. Until pkexec becomes
+# root it is an ordinary child of the applet's, and terminating it is what
+# dismisses the dialog -- so this must be a process that dies on SIGTERM and
+# says nothing. `exec sleep` rather than a loop: the pid the applet holds is
+# then the pid that has to die, and no orphan outlives the scenario.
+#
+# Nothing is printed on the way in. The applet's `helper_spoke` turns on for
+# a decodable protocol line only, so chatter here would not set it -- but a
+# stand-in that talks while pretending to be a dialog nobody answered is
+# staging the wrong thing.
+if [ -n "$FAKE_PKEXEC_HANG" ]; then
+  exec sleep 3600
+fi
 exec "$@"

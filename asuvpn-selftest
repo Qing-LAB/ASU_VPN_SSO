@@ -591,6 +591,7 @@ def machine_stub(tray):
             self.tunnel_address = self.tunnel_dns = ""
             self.tunnel_ever_connected = False
             self.tunnel_up_since = None
+            self.connecting_since = None
             self.last_failure = None
             self.dropped = False
             self.rebuilds = 0
@@ -984,6 +985,38 @@ def check_signin_deadline(tray, r):
     r.check("signin-timeout has no off, and no nonsense either",
             refused == ["0", "-1", "5", "99999"] and setting.default == 300,
             f"refused={refused} default={setting.default}")
+
+    # The other end of the same setting, which nothing bounded at all until
+    # now: pkexec's dialog. A polkit agent does not time out, so an
+    # unattended rebuild raised a password prompt at three in the morning and
+    # sat behind it in CONNECTING -- a state the watchdog does not run in --
+    # until somebody came back. Driven through the shipping table, like every
+    # other row; the sandbox drives the tick that sends this.
+    Stub = machine_stub(tray)
+    stub = Stub()
+    stub.state = tray.CONNECTING
+    stub.dropped = True          # this was a rebuild: one attempt is spent
+    stub.rebuilds = 1
+    generation = stub.helper_generation
+    stub.dispatch(tray.MSG_AUTHORIZE_TIMEOUT)
+    r.check("an unanswered authorization ends, and keeps the rebuild's promise",
+            stub.state == tray.FAILED and stub.dropped and stub.rebuilds == 1
+            and stub.helper_generation == generation + 1
+            and stub.detail.endswith("; rebuilding"),
+            f"state={stub.state!r} dropped={stub.dropped}"
+            f" rebuilds={stub.rebuilds} detail={stub.detail!r}"
+            f" generation={stub.helper_generation} (was {generation}) —"
+            " handing the budget back here, as Cancel does, would make this a"
+            " loop: prompt, wait, refund, prompt; and without the bump the"
+            " kill's own exit paints a bare SIGTERM over the explanation")
+    # A tunnel that is up is not in CONNECTING, so the table must drop this
+    # rather than tear one down on a timer.
+    live = Stub()
+    live.state = tray.CONNECTED
+    live.dispatch(tray.MSG_AUTHORIZE_TIMEOUT)
+    r.check("an authorization deadline cannot reach a tunnel that is up",
+            live.state == tray.CONNECTED and live.published == [],
+            f"state={live.state!r} published={live.published}")
 
 
 def check_rebuild_rules(tray, r):

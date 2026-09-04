@@ -317,6 +317,7 @@ things*). `any` is the `ANY` wildcard — the row applies in every state.
 | `authenticating` | `auth-ok` | `_tr_start_tunnel` | Spawn the helper under pkexec and feed it the cookie on stdin. |
 | `authenticating` | `auth-failed` | `_tr_signin_failed` | Keep the sentence; the badge says why. |
 | `connecting` | `tunnel-up` | `_tr_tunnel_came_up` | Adopt device, address and resolver; announce **connected**. |
+| `connecting` | `authorize-timeout` | `_tr_authorize_timed_out` | The polkit prompt went unanswered for `signin-timeout`: dismiss it and fail, keeping any rebuild's promise. |
 | `recovering` | `tunnel-up` | `_tr_tunnel_came_up` | Adopt and announce **reconnected** — no sign-in was needed. |
 | `connected` | `tunnel-up` | `_tr_refresh_address` | Only refresh the address if the tunnel was re-addressed. |
 | `demoted` | `tunnel-up` | `_tr_adopt_only` | Adopt, but do **not** promote: openconnect asserting connected is what it asserted before the watchdog disagreed. |
@@ -837,7 +838,7 @@ interchangeable:
 | --- | --- | --- |
 | `SIGUSR2` to `openconnect` via the control pipe | none — same session | once per incident; `nudge-min-gap`, default 120s, between incidents |
 | stay demoted, say the free option is spent | none | once per incident |
-| full sign-in (`reconnect`) | Duo approval **and** polkit password | `autoreconnect-min-gap`, default 300s; `MAX_REBUILDS`, three; on by default, and one untick from off |
+| full sign-in (`reconnect`) | Duo approval **and** polkit password | `autoreconnect-min-gap`, default 300s; `MAX_REBUILDS`, three; `signin-timeout` on each half of it; on by default, and one untick from off |
 
 ```mermaid
 stateDiagram-v2
@@ -1129,6 +1130,7 @@ where it can be, checked by `asuvpn selftest`.
 | A stalled tunnel is noticed rather than shown as connected | `--force-dpd`, plus a watchdog for what DPD cannot see | logic tier, and a sandbox scenario where the device never appears |
 | A tunnel that dies unattended is rebuilt, and a retry never becomes a loop | armed only by an exit that followed real traffic, capped at `MAX_REBUILDS`, sharing the ladder's rate limit | logic tier drives all three bounds on the shipping table, both directions of the setting included |
 | A sign-in always ends | `signin-timeout` kills the process group; the blocking read ends on the closed pipe | logic tier; the setting has no off, so the guarantee has no hole |
+| No unattended wait is unbounded | `signin-timeout` bounds the browser sign-in *and* the polkit prompt after it — a polkit agent does not time out, so `connecting` was the one state a rebuild could wedge in, and the watchdog does not run there | `authprompt.sh` stages a prompt nobody answers and asserts the applet leaves `connecting`, dismisses the dialog and says why; the logic tier drives the row |
 | Recovery never costs a Duo push while a free option remains | `SIGUSR2` first — waited for if rate-limited, never skipped — the sign-in rung is unreachable until the nudge is spent | `escalate.sh` **asserts** exactly one nudge and one sign-in over 115s; the held-nudge rule in the logic tier |
 | openconnect cannot drive the control channel | it is spawned with its own `stdin` pipe | `fdcheck.sh` asserts `/proc/<pid>/fd/0` of the two are distinct (the child's open mode is printed for the reader) |
 | A refusal is reported as a sentence, not a number | `[helper] FATAL ` marker, set by the helper | wiring tier, by running three refused connects |
