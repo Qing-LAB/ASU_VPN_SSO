@@ -59,6 +59,23 @@ confirm() {
   case "$reply" in [yY]*) return 0 ;; *) return 1 ;; esac
 }
 
+# README says "Uses sudo", and a reader can take that as "run it with sudo".
+# That installs everything into /root: the programs, the launcher, the CLI
+# symlink, a root-owned pipx venv, and an edited /root/.bashrc -- then prints
+# "Launch ASU VPN from the Activities overview" to a user whose own session
+# has none of it. The script asks for sudo where it needs it, per command.
+if [ "$(id -u)" -eq 0 ] && [ -n "${SUDO_USER:-}" ]; then
+  printf '\033[1;31merror\033[0m %s\n' \
+    "run this as yourself, not with sudo." >&2
+  printf '  %s\n' \
+    "It installs into your own home directory and asks for sudo only for" \
+    "the system packages. Under sudo, \$HOME is /root and everything would" \
+    "land there instead:" \
+    "" \
+    "    ./bootstrap.sh${*:+ $*}" >&2
+  exit 1
+fi
+
 while [ $# -gt 0 ]; do
   case "$1" in
     --server) SERVER="${2:?--server needs a value}"; shift 2 ;;
@@ -321,6 +338,23 @@ install_openconnect_sso() {
   # with `pip install --user` lands in the same ~/.local/bin and satisfies the
   # check above, and `pipx inject` then exits 1 and killed the whole bootstrap
   # under set -e, before the app was ever installed.
+
+  maintain_openconnect_sso "$sso"
+}
+
+
+maintain_openconnect_sso() {
+  # The half the header promises runs every time: the setuptools pin, and the
+  # PATH check. Split out because it used to live inside the install-if-absent
+  # function, so the "everything is already present" fast path skipped both --
+  # and the pin is the documented repair for a venv that a later
+  # `pipx upgrade-all` rebuilt with a current setuptools, which is precisely
+  # the machine that reaches that fast path.
+  local sso="${1:-}"
+  command -v pipx >/dev/null || return 0
+  [ -n "$sso" ] || sso="$(command -v openconnect-sso || true)"
+  [ -n "$sso" ] || { [ -x "$HOME/.local/bin/openconnect-sso" ] && sso="$HOME/.local/bin/openconnect-sso"; }
+  [ -n "$sso" ] || return 0
   if pipx list --short 2>/dev/null | grep -q "^openconnect-sso "; then
     say "pinning $SETUPTOOLS_PIN inside its venv"
     pipx inject openconnect-sso "$SETUPTOOLS_PIN" --force >/dev/null
@@ -418,6 +452,13 @@ if [ "$INSTALL_DEPS" -eq 1 ]; then
     # dconf setting and asks for no password, so skipping it would quietly cost
     # a user with the extension installed-but-off their tray icon.
     enable_extension
+    # The header promises the setuptools pin and the PATH check run every
+    # time, and they live inside install_openconnect_sso -- which this path
+    # skips. So a venv rebuilt by `pipx upgrade-all`, or a first run that died
+    # between the install and the inject, was met with "nothing to install"
+    # and repaired nothing, while the pin is the documented fix for exactly
+    # that state.
+    maintain_openconnect_sso
     INSTALL_DEPS=0
   elif [ "$MANAGER" != "apt" ]; then
     # Report, then carry on rather than dying. Everything below this point is
@@ -460,6 +501,22 @@ if [ "$INSTALL_DEPS" -eq 1 ]; then
   enable_extension
 fi
 
+# Everything above this line can abort under set -e -- a compile failure in
+# lxml, a transient archive error, a `confirm` that cannot prompt because
+# there is no tty. All of it happens *after* apt has already changed the
+# system, and none of it is needed by the half below, which touches only
+# ~/.local. Dying silently there left a machine with two dozen new packages
+# and no application, and nothing said what to do next.
+explain_if_it_died() {
+  [ "$1" -eq 0 ] && return 0
+  warn "the dependency phase failed (exit $1)."
+  warn "The app itself was not installed. Nothing above is needed to install"
+  warn "it -- only to connect -- so this puts the app in place:"
+  warn "    ./bootstrap.sh --no-deps --server $SERVER"
+  warn "and 'asuvpn selftest' then says what is still missing."
+}
+trap 'explain_if_it_died $?' EXIT
+
 verify_bindings
 
 say "installing the app, the launcher and the asuvpn command"
@@ -481,6 +538,8 @@ $(say "the app is installed; the system packages above are not")
 EOF
   exit 0
 fi
+
+trap - EXIT
 
 cat <<EOF
 

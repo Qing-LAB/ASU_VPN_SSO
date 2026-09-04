@@ -139,7 +139,13 @@ jobs:
           # carries on -- and its `if` is the last statement, so asuvpn-install
           # exits 0 whatever the self-check said. Here, where the runner has
           # every dependency, a red self-check is a broken wheel.
-          HOME=/tmp/wheel-home /tmp/wheel-home/.local/share/asuvpn/asuvpn-selftest
+          # The venv's bin on PATH, so the upgrade-skew check is actually
+          # exercised: without it, find_program cannot see asuvpn-install and
+          # the check reports "not installed from PyPI; nothing to fall
+          # behind" -- a green tick for the one assertion this step exists to
+          # make.
+          PATH=/tmp/wheel-venv/bin:$PATH HOME=/tmp/wheel-home \
+            /tmp/wheel-home/.local/share/asuvpn/asuvpn-selftest
           # The installers state the default endpoint in shell, because bash
           # cannot load the schema, and a comment promises they stay in sync.
           # That promise used to be checked by grepping install.sh for its own
@@ -171,19 +177,32 @@ jobs:
           # Driven with the variables actually set, and set to a *relative*
           # value as well, because "a relative value is ignored" is the half
           # of the rule most easily got wrong on one side only.
+          # All three variables, not one. XDG_DATA_HOME is the one that was
+          # missing from install.sh, with the launcher and the icon landing
+          # outside the session's search path while the installer printed
+          # success -- and it was still the one this loop did not drive, so
+          # reverting that fix kept CI green.
           for value in /tmp/xdg-abs relative/not-absolute; do
             rm -rf /tmp/xdg-home /tmp/xdg-abs
-            HOME=/tmp/xdg-home XDG_CONFIG_HOME="$value" \
+            env HOME=/tmp/xdg-home XDG_CONFIG_HOME="$value" \
+                XDG_DATA_HOME="$value" XDG_CACHE_HOME="$value" \
               /tmp/wheel-venv/bin/asuvpn-install > /dev/null
-            reads=$(HOME=/tmp/xdg-home XDG_CONFIG_HOME="$value" python3 -c \
-              'import importlib.util as u; s=u.spec_from_file_location("c","asuvpn_contract.py"); m=u.module_from_spec(s); s.loader.exec_module(m); print(m.config_path())')
-            if [ ! -f "$reads" ]; then
-              echo "with XDG_CONFIG_HOME=$value the installer did not write" >&2
-              echo "the file the applet reads ($reads); it wrote:" >&2
-              find /tmp/xdg-home /tmp/xdg-abs -name 'asuvpn.conf' >&2 || true
-              exit 1
-            fi
-            echo "XDG_CONFIG_HOME=$value -> both sides agree on $reads"
+            reads=$(env HOME=/tmp/xdg-home XDG_CONFIG_HOME="$value" \
+                XDG_DATA_HOME="$value" XDG_CACHE_HOME="$value" python3 -c \
+              'import importlib.util as u; s=u.spec_from_file_location("c","asuvpn_contract.py"); m=u.module_from_spec(s); s.loader.exec_module(m); print(m.config_path()); print(m.xdg_dir("XDG_DATA_HOME", ".local/share")); print(m.xdg_dir("XDG_CACHE_HOME", ".cache"))')
+            conf=$(echo "$reads" | sed -n 1p)
+            data=$(echo "$reads" | sed -n 2p)
+            for want in "$conf" "$data/applications/asuvpn.desktop" \
+                        "$data/asuvpn/asuvpn-tray"; do
+              if [ ! -e "$want" ]; then
+                echo "with the XDG variables = $value the installer did not" >&2
+                echo "put $want where the applet looks for it; it wrote:" >&2
+                find /tmp/xdg-home /tmp/xdg-abs \
+                  \( -name 'asuvpn.conf' -o -name '*.desktop' \) >&2 || true
+                exit 1
+              fi
+            done
+            echo "XDG_*_HOME=$value -> config, launcher and programs all agree"
           done
 
   # Proves the portable half is portable, and claims nothing more. The logic

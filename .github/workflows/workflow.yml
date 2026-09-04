@@ -16,7 +16,34 @@ on:
     tags: ["v*"]
 
 jobs:
+  # Nothing gated this. checks.yml runs on `push: branches: [main]` and on
+  # pull requests, and a tag push matches neither -- so the normal release
+  # gesture (`git tag v0.12.0 && git push --follow-tags`) fired both workflows
+  # at once and this one, which does not install an apt stack or compile lxml,
+  # finished first. The upload landed before checks reported, and would have
+  # landed identically if they failed. Tagging a commit that never reached
+  # main skipped them altogether.
+  #
+  # Deliberately not the whole of checks.yml: this is the subset that needs no
+  # apt packages, so it costs about a minute and cannot itself become the
+  # reason a release stalls. The full suite still runs on main.
+  verify:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: the logic tier, which needs nothing but python
+        run: python3 -I asuvpn-selftest --tier logic
+      - name: the wheel builds and the payload installs from it
+        run: |
+          pipx run build
+          python3 -m venv /tmp/release-venv
+          /tmp/release-venv/bin/pip -q install dist/*.whl
+          HOME=/tmp/release-home /tmp/release-venv/bin/asuvpn-install
+          HOME=/tmp/release-home \
+            /tmp/release-home/.local/share/asuvpn/asuvpn-selftest --tier logic
+
   pypi:
+    needs: verify
     # Pinned, like checks.yml and scenarios.yml. `ubuntu-latest` is a label
     # that moves: GitHub repoints it at the next LTS on its own schedule, and
     # this is the one job whose run cannot be repeated — a version number is

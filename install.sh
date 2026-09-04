@@ -10,6 +10,17 @@
 #            take effect immediately. The checkout then has to stay put.
 set -euo pipefail
 
+# Everything below installs into $HOME. Under sudo that is /root, so the whole
+# applet would land where the user cannot see it while the script reported
+# success -- and `asuvpn-install` is a console script a reader may well reach
+# for with sudo out of habit.
+if [ "$(id -u)" -eq 0 ] && [ -n "${SUDO_USER:-}" ]; then
+  echo "error: run this as yourself, not with sudo." >&2
+  echo "  It installs into your own home directory and needs no privileges;" >&2
+  echo "  under sudo everything would land in /root instead." >&2
+  exit 1
+fi
+
 SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # XDG_DATA_HOME, on the same terms as XDG_CONFIG_HOME and XDG_CACHE_HOME
 # below: absolute or ignored, which is what the spec says. It was the one of
@@ -145,11 +156,24 @@ if [ -s "$CONFIG_FILE" ] && grep -q '=' "$CONFIG_FILE"; then
     "$CONFIG_FILE" > "$CONFIG_FILE.$$.tmp" )
   mv "$CONFIG_FILE.$$.tmp" "$CONFIG_FILE"
 else
-  ( umask 077; "$INSTALL_DIR/asuvpn-tray" --write-config "$SERVER" \
-      > "$CONFIG_FILE.$$.tmp" )
-  mv "$CONFIG_FILE.$$.tmp" "$CONFIG_FILE"
+  # Not fatal. This executes the applet, which is the first time anything in
+  # the install runs Python -- so a system without /usr/bin/python3 (Nix,
+  # Guix), or one older than 3.10, aborted the script *here*: under set -e the
+  # launcher, the desktop entry and the self-check were all still to come, so
+  # the user was left with a symlink to a program that cannot run, no entry in
+  # the overview, no config, and no report saying why. The applet regenerates
+  # a missing config on first use, and the self-check below is what explains
+  # the real problem, so the install carries on to reach it.
+  if ( umask 077; "$INSTALL_DIR/asuvpn-tray" --write-config "$SERVER" \
+        > "$CONFIG_FILE.$$.tmp" ); then
+    mv "$CONFIG_FILE.$$.tmp" "$CONFIG_FILE"
+  else
+    rm -f "$CONFIG_FILE.$$.tmp"
+    echo "  ! could not generate the settings file; the applet will write" >&2
+    echo "    defaults on first use. The self-check below says why." >&2
+  fi
 fi
-chmod 0600 "$CONFIG_FILE"
+[ -f "$CONFIG_FILE" ] && chmod 0600 "$CONFIG_FILE"
 
 # Superseded by the file above; left behind they would be two sources of truth.
 rm -f "$CONFIG_DIR/server" "$CONFIG_DIR/autoreconnect"
