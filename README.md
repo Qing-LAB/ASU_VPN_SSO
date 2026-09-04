@@ -551,10 +551,18 @@ is one person.
   and fails closed rather than let a blank answer become the saved password.
 - **Never writes to the keyring.**
 - **Never logs the session cookie**, and never puts it on a command line where
-  `ps` could show it. It is written to the helper's stdin and nowhere else.
-  Note this is a property of the default arguments: `asuvpn connect --
-  --dump-http-traffic` would make *openconnect* print the cookie header, and
-  that lands in the log like any other output.
+  `ps` could show it. It travels on a pipe from the sign-in, through the
+  applet's memory, into the helper's stdin, and nowhere else — never a file,
+  never a terminal, never `argv`.
+
+  That much is structural, and it only covers the paths this project wrote. The
+  log also carries `openconnect`'s own output verbatim, so as a second line of
+  defence **every log line is redacted before it is written**: anything shaped
+  like a session token — `COOKIE`, `webvpn`, `acSamlv2Token`, `sso-token`,
+  `sessionid` — has its value replaced with `<redacted>`, while the key and the
+  rest of the line survive so the log stays readable. This is why
+  `asuvpn connect -- --dump-http-traffic`, which makes *openconnect* print the
+  cookie header, no longer leaks it.
 - **Never modifies system files or settings — at run time.** Installing the app
   is confined to `$HOME` and needs no root at all. `bootstrap.sh` is the sole
   exception, and only on the dependency pass: it runs `apt` under `sudo`, asks
@@ -1232,6 +1240,12 @@ python3-gi  gir1.2-gtk-3.0  gir1.2-ayatanaappindicator3-0.1  gir1.2-notify-0.7
 It deliberately uses `/usr/bin/python3` in its shebang rather than whatever is
 first on `PATH`, because a conda or pyenv install will shadow it and will not
 have `gi`.
+
+**Python 3.10 or newer** for the applet itself — the floor Ubuntu 22.04 sets,
+and CI runs the portable half on 3.10, 3.11 and 3.12+ on every push so the
+claim is tested rather than asserted. Note this is a *different* requirement
+from the Python 3.12 `openconnect-sso` needs below: that one lives in its own
+pipx venv and the applet never runs on it.
 
 Also needed: `openconnect`, `pkexec`, and the GNOME AppIndicator extension
 (`gnome-shell-ubuntu-extensions`) — without the extension GNOME has nowhere to

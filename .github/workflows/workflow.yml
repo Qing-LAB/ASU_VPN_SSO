@@ -1,4 +1,4 @@
-# Publishing: push a tag like v0.10.0 and this builds the sdist and wheel and
+# Publishing: push a tag like v0.11.0 and this builds the sdist and wheel and
 # uploads them to PyPI. No token is stored anywhere — it uses PyPI's Trusted
 # Publishing, configured once on pypi.org against project "asuvpn", owner
 # Qing-LAB, repository ASU_VPN_SSO, workflow **workflow.yml**, environment
