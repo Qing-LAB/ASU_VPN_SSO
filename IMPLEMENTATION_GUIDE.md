@@ -88,6 +88,12 @@ not, and each cost a round of rework.
   asserts the applet signs in again unasked, stops after `MAX_REBUILDS`, and
   says so once. The three bounds — armed only after real traffic, the shared
   rate limit, the count — are each mutation-verified in the logic tier.
+- **The authorization deadline** (2026-09-04). `authprompt.sh` stages a
+  `pkexec` that never answers, which is what a polkit dialog on a locked
+  screen is. The applet must leave `Connecting…`, dismiss the dialog rather
+  than orphan it, and name the reason. Nothing had bounded that phase at all:
+  `signin-timeout` ended the browser half and the prompt after it waited
+  forever, in a state the watchdog does not run in.
 - **The sign-in deadline** (2026-08-28), driven against a child that would
   outlive the whole run. A wait that never returns cannot be observed by
   waiting for it, so `Deadline` takes its kill as an argument and the check
@@ -300,12 +306,21 @@ above rather than restated here.
    only an approval taken slowly proves the floor is comfortable. Raise it if
    anyone hits it legitimately; the ceiling is 3600.
 4. **How often the Duo pushes actually arrive**, now that both automatic
-   sign-ins are on by default and share one `autoreconnect-min-gap`. More than
-   one every five minutes means a bound is wrong, not that the feature is.
+   sign-ins are on by default and share one `autoreconnect-min-gap` *and* one
+   `MAX_REBUILDS`. More than one every five minutes means a bound is wrong,
+   not that the feature is; more than three for one incident means the shared
+   budget is not shared after all.
+5. **A tunnel that flaps rather than dies** — connects, passes as usable, goes
+   bad, repeats. The ladder's cap and its refund are both driven in the logic
+   tier, but the refund's premise is a judgement call about real breaks: that
+   a tunnel which stayed connected longer than the gap before going bad is a
+   recovery that met something new. Only live use says whether that reads the
+   same way on this network.
 
 Two judgement calls, neither urgent: whether `probe-every = 3` is still right
 now that a probe costs ~17 ms, and whether the polkit prompt is worth
-revisiting — leave that one alone unless the user reopens it.
+revisiting — leave that one alone unless the user reopens it. (The prompt now
+has a deadline, which is a different question from whether it should be there.)
 
 ---
 
