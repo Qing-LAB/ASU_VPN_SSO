@@ -401,9 +401,18 @@ def handle_dns(environ, binary=None):
     if binary is None:
         # No systemd-resolved on this machine, so the stock script keeps DNS
         # and will have written /etc/resolv.conf. Recorded for the teardown,
-        # which otherwise had no way to know this run had fallen back.
-        if environ.get("reason", "") in ("connect", "reconnect"):
+        # which otherwise had no way to know this run had fallen back -- and
+        # *un*recorded on the way out, which this branch used to skip. The
+        # marker's whole meaning is "the disconnect never ran", so leaving it
+        # behind after a perfectly clean disconnect made the helper warn that
+        # /etc/resolv.conf might still name the tunnel's resolvers, and raise
+        # a desktop notification saying so, on every single disconnect on
+        # every machine without systemd-resolved.
+        reason = environ.get("reason", "")
+        if reason in ("connect", "reconnect"):
             set_marker(environ, C.DNS_OWNER_SCRIPT)
+        elif reason == "disconnect":
+            set_marker(environ, None)
         return
     device = environ.get("TUNDEV", "")
     if not C.INTERFACE_RE.match(device):
@@ -429,11 +438,18 @@ def handle_dns(environ, binary=None):
         # (vpnc-script: `if [ -n "$INTERNAL_IP4_DNS" ]`), so removing it is how
         # it is told the job is done -- routing untouched, DNS entirely ours.
         environ.pop("INTERNAL_IP4_DNS", None)
-    elif reason in ("connect", "reconnect"):
+    elif reason == "connect":
         # Handed back. Recorded, because "no marker" would otherwise mean both
         # "DNS was cleanly given back" and "the stock script has been holding
         # /etc/resolv.conf all along", and the teardown has to tell those
         # apart to know whether to warn.
+        #
+        # A connect only. A *reconnect* that fails hands nothing over -- that
+        # is the whole point of not reverting there -- so the link still
+        # carries what the connect installed, and saying "script" would be a
+        # lie in the direction that matters: the teardown would then skip the
+        # one repair it can perform, and tell the user to inspect a file
+        # nothing has touched.
         set_marker(environ, C.DNS_OWNER_SCRIPT)
     # attempt-reconnect and pre-init are left alone on purpose. The link is
     # coming back, `reconnect` will configure it again, and tearing the resolver

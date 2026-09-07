@@ -739,6 +739,10 @@ def verify_teardown(ifname, before, was_killed, owned, dns_on_link=None):
     """
     ip = find_ip()
     present = tunnel_interfaces()
+    # Whether this run actually took the resolver off the link, as opposed to
+    # the link having gone on its own or not being ours to touch. Only the
+    # branch that calls drop_link_dns may claim it.
+    reverted = False
 
     if interface_exists(ifname):
         if owned is None or C.interface_index(ifname) != owned:
@@ -747,7 +751,8 @@ def verify_teardown(ifname, before, was_killed, owned, dns_on_link=None):
             log(f"WARNING: {ifname} outlived openconnect but 'ip' is missing;"
                 " it was not removed")
         else:
-            if dns_on_link == C.DNS_OWNER_LINK:
+            reverted = dns_on_link == C.DNS_OWNER_LINK
+            if reverted:
                 # Before the deletion, while there is still a link to name.
                 # Usually redundant -- the resolver goes when the link does --
                 # but not when the device is persistent or the delete below
@@ -780,9 +785,19 @@ def verify_teardown(ifname, before, was_killed, owned, dns_on_link=None):
     # Not gated on was_killed. The marker is only removed by the disconnect
     # transition, so its survival says that transition did not run -- however
     # openconnect died, and including the ways we did not cause.
-    if dns_on_link == C.DNS_OWNER_LINK:
+    if dns_on_link == C.DNS_OWNER_LINK and reverted:
         log("the disconnect never ran, so the tunnel's resolver was still on"
             " its link; it has been taken off")
+    elif dns_on_link == C.DNS_OWNER_LINK:
+        # Reached whenever the deletion branch was not: the device is gone
+        # already (so the resolver went with it), or it is not ours to touch,
+        # or there is no `ip`. Claiming the revert unconditionally was wrong
+        # in the middle case -- a device we could not prove was ours still
+        # carries the tunnel's resolvers, and saying "it has been taken off"
+        # is exactly the reassurance that stops anybody looking.
+        log("WARNING: the disconnect never ran and the tunnel's resolver was"
+            f" on {ifname}; this session could not take it off. If names stop"
+            f" resolving, 'resolvectl revert {ifname}' does it")
     elif dns_on_link == C.DNS_OWNER_SCRIPT:
         # Nothing here can fix this: the backup belongs to the stock script
         # and is only put back by the disconnect that never ran.

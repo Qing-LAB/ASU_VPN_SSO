@@ -262,9 +262,10 @@ TRANSITIONS = {
     (DEMOTED, MSG_CONNECT): "connect_means_reconnect",
     (DISCONNECTED, MSG_RECONNECT): "start_signin",
     (FAILED, MSG_RECONNECT): "start_signin",
-    # "user_reconnect", not "teardown_reconnect": both end in the same place,
+    # "user_reconnect", not the teardown action itself: both end in the same
+    # place,
     # but a human asking is a human taking over, and that refunds the rebuild
-    # budget exactly as Connect does. The ladder calls _tr_teardown_reconnect
+    # budget exactly as Connect does. The ladder calls _act_teardown_reconnect
     # directly and so keeps its count, which is the distinction _clear_drop's
     # docstring describes and the table could not previously express.
     (CONNECTED, MSG_RECONNECT): "user_reconnect",
@@ -275,7 +276,7 @@ TRANSITIONS = {
     # and reported on a reconnect that never happened. openconnect
     # re-establishing is not a reason to refuse a fresh session; it is a
     # reason the user might want one.
-    (RECOVERING, MSG_RECONNECT): "teardown_reconnect",
+    (RECOVERING, MSG_RECONNECT): "user_reconnect",
     (RECOVERING, MSG_CONNECT): "connect_means_reconnect",
     # The same gap in the other two busy states. The menu offers only Cancel
     # there, but the CLI has no menu: the verb was dropped, the IPC still
@@ -905,6 +906,11 @@ class StateMachine:
     helper_generation = 0
     auth_generation = 0
     helper_spoke = False
+    # Set when this applet has already published the reason a helper is about
+    # to die, so that helper's exit must not publish a second one. A flag and
+    # not a generation bump: the generation retires *every* later message from
+    # that helper, including the exit a subsequent teardown is waiting for.
+    exit_explained = False
     helper_proc: subprocess.Popen | None
     teardown_intent: str | None
     reconnect_keep_log: bool
@@ -1015,11 +1021,11 @@ class StateMachine:
             # has.
             self.log("[tray] connect asked for while a tunnel is still up;"
                      " closing it first")
-            self._tr_teardown_reconnect({"keep_log": False})
+            self._act_teardown_reconnect({"keep_log": False})
             return
         # Always a fresh log: this row serves the user verbs, and the
         # keep-the-log flavor travels only through the reconnect teardown
-        # (_tr_teardown_reconnect), never through a connect from cold.
+        # (_act_teardown_reconnect), never through a connect from cold.
         self._act_start_signin(keep_log=False)
 
     def _tr_connect_means_reconnect(self, _data):
@@ -1031,7 +1037,7 @@ class StateMachine:
         self._clear_drop()
         self.log("[tray] connect asked for while the tunnel is demoted;"
                  " reconnecting instead")
-        self._tr_teardown_reconnect({"keep_log": False})
+        self._act_teardown_reconnect({"keep_log": False})
 
     def _tr_already_disconnected(self, _data):
         self._clear_drop()
@@ -1057,9 +1063,9 @@ class StateMachine:
         next tunnel and the other left it exhausted.
         """
         self._clear_drop()
-        self._tr_teardown_reconnect(data)
+        self._act_teardown_reconnect(data)
 
-    def _tr_teardown_reconnect(self, data):
+    def _act_teardown_reconnect(self, data):
         keep = data.get("keep_log", False)
         if self.helper_proc is None or self.helper_proc.poll() is not None:
             # Nothing to tear down. The bump retires the dead helper's
@@ -1124,8 +1130,18 @@ class StateMachine:
         with a live helper is a state the machine now understands -- Disconnect
         retries the teardown there, and Connect closes the tunnel before
         signing in -- so keeping it is what makes those verbs reach this
-        tunnel. The generation bump retires the exit the kill produces, so a
-        bare "terminated by SIGTERM" cannot paint over the explanation.
+        tunnel. The exit the kill produces still has to be kept quiet, or a
+        bare "terminated by SIGTERM" paints over the explanation -- and that
+        was done by bumping the generation, which was the wrong tool. Bumping
+        it while *keeping* the handle wedged the applet: the bump retires
+        every later message from this helper, and `_disconnect_thread` posts
+        nothing on success, relying entirely on that exit. So a user who took
+        the Disconnect this state deliberately offers reached DISCONNECTING,
+        the helper closed cleanly, its exit was dropped as stale, and nothing
+        could leave that state again -- only Quit worked. `exit_explained`
+        says the narrower thing that was meant: this one exit needs no
+        announcement, and anything that asks for a teardown meanwhile is
+        served first and clears it on the way past.
 
         What is deliberately *not* touched is `dropped`. A rebuild that timed
         out here has spent one attempt and is still owed the rest, so the tick
@@ -1134,7 +1150,7 @@ class StateMachine:
         prompt.
         """
         limit = SETTINGS["signin-timeout"]
-        self.helper_generation += 1
+        self.exit_explained = True
         proc = self.helper_proc
         if proc is not None:
             self._close_helper_stdin(proc)
@@ -1339,6 +1355,10 @@ class StateMachine:
             self.log(f"[tray] a previous tunnel closed (status {status})")
             return
         self.helper_proc = None
+        # One-shot, and read before anything else can set it: this exit was
+        # already accounted for by whoever closed the helper.
+        explained = self.exit_explained
+        self.exit_explained = False
         # Read before the reset wipes it: a DEMOTED tunnel is no longer
         # CONNECTED but certainly was one, and "connection dropped" explains
         # its death far better than a bare exit status does.
@@ -1379,6 +1399,13 @@ class StateMachine:
             self._set_state(DISCONNECTED)
             self.log("[tray] disconnected")
             self.notify("VPN disconnected", self.server)
+            return
+        if explained:
+            # The reason is already on the badge and in the log, and nobody
+            # has asked for a teardown since. Note the closure and leave the
+            # state -- and `dropped` -- exactly as they were.
+            self.log(f"[tray] the helper closed (status {status});"
+                     " the reason is above")
             return
         if status is None:
             status = -1  # the reader thread died before it could reap
@@ -1691,7 +1718,7 @@ class StateMachine:
         # dialog and the user should know what asked for them.
         self.notify("VPN signing in again",
                     "the tunnel could not be recovered without it")
-        self._tr_teardown_reconnect({"keep_log": True})
+        self._act_teardown_reconnect({"keep_log": True})
 
     def _announce_connected(self, address):
         """The single place a tunnel becomes usable, whichever source said so.
@@ -1791,7 +1818,7 @@ class StateMachine:
 
         Called from the handlers a user verb is the *only* way to reach, so
         that acting on the applet always hands the decision back. The one
-        user verb missing from that list is Reconnect: `_tr_teardown_reconnect`
+        user verb missing from that list is Reconnect: `_act_teardown_reconnect`
         is shared with the escalation ladder, and clearing the count from
         there would let a demotion sign-in refund its own budget every time
         round -- which is exactly the loop the cap in `_act_ladder` exists to
@@ -1904,6 +1931,7 @@ class VpnTray(StateMachine):
         # cannot start a tunnel on top of a newer one.
         self.auth_generation = 0
         self.helper_spoke = False
+        self.exit_explained = False
         self.state_events = False
         self.last_failure = None
         # What the watchdog watches: the device from the helper's DEVICE line
@@ -2324,8 +2352,14 @@ class VpnTray(StateMachine):
         # window open and, being start_new_session, outlives the applet --
         # and _kill_auth can only ever reach the newest handle, so an older
         # one became unreachable the moment this overwrote it.
-        self._kill_auth()
+        # The bump first, then the kill -- the order the other two call sites
+        # use, and the correct one: the worker consults the generation, not
+        # the handle. Killing first meant a sign-in that had spawned but not
+        # yet published its handle saw its own generation still current,
+        # published anyway, and was then overwritten by the next one --
+        # unreachable, with its browser window, until its own deadline.
         self.auth_generation += 1
+        self._kill_auth()
         self._set_state(AUTHENTICATING, "waiting for ASU sign-in")
         self.log(f"[tray] authenticating to {self.server} via {sso}")
         threading.Thread(
@@ -2575,6 +2609,7 @@ class VpnTray(StateMachine):
         generation = self.helper_generation
         exited = threading.Event()
         self.helper_spoke = False
+        self.exit_explained = False
         self.state_events = False
         self.last_failure = None
         self._reset_tunnel_state()

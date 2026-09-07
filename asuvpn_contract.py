@@ -327,8 +327,17 @@ SYS_CLASS_NET = "/sys/class/net"
 #
 # The scheme is optional because the helper accepts a bare hostname too, and
 # host_domain() already copes with both.
+#
+# The bracketed alternative is for an IPv6 literal, which the first version of
+# this refused outright -- a rule added to close a hole must not close a door
+# that was open, and --host had no rule at all before it. Brackets are
+# required, as they are in a URL: a bare "2001:db8::1" is ambiguous with
+# host:port, and openconnect wants the bracketed form anyway. The character
+# class is deliberately loose; this is a "could not be an option" gate, and
+# what is or is not a valid address is the resolver's question.
 GATEWAY_RE = re.compile(r"^(?:https?://)?"
-                        r"[A-Za-z0-9]([A-Za-z0-9._-]{0,252}[A-Za-z0-9])?"
+                        r"(?:\[[0-9A-Fa-f:.]{2,45}\]"      # an IPv6 literal
+                        r"|[A-Za-z0-9]([A-Za-z0-9._-]{0,252}[A-Za-z0-9])?)"
                         r"(?::[0-9]{1,5})?"
                         r"(?:[/?][A-Za-z0-9._~!$&'()*+,;=:@%/?-]*)?\Z")
 

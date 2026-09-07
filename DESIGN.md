@@ -303,7 +303,7 @@ things*). `any` is the `ANY` wildcard — the row applies in every state.
 | `failed` | `reconnect` | `_tr_start_signin` | Same, keeping the log that explains the failure. |
 | `connected` | `reconnect` | `_tr_user_reconnect` | Tear the tunnel down, then sign in again — a Duo push and a password. A person asking hands the rebuild budget back, exactly as Connect does; the ladder calls the teardown row directly and keeps its count. |
 | `demoted` | `reconnect` | `_tr_user_reconnect` | The expensive rung of the ladder when a person asks for it. |
-| `recovering` | `reconnect` | `_tr_teardown_reconnect` | openconnect re-establishing is a reason the user might want a fresh session, not a reason to refuse one. The CLI has no menu to hide the verb, and dropping it left `--wait` polling a busy state. |
+| `recovering` | `reconnect` | `_tr_user_reconnect` | openconnect re-establishing is a reason the user might want a fresh session, not a reason to refuse one. The CLI has no menu to hide the verb, and dropping it left `--wait` polling a busy state. |
 | `recovering` | `connect` | `_tr_connect_means_reconnect` | Same reading as on a demoted tunnel: there is a session to replace. |
 | `authenticating` | `reconnect` | `_tr_user_reconnect` | Start over. The menu offers only Cancel here, but the CLI has no menu, and a dropped verb was answered `ok` while `--wait` polled a busy state to its timeout. |
 | `authenticating` | `connect` | `_tr_start_signin` | Same, spelled the other way. |
@@ -923,7 +923,7 @@ things — which is the part that took two attempts to get right:
 | Event | Flag (`dropped`) | Count (`rebuilds`) | Why |
 | --- | --- | --- | --- |
 | Connect, Disconnect, Cancel | cleared | cleared | a human took over; nothing may keep retrying behind them |
-| Reconnect | — | — | `_tr_teardown_reconnect` is shared with the ladder, and clearing from there would let a demotion sign-in refund the drop budget every time round. Nothing is lost: the last row refunds it anyway |
+| Reconnect | — | — | `_act_teardown_reconnect` is shared with the ladder, and clearing from there would let a demotion sign-in refund the drop budget every time round. Nothing is lost: the last row refunds it anyway |
 | the setting turned off | cleared | — | disarmed, not paused. Left armed, ticking the box again hours later opened a browser window for a tunnel that died before lunch |
 | `MAX_REBUILDS` reached | cleared | — | said once, and the badge stops promising a rebuild that is not coming |
 | reaching `connected` | cleared | **kept** | there is a tunnel, so nothing is owed — but every rebuild reaches this line, including the ones whose tunnel falls over seconds later |

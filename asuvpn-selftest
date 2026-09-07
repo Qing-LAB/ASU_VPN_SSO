@@ -1541,14 +1541,53 @@ def check_signin_deadline(tray, r):
             " report success over a live tunnel")
     r.check("an unanswered authorization ends, and keeps the rebuild's promise",
             stub.state == tray.FAILED and stub.dropped and stub.rebuilds == 1
-            and stub.helper_generation == generation + 1
+            and stub.helper_generation == generation
+            and stub.exit_explained
             and stub.detail.endswith("; rebuilding"),
             f"state={stub.state!r} dropped={stub.dropped}"
             f" rebuilds={stub.rebuilds} detail={stub.detail!r}"
-            f" generation={stub.helper_generation} (was {generation}) —"
-            " handing the budget back here, as Cancel does, would make this a"
-            " loop: prompt, wait, refund, prompt; and without the bump the"
-            " kill's own exit paints a bare SIGTERM over the explanation")
+            f" generation={stub.helper_generation} (was {generation})"
+            f" explained={stub.exit_explained} — handing the budget back"
+            " here, as Cancel does, would make this a loop: prompt, wait,"
+            " refund, prompt. The generation must NOT move: retiring it"
+            " retires every later message from this helper, including the"
+            " exit the next teardown waits for")
+
+    # The wedge that combination caused. Both halves were right on their own:
+    # keep the handle so Disconnect can reach the tunnel, and silence the exit
+    # so a bare SIGTERM cannot paint over the explanation. Done with a
+    # generation bump, the second silenced the exit the *first* depends on,
+    # and the applet sat in DISCONNECTING with only Quit working.
+    wedge = Stub()
+    wedge.state = tray.CONNECTING
+    wedge.helper_proc = Terminable()
+    original = wedge.helper_generation
+    wedge.dispatch(tray.MSG_AUTHORIZE_TIMEOUT)
+    wedge.dispatch(tray.MSG_DISCONNECT)          # the verb this state offers
+    wedge.dispatch(tray.MSG_HELPER_EXITED, status=0, generation=original)
+    r.check("a teardown after an unanswered prompt still reaches an end state",
+            wedge.state == tray.DISCONNECTED,
+            f"state={wedge.state!r} — the helper closed cleanly and its exit"
+            " has to be the thing that says so; retired, nothing else does,"
+            " and DISCONNECTING has no way out but Quit")
+
+    # And the exit that needs no announcement, when nobody asked for a
+    # teardown: it must leave the badge and the rebuild budget alone.
+    quiet = Stub()
+    quiet.state = tray.CONNECTING
+    quiet.helper_proc = Terminable()
+    quiet.dropped = True
+    quiet.rebuilds = 1
+    quiet.dispatch(tray.MSG_AUTHORIZE_TIMEOUT)
+    detail = quiet.detail
+    quiet.dispatch(tray.MSG_HELPER_EXITED, status=-15,
+                   generation=quiet.helper_generation)
+    r.check("that helper's own exit does not overwrite the explanation",
+            quiet.state == tray.FAILED and quiet.detail == detail
+            and quiet.dropped and quiet.rebuilds == 1,
+            f"state={quiet.state!r} detail={quiet.detail!r} (was {detail!r})"
+            f" dropped={quiet.dropped} — a bare \"terminated by SIGTERM\""
+            " says nothing about the prompt")
     # A tunnel that is up is not in CONNECTING, so the table must drop this
     # rather than tear one down on a timer.
     live = Stub()
@@ -2524,9 +2563,17 @@ def check_teardown_ownership(helper, r):
         # revert either -- the same rule the deletion already follows, for the
         # same reason: the name may belong to somebody else's tunnel by now.
         deleted.clear()
+        logged.clear()
         helper.verify_teardown("asuvpn0", set(), True, 9,
                                dns_on_link=helper.C.DNS_OWNER_LINK)
         foreign_revert = [c for c in deleted if "revert" in c]
+        # A device that is not ours to delete is not ours to revert either --
+        # and the *report* has to agree with that. Claiming "it has been taken
+        # off" here is the reassurance that stops anyone looking at a link
+        # still carrying the tunnel's resolvers.
+        unproven_claim = any("has been taken off" in line for line in logged)
+        unproven_warned = any(line.startswith("WARNING") and "revert" in line
+                              for line in logged)
         # And when the stock script owned DNS there is nothing to revert and
         # nothing this can fix -- only /etc/resolv.conf, whose backup belongs
         # to the disconnect that never ran. Saying nothing would be the worst
@@ -2603,6 +2650,10 @@ def check_teardown_ownership(helper, r):
             f"link={on_link!r} script={handed_back!r} clean={clean!r}"
             f" no_channel={helper.dns_owner(None)!r} — the two owners need"
             " different words, and only one of them needs a warning")
+    r.check("a resolver we could not remove is not reported as removed",
+            not unproven_claim and unproven_warned,
+            f"claimed={unproven_claim} warned={unproven_warned} — nothing was"
+            " reverted on a device this session could not prove was its own")
     r.check("a killed teardown drops the per-link resolver before the device",
             ordered and not foreign_revert,
             f"ordered={ordered} foreign_revert={foreign_revert} — the resolver"
@@ -3493,7 +3544,11 @@ def check_dns_takeover(notify, C, r):
                      "exit 0\n")
         os.chmod(stub, 0o700)
 
-        def run(env_extra, reason="connect"):
+        def run(env_extra, reason="connect", binary=stub):
+            """Drive one transition. `binary=None` means this machine has no
+            resolvectl at all, which is the documented fallback and a branch
+            of its own -- reached the way the program reaches it, through the
+            lookup, rather than by handing handle_dns a path."""
             for path in (log,):
                 if os.path.exists(path):
                     os.remove(path)
@@ -3504,7 +3559,7 @@ def check_dns_takeover(notify, C, r):
                 C.DNS_DOMAINS_VAR: "example.com",
             }
             env.update(env_extra)
-            notify.handle_dns(env, binary=stub)
+            notify.handle_dns(env, binary=binary)
             try:
                 with open(log, encoding="utf-8") as fh:
                     calls = [line.strip() for line in fh if line.strip()]
@@ -3665,6 +3720,42 @@ def check_dns_takeover(notify, C, r):
                 f"recorded {owner()!r} — the stock script now holds"
                 " /etc/resolv.conf, and only its own disconnect puts it back")
 
+        # A machine with no systemd-resolved at all: the stock script keeps
+        # DNS, and the marker has to be cleared on the way out like any other.
+        # It was not, so every clean disconnect ended in a helper WARNING and
+        # a desktop notification claiming /etc/resolv.conf might still name
+        # the tunnel's resolvers -- on the documented fallback configuration.
+        original_path = notify.C.resolvectl_path
+        try:
+            notify.C.resolvectl_path = lambda: None
+            run(dict(socket_env), binary=None)
+            without_resolved = owner()
+            run(dict(socket_env), reason="disconnect", binary=None)
+            after_disconnect = owner()
+        finally:
+            notify.C.resolvectl_path = original_path
+        r.check("a fallback machine clears the marker on disconnect too",
+                without_resolved == C.DNS_OWNER_SCRIPT
+                and after_disconnect is None,
+                f"connect={without_resolved!r} disconnect={after_disconnect!r}"
+                " — the marker means 'the disconnect never ran', so leaving"
+                " it behind after one that did is a warning about nothing")
+
+        # And a *reconnect* that fails hands nothing over -- that is why it
+        # does not revert -- so the link still carries what the connect
+        # installed and the marker must still say so. Calling it "script"
+        # would make the teardown skip the one repair it can perform and send
+        # the user to a file nothing touched.
+        run(dict(socket_env))
+        open(os.path.join(faildir, "dns"), "w", encoding="utf-8").close()
+        calls, env = run(dict(socket_env), reason="reconnect")
+        still_ours = owner()
+        os.remove(os.path.join(faildir, "dns"))
+        r.check("a reconnect that half fails still says the link is ours",
+                still_ours == C.DNS_OWNER_LINK and "revert asuvpn0" not in calls,
+                f"marker={still_ours!r} calls={calls} — nothing was handed"
+                " back, so nothing may be recorded as handed back")
+
         calls, env = run({}, reason="disconnect")
         r.check("a disconnect reverts the link",
                 calls == ["revert asuvpn0"], f"got {calls}")
@@ -3773,13 +3864,22 @@ def check_every_argument_has_a_rule(helper, r):
             " of them would be read as --background")
     # The contrast case, or a validator that refuses everything would satisfy
     # the line above.
-    ordinary = argparse.Namespace(host="https://vpn.example.edu",
-                                  fingerprint="pin-sha256:AAAA=",
-                                  ac_version=helper.C.AC_VERSION)
+    # Both spellings of a real endpoint, including the one the first version
+    # of this rule refused: --host had no rule at all before it, so an IPv6
+    # literal that used to work would have started failing at exit 28. A gate
+    # added to close a hole must not close a door.
+    refused_real = []
+    for endpoint in ("https://vpn.example.edu", "vpn.example.edu",
+                     "192.0.2.10", "https://[2001:db8::1]",
+                     "https://[2001:db8::1]:443"):
+        ordinary = argparse.Namespace(host=endpoint,
+                                      fingerprint="pin-sha256:AAAA=",
+                                      ac_version=helper.C.AC_VERSION)
+        if helper.unacceptable_argument(ordinary) is not None:
+            refused_real.append(endpoint)
     r.check("the values a real sign-in produces are accepted",
-            helper.unacceptable_argument(ordinary) is None,
-            f"an ordinary connect was refused:"
-            f" {helper.unacceptable_argument(ordinary)}")
+            not refused_real,
+            f"these ordinary endpoints were refused: {refused_real}")
 
 
 def check_fatal_reporting(r):

@@ -438,6 +438,28 @@ enable_extension() {
 
 # ----------------------------------------------------------------------- main
 
+# Armed for the dependency phase below, and disarmed the moment it ends --
+# which is the whole point, and where the first version of this got it wrong.
+# It was installed *after* that phase, so an abort inside it (a compile
+# failure in lxml, a transient archive error, a `confirm` with no tty) still
+# said nothing, while a failure of `install.sh` afterwards was reported as
+# "the dependency phase failed" and the advice sent the user round in a
+# circle: `--no-deps` re-runs the same install.sh and fails identically.
+#
+# All of the dependency phase happens after apt has already changed the
+# system, and none of it is needed by the user half, which touches only
+# ~/.local -- so dying silently there left a machine with two dozen new
+# packages and no application.
+explain_if_it_died() {
+  [ "$1" -eq 0 ] && return 0
+  warn "the dependency phase failed (exit $1)."
+  warn "The app itself was not installed. Nothing above is needed to install"
+  warn "it -- only to connect -- so this puts the app in place:"
+  warn "    ./bootstrap.sh --no-deps --server $SERVER"
+  warn "and 'asuvpn selftest' then says what is still missing."
+}
+trap 'explain_if_it_died $?' EXIT
+
 if [ "$INSTALL_DEPS" -eq 1 ]; then
   MANAGER="$(detect_manager || true)"
 
@@ -501,21 +523,9 @@ if [ "$INSTALL_DEPS" -eq 1 ]; then
   enable_extension
 fi
 
-# Everything above this line can abort under set -e -- a compile failure in
-# lxml, a transient archive error, a `confirm` that cannot prompt because
-# there is no tty. All of it happens *after* apt has already changed the
-# system, and none of it is needed by the half below, which touches only
-# ~/.local. Dying silently there left a machine with two dozen new packages
-# and no application, and nothing said what to do next.
-explain_if_it_died() {
-  [ "$1" -eq 0 ] && return 0
-  warn "the dependency phase failed (exit $1)."
-  warn "The app itself was not installed. Nothing above is needed to install"
-  warn "it -- only to connect -- so this puts the app in place:"
-  warn "    ./bootstrap.sh --no-deps --server $SERVER"
-  warn "and 'asuvpn selftest' then says what is still missing."
-}
-trap 'explain_if_it_died $?' EXIT
+# The dependency phase is over; everything below installs into ~/.local and
+# owns its own failures.
+trap - EXIT
 
 verify_bindings
 
@@ -538,8 +548,6 @@ $(say "the app is installed; the system packages above are not")
 EOF
   exit 0
 fi
-
-trap - EXIT
 
 cat <<EOF
 
