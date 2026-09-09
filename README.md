@@ -140,12 +140,21 @@ Python 3.12 is needed).
 | `--no-deps` | Skip system packages, just install and register the app |
 | `--link` | Run from the checkout instead of copying into `~/.local` |
 
-One-time step if you have never signed in with `openconnect-sso` on this machine
-— it needs to save your password to the login keyring, and the applet will not
-guess a blank one:
+**There is no credential step.** Signing in happens in your browser, on ASU's
+own page with Duo, and nothing is stored in your keyring. This was documented
+here as a required "one-time step" and it is not one — worse, the command
+given for it does nothing at all on a machine that has never been set up,
+because `openconnect-sso` only asks for a password when it already has a
+username to attach it to.
+
+That is the one case where the keyring matters. If you give `openconnect-sso`
+a username so it can fill ASU's login form for you, it then wants the matching
+password stored, and this applet refuses to guess a blank one — `asuvpn
+selftest` reports `no saved password` when that is your situation. To set it
+up, and note the `--user`:
 
 ```bash
-openconnect-sso --server sslvpn.asu.edu --authenticate=shell
+openconnect-sso --server sslvpn.asu.edu --user YOUR_ASURITE --authenticate=shell
 ```
 
 `--authenticate=shell` matters: without it, `openconnect-sso` goes on to run
@@ -1376,7 +1385,7 @@ teardown, and logged precisely so a declined action never reads as a hang.
 
 | Symptom | Cause and fix |
 | --- | --- |
-| `no saved password` | The keyring has no password and the applet will not guess a blank one. Run `openconnect-sso --server sslvpn.asu.edu --authenticate=shell` once in a terminal. |
+| `no saved password` | You have a username configured for form auto-fill but no password stored for it, and the applet will not guess a blank one. Run `openconnect-sso --server sslvpn.asu.edu --authenticate=shell` once in a terminal — with the username already in its config, that prompts and saves. (Without a username configured you will never see this: the browser does the whole sign-in.) |
 | `keyring did not answer` | The login keyring is locked, so the probe timed out rather than risk a blank answer being saved as your password. Unlock the keyring and connect again. |
 | `authorization cancelled` | The polkit dialog was dismissed, or the password was wrong. Run `asuvpn connect` again. |
 | No icon in the panel | `gnome-extensions enable ubuntu-appindicators@ubuntu.com` |

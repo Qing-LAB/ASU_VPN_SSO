@@ -561,10 +561,14 @@ $(say "done")
 
       asuvpn selftest       # check this install against this machine
 
-  One-time step, if you have never signed in with openconnect-sso on this
-  machine: run it once in a terminal so it can save your password to the
-  keyring. The applet refuses to guess a blank password.
+  Nothing else to set up: signing in happens in your browser, on ASU's own
+  login page with Duo, and no password is stored anywhere.
 
-      openconnect-sso --server $SERVER --authenticate=shell
+  The one exception is if you have told openconnect-sso a username, so it can
+  fill that page in for you. It then wants the matching password in your login
+  keyring, and this applet will not guess a blank one. "asuvpn selftest" says
+  so plainly if that applies to you; this is how to store it:
+
+      openconnect-sso --server $SERVER --user YOUR_ASURITE --authenticate=shell
 
 EOF
