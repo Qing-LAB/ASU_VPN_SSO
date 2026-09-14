@@ -1079,6 +1079,36 @@ def tunnel_catch_all(ip, device, family):
     return {"dst": "default", "dev": device}
 
 
+def uplink_routes_now(ip, device, family, snapshotted):
+    """The uplink's routes as they are *now*, plus the pre-tunnel default.
+
+    Two moments are needed and neither is enough alone.
+
+    The stock script does not only add tunnel routes. A gateway that pushes
+    split-*excludes* -- "these destinations must not be tunnelled" -- has them
+    installed on the **uplink**, via its gateway, after this program took its
+    snapshot. Copying only the snapshot therefore misses them: seen live on ASU,
+    where three pre-tunnel routes became fifteen. Harmless there, because every
+    exclude pointed at the same gateway the copied default already pointed at,
+    so replies reached the same next hop either way -- but a single exclude with
+    a different next hop would have been shadowed by that default, and nothing
+    would have said so.
+
+    Reading live alone is worse. In a full tunnel the stock script *replaces*
+    the uplink's default route, so by install time the pre-tunnel value is gone
+    and a table built from the live view would have no catch-all at all.
+
+    So: live routes, and the snapshotted default only when the live view has
+    lost one.
+    """
+    live = [{**route, "dev": device}
+            for route in ip_json(ip, "-f", family, "route", "show", "dev", device)
+            if route.get("dst")]
+    if any(route.get("dst") == "default" for route in live):
+        return live
+    return live + [r for r in snapshotted if r.get("dst") == "default"]
+
+
 def plan_reply_routing(ip, snapshot, device, addresses,
                        families=("inet", "inet6")):
     """What to create: one group per (interface, family), or [] if nothing to do.
@@ -1092,8 +1122,9 @@ def plan_reply_routing(ip, snapshot, device, addresses,
     """
     groups = []
     for uplink, by_family in sorted(snapshot.items()):
-        for family, routes in sorted(by_family.items()):
+        for family, snapshotted in sorted(by_family.items()):
             sources = source_addresses(ip, uplink, family)
+            routes = uplink_routes_now(ip, uplink, family, snapshotted)
             if sources and routes:
                 groups.append({"device": uplink, "family": family,
                                "routes": routes, "sources": sources,

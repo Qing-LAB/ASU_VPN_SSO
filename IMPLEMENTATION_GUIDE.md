@@ -150,7 +150,7 @@ not, and each cost a round of rework.
 ---
 
 
-### Reply routing: proven in a namespace, not yet on the real tunnel
+### Reply routing: proven on the real tunnel, with gaps named
 
 Added 2026-09-14. The failure it fixes was diagnosed on a live machine —
 three inbound connections, all timing out, all because the reply left by the
@@ -173,14 +173,23 @@ far proven only in a network namespace, and the gap is worth naming precisely:
 - the rollback fires: drop the on-link route from the copy and the post-install
   check catches the shadowed table and reverts it.
 
+**Proven live on ASU, 2026-09-14:** the install ran on a real connect and
+placed three rules -- uplink v4, tunnel v4, tunnel v6 -- against a gateway
+pushing 53 IPv4 and 6 IPv6 routes. Both previously-broken reply paths resolve
+correctly, and an inbound RDP session from a phone over the tunnel completed
+end to end. The readiness wait was enough. Outbound traffic was unaffected,
+checked rather than assumed.
+
+The live run is also what found the split-exclude gap: the uplink's own route
+count went from 3 to 15 after the stock script installed the gateway's
+excludes, all of them after the snapshot this used to copy. Fixed by building
+the uplink table from the live view and falling back to the snapshot only for
+a default the full-tunnel case would otherwise have lost.
+
 **Not proven:**
 
-- any of it against a real ASU tunnel, which pushes 53 IPv4 + 6 IPv6 routes
-  where the namespace had one;
-- the readiness wait. `asuvpn-notify` reports the connect event and *then*
-  execs the real script, so the install waits for the tunnel's address to
-  appear on the tunnel's device. Ten seconds, polled. Whether that is enough
-  on a slow gateway is a guess until somebody watches one;
+- the readiness wait's bound. Ten seconds was ample once; whether it is enough
+  on a slower gateway is still a guess;
 - the reconnect path, which compares the tunnel address and rebuilds the rules
   when it has moved;
 - IPv6 end to end. The uplink here has no global IPv6, so only the tunnel side

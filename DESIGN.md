@@ -748,6 +748,25 @@ resolve on-link rather than through the default.
 
 ### Two things that cannot be known in advance
 
+**Which of the uplink's routes are its own.** Not a single moment's answer,
+and the first version assumed it was. The stock script does not only add tunnel
+routes: a gateway pushing split-*excludes* -- "these destinations must not be
+tunnelled" -- has them installed on the **uplink**, through its gateway, after
+this program has taken its snapshot. Copying the snapshot alone misses every one
+of them. Measured on ASU: three pre-tunnel routes on the uplink became fifteen
+once the excludes landed.
+
+It happened to be harmless there, which is the part worth distrusting. Every
+exclude pointed at the same gateway the copied default already pointed at, so
+replies reached the same next hop either way and nothing looked wrong. One
+exclude with a different next hop would have been shadowed by that default,
+silently, with no symptom until somebody noticed a destination answering from
+the wrong place.
+
+So the uplink's table is built from its routes **as they are at install time**,
+with the snapshotted default added back only when the live view has lost one --
+which is the full-tunnel case below, and the reason the snapshot is still taken.
+
 **The uplink's default route, in a full tunnel.** The stock script *replaces* it
 and keeps its own backup. So the helper captures it before it launches
 `openconnect` — not for convenience, but because that is the only moment the

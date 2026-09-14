@@ -365,6 +365,21 @@ def check_reply_routing(helper, C, r):
             "a fixed probe would silently test whatever route happens to cover"
             " it, leaving the default's own behaviour unchecked")
 
+    # Split-exclude routes land on the *uplink* and arrive after the
+    # snapshot, so a table built from the snapshot alone misses them. Seen
+    # live: three pre-tunnel routes became fifteen once ASU's excludes were
+    # installed. Driven with an ip that answers nothing, which is the
+    # full-tunnel shape -- no live routes at all -- where the snapshotted
+    # default is the only catch-all there is.
+    snapped = [{"dst": "default", "dev": "eno1", "gateway": "192.0.2.254"},
+               {"dst": "192.0.2.0/24", "dev": "eno1"}]
+    merged = helper.uplink_routes_now("/nonexistent/ip", "eno1", "inet", snapped)
+    r.check("a lost uplink default is restored from the snapshot",
+            [x["dst"] for x in merged] == ["default"],
+            f"got {merged}. In a full tunnel the stock script replaces the"
+            " uplink's default, so the live view has no catch-all and a table"
+            " built from it would shadow nothing and protect nothing")
+
     # The tunnel's catch-all is read off the device, not assumed. Driven
     # against fabricated output because this machine's tunnel has no gateway
     # and the interesting case is the one where it does.
