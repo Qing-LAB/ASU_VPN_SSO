@@ -1324,6 +1324,82 @@ def reply_routing_install(ip, snapshot, device, marker, state,
         return
     if install_reply_routing(ip, groups, marker):
         state["installed"] = True
+        # The watcher rebuilds against this when an address goes away, so it
+        # has to be the device the rules were actually made for.
+        state["device"] = device
+
+
+# How often to confirm the rules still name addresses this machine has. A DHCP
+# lease is renewed on a timescale of hours and only rarely changes the address,
+# so this is not a hot loop -- it is one `ip -j addr show` per interval, and the
+# point is that the window where reply routing is silently off is bounded by
+# this rather than by the life of the tunnel.
+REPLY_WATCH_INTERVAL = 20
+
+
+def installed_addresses(marker):
+    """The addresses the manifest says rules were made for."""
+    try:
+        with open(marker, encoding="utf-8") as handle:
+            lines = handle.read().splitlines()
+    except OSError:
+        return set()
+    return {parts[3] for parts in (line.split() for line in lines)
+            if len(parts) == 4}
+
+
+def live_addresses(ip):
+    """Every global address this machine currently holds, any device."""
+    live = set()
+    for link in ip_json(ip, "addr", "show"):
+        for info in link.get("addr_info") or []:
+            if info.get("scope") == "global" and info.get("local"):
+                live.add(info["local"])
+    return live
+
+
+def reply_routing_watch(ip, snapshot, marker, state, families, stop):
+    """Rebuild the rules if an address they name stops being ours.
+
+    A rule is written `from <address>`, naming one literal address. When DHCP
+    renews a lease onto a different address -- or the tunnel is re-established
+    with a new one -- that rule matches nothing. It does not fail: it stops
+    applying, silently, and the machine is back to answering inbound
+    connections down the wrong interface with nothing anywhere saying so. That
+    is the same invisible failure reply routing exists to fix, reintroduced by
+    its own fix going stale, which is the kind of thing this project treats as
+    a bug rather than a caveat.
+
+    Cheap by construction: one query per interval, comparing what the manifest
+    records against what the machine holds. A rebuild only happens when an
+    address has actually gone.
+    """
+    while not stop.wait(REPLY_WATCH_INTERVAL):
+        if not state.get("installed"):
+            continue
+        recorded = installed_addresses(marker)
+        if not recorded:
+            continue
+        missing = recorded - live_addresses(ip)
+        if not missing:
+            continue
+        log(f"reply routing: {', '.join(sorted(missing))} is no longer an"
+            " address of this machine, so the rule naming it matches nothing;"
+            " rebuilding")
+        remove_reply_routing(ip, marker)
+        state["installed"] = False
+        device = state.get("device")
+        if not device:
+            continue
+        addresses = [a for family in families
+                     for a in source_addresses(ip, device, family)]
+        if not addresses:
+            log("reply routing: the tunnel has no address to rebuild against;"
+                " leaving routing alone")
+            continue
+        groups = plan_reply_routing(ip, snapshot, device, addresses, families)
+        if groups and install_reply_routing(ip, groups, marker):
+            state["installed"] = True
 
 
 def verify_teardown(ifname, before, was_killed, owned, dns_on_link=None):
@@ -1831,6 +1907,15 @@ def main():
             target=serve_events, args=(events, token, ifname, owned, reply),
             daemon=True
         ).start()
+    if reply is not None:
+        # Stopped by the same event that says the socket close below was
+        # deliberate: there is exactly one moment this session is ending, and
+        # two flags meaning that would be two chances to disagree.
+        threading.Thread(
+            target=reply_routing_watch,
+            args=(reply["ip"], reply["snapshot"], reply["marker"], reply,
+                  reply["families"], closing),
+            daemon=True).start()
     # Kept as a second, independent source: if the script never fires we still
     # learn the device's identity from the kernel -- but only once the kernel
     # can also confirm this openconnect is the process holding it open.
@@ -1868,6 +1953,10 @@ def main():
     # of here including the one where openconnect had to be killed and its
     # script never ran at all.
     if reply is not None and reply.get("installed"):
+        # Before the removal, not after: a watcher waking between the remove
+        # and the flag being cleared would reinstall the rules this is trying
+        # to take off, and leave them behind for good.
+        closing.set()
         taken = remove_reply_routing(reply["ip"], reply["marker"])
         log(f"reply routing: {taken} rule(s) removed")
     verify_teardown(ifname, interfaces_before, tunnel.killed,

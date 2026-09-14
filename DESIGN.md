@@ -779,6 +779,27 @@ rule priorities are allocated from a band, each verified empty before use. An id
 already in use is refused with a line in the log, never reused — this is the one
 place a wrong guess would quietly steal another tool's routing.
 
+### A rule that names an address outlives the address
+
+A rule is written `from <address>`. That is one literal address, and when DHCP
+renews this machine onto another one the rule matches nothing. It does not
+fail; it stops applying. The machine goes back to answering inbound connections
+down the wrong interface, with nothing anywhere saying so — which is the exact
+failure this feature exists to remove, reintroduced by the feature's own fix
+going stale. A caveat in a document would not have been an answer to that.
+
+So the helper re-reads the manifest every `REPLY_WATCH_INTERVAL` seconds and
+compares the addresses it records against the addresses the machine holds. One
+`ip -j addr show` per interval, and a rebuild only when one has actually gone.
+The window where reply routing is silently off is then bounded by that interval
+rather than by the life of the tunnel.
+
+The watch stops on `closing`, the same event that says the socket close at
+teardown is deliberate — two flags meaning "this session is ending" would be
+two chances to disagree. It is set *before* the rules are removed, not after: a
+watcher waking in between would reinstall what teardown is trying to take off,
+and leave it behind for good.
+
 ### Teardown is the hard half
 
 `vpnc-script` is **not** guaranteed to run on the way out. The ladder's last
@@ -820,7 +841,7 @@ is tidiness, not repair.
 
 | Situation | What happens |
 | --- | --- |
-| DHCP moves an address | the rule stops matching; traffic falls through to main |
+| DHCP moves an address | noticed within 20s and the rules rebuilt; until then it falls through to main |
 | an uplink disappears | its table is stale but still describes that uplink |
 | the tunnel dies uncleanly | the kernel drops the routes with the device; the table is empty |
 | no default route at all when the tunnel starts | no uplink is found and no rule is made |

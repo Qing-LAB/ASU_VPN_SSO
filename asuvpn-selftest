@@ -401,6 +401,32 @@ def check_reply_routing(helper, C, r):
             f"verify flags: {verified}. Holding the tunnel group to it would"
             " reject the fix as a regression")
 
+    # A rule names one literal address. When DHCP renews onto a different one
+    # the rule matches nothing -- silently, which is the failure reply routing
+    # exists to fix, reintroduced by its own fix going stale. The watcher
+    # compares what the manifest recorded against what the machine holds, so
+    # the parser that reads it back has to agree with the writer.
+    import tempfile
+    with tempfile.NamedTemporaryFile("w", suffix=".manifest",
+                                     delete=False) as handle:
+        handle.write("inet 7710 7710 192.0.2.10\n"
+                     "inet 7711 7711 198.51.100.9\n"
+                     "inet6 7712 7712 2001:db8::1\n"
+                     "rubbish\n"
+                     "inet 7713\n")
+        manifest = handle.name
+    try:
+        recorded = helper.installed_addresses(manifest)
+        r.check("the manifest is read back as the addresses it recorded",
+                recorded == {"192.0.2.10", "198.51.100.9", "2001:db8::1"},
+                f"got {recorded}. A parser that disagrees with the writer"
+                " makes the watcher rebuild rules that are perfectly fine,"
+                " or miss ones that are stale")
+        r.check("a missing manifest is no addresses, not an error",
+                helper.installed_addresses(manifest + ".absent") == set())
+    finally:
+        os.unlink(manifest)
+
     r.check("the table and rule bands are the same numbers",
             C.REPLY_TABLE_BASE == C.REPLY_RULE_BASE,
             "they are meant to be readable against each other")

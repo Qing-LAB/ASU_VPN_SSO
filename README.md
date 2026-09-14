@@ -1334,6 +1334,21 @@ where a set of real destinations would go before and after installing, and if
 anything moved that should not have, it removes everything it added and leaves
 routing alone.
 
+**If your machine's address changes.** A rule names one literal address — if
+DHCP renews this machine onto a different one, that rule would match nothing
+and you would quietly be back to the broken behaviour. So the applet re-checks
+every 20 seconds that the addresses its rules name are still this machine's,
+and rebuilds them if one has gone. The log says so when it happens:
+
+```
+reply routing: 192.0.2.10 is no longer an address of this machine, so the
+rule naming it matches nothing; rebuilding
+```
+
+Giving this machine a fixed address on your router is still worth doing — a
+port forward pointing at a borrowed address is fragile on its own — but this no
+longer depends on it.
+
 **When it is removed.** When the tunnel goes, every time:
 
 | How the tunnel ends | What happens |
