@@ -149,6 +149,49 @@ not, and each cost a round of rework.
 
 ---
 
+
+### Reply routing: proven in a namespace, not yet on the real tunnel
+
+Added 2026-09-14. The failure it fixes was diagnosed on a live machine —
+three inbound connections, all timing out, all because the reply left by the
+wrong interface — so the *problem* is real and observed. The *remedy* is so
+far proven only in a network namespace, and the gap is worth naming precisely:
+
+**Measured, in `unshare -rn` with dummy devices:**
+
+- a source rule **does** reach locally-initiated traffic. The design's first
+  safety argument said the opposite and was wrong: `connect()` resolves a
+  route, takes the source it implies, and looks up again with that source set.
+  `ip route get` issues one lookup and cannot show this — the check has to pass
+  `from`, or it passes on exactly the configuration it exists to catch;
+- with faithful tables, three outbound behaviours are unchanged and only the
+  broken reply moves;
+- an unmatched table falls through to main; a table holding only a default
+  shadows the more-specific routes in main;
+- the whole install, verification, manifest and removal cycle, driven through
+  the helper's own functions rather than a reimplementation of them;
+- the rollback fires: drop the on-link route from the copy and the post-install
+  check catches the shadowed table and reverts it.
+
+**Not proven:**
+
+- any of it against a real ASU tunnel, which pushes 53 IPv4 + 6 IPv6 routes
+  where the namespace had one;
+- the readiness wait. `asuvpn-notify` reports the connect event and *then*
+  execs the real script, so the install waits for the tunnel's address to
+  appear on the tunnel's device. Ten seconds, polled. Whether that is enough
+  on a slow gateway is a guess until somebody watches one;
+- the reconnect path, which compares the tunnel address and rebuilds the rules
+  when it has moved;
+- IPv6 end to end. The uplink here has no global IPv6, so only the tunnel side
+  would exercise it;
+- the stale-manifest sweep after a `SIGKILL`ed helper.
+
+**Not yet a shipped scenario.** The namespace harness is real and it passes,
+but it lives outside the repo. Until it is a `tests/sandbox` scenario, the
+invariants in DESIGN.md that name it are enforced-but-unchecked, and the two
+rows there say so.
+
 ## Open questions, and answers already established
 
 Do not re-derive these. Each was investigated with evidence.

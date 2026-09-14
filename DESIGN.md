@@ -28,6 +28,7 @@ is a machine with no working network until it reboots.
 - [What happens on connect](#what-happens-on-connect)
 - [The state machine](#the-state-machine)
 - [Where state comes from](#where-state-comes-from)
+- [Who owns the return path](#who-owns-the-return-path)
 - [Concurrency](#concurrency)
 - [Watching the tunnel](#watching-the-tunnel)
 - [Two orderings that are load-bearing](#two-orderings-that-are-load-bearing)
@@ -589,6 +590,253 @@ Two smaller rules fall out of the same idea, both enforced where the line is
   would end the line early and a **space** would silently add a second `addr=`
   — and parsing keeps the last one.
 
+## Who owns the return path
+
+The tunnel is not the only way off this machine, and the main routing table
+cannot say so. It answers *where does this packet go?* from the destination
+alone — and for a **reply**, the only correct answer depends on which interface
+the request arrived on. A split tunnel makes those two answers differ, and
+nothing reports it: the device is up, the routes are exactly what the gateway
+asked for, DNS resolves, the watchdog is green, and every service this machine
+offers to the outside stops answering.
+
+It is the house failure mode. Three sightings, one defect:
+
+| Request arrived on | Reply left by | Because |
+| --- | --- | --- |
+| the uplink, port-forwarded | the tunnel | the gateway pushed a prefix containing the peer |
+| the uplink, port-forwarded | the tunnel | as above, a different pushed prefix |
+| **the tunnel** | **the uplink** | a `/32` from DHCP is more specific than the pushed aggregate |
+
+The third is the mirror image, and it is why the fix is stated as a symmetry
+rather than as "keep replies off the tunnel". A patch that only pushed replies
+toward the uplink would have fixed two of these and left the third, looking
+correct while being half a fix — which is the same shape as every other bug in
+this file.
+
+### Why a source rule is safe
+
+The first version of this section argued that a `from <address>` rule cannot
+match locally-initiated traffic: the socket is unbound, so `saddr` is
+unspecified when the rules are consulted. That is **wrong**, and it is worth
+recording as wrong, because it is exactly the kind of claim this file exists to
+stop being made. `ip route get` issues one lookup; `connect()` does not. With
+the source unspecified the kernel resolves a route, takes the source it implies,
+and **looks up again** with that source set — which is the whole reason the
+standard multi-homing recipe works at all.
+
+Measured in a namespace, packets counted at the device rather than inferred:
+
+| | egress |
+| --- | --- |
+| no rules | `d0` |
+| `from 192.0.2.1 table 100` (default via `d1`) | **`d1`** |
+| rule removed again | `d0` |
+
+So the rule reaches outbound traffic, and safety has to come from somewhere
+else. It comes from **table fidelity**: each table reproduces the routes of the
+interface its addresses live on, so the second lookup arrives at the answer the
+main table would have given. The same topology, before and after:
+
+| | before | after |
+| --- | --- | --- |
+| outbound to the internet | `up0` | `up0` |
+| outbound to a pushed prefix | `tun0` | `tun0` |
+| outbound to the LAN | `up0` | `up0` |
+| **reply, bound to the uplink, to a peer inside a pushed prefix** | **`tun0`** | **`up0`** |
+
+Three behaviours unchanged, one corrected. That is the claim, and it is a
+measurement rather than a reading of the rules.
+
+Two kernel properties make the fidelity requirement tractable, both measured
+the same way:
+
+- **A table that does not match falls through to main.** An empty table, or one
+  missing a prefix, costs nothing — the lookup simply continues. Partial state
+  degrades instead of breaking.
+- **A default route shadows every more-specific route in main.** This is the
+  one dangerous entry. A table holding only a default sends an on-link LAN peer
+  to the gateway instead of straight out the wire.
+
+So the rule is: a table carries a default route **only** together with the
+device's more-specific routes. That is what "faithful" has to mean, and it is
+the single thing an implementation can get wrong in a way that matters.
+
+Which is why the install checks its own effect rather than its exit status.
+Representative destinations are resolved before the rules go in and again
+after; anything that moved where it was not supposed to move is a failed
+install, and a failed install is rolled back in full. The rules are two:
+
+```
+from <uplink address>  lookup <table for that uplink>
+from <tunnel address>  lookup <table for the tunnel>
+```
+
+Replies then leave by the interface their request arrived on, in both
+directions, which is the property the main table could not express.
+
+### Nothing is named, everything is probed
+
+Interfaces are categorised by what they *do*, never by what they are called.
+There is no list of name prefixes to keep current, and no assumption that an
+uplink is ethernet or that there is one of it.
+
+| Role | Established by | Deliberately not by |
+| --- | --- | --- |
+| the tunnel device | `TUNDEV`, which openconnect set | a name pattern, `POINTOPOINT`, `link_type` |
+| the tunnel's addresses | `INTERNAL_IP4_ADDRESS` / `INTERNAL_IP6_ADDRESS`, confirmed against the device | reading the device alone |
+| an **uplink** | it carries a default route in the pre-tunnel main table | `eno*` / `wl*`, or "not the tunnel" |
+| an uplink's addresses | `scope: global`, less `tentative` and `deprecated` | assuming one address per interface |
+| alive | the `LOWER_UP` flag | `operstate` |
+
+"Carries a default route" is the criterion because it is the same property that
+makes an interface able to answer an arbitrary remote peer. It generalises to a
+machine with ethernet and wifi without a special case, and to a machine with
+neither by producing no rules at all.
+
+`operstate` is called out because it is the trap. A tun device reports
+`UNKNOWN`, not `UP`, for its whole life — so the obvious liveness test excludes
+the one device the tunnel half of this depends on, while reading perfectly
+sensibly. `LOWER_UP` is the flag that means what `operstate` looks like it
+means; it admits the tunnel, admits a live uplink, and rejects a bridge with no
+carrier.
+
+Discovery runs through `ip -j`, so the structure is parsed rather than
+scraped — which is not the same as being safe from it. `ip route show dev X`
+**omits the `dev` field from every route it prints**, because the query implies
+it. The first working version read those routes back, failed to render a single
+one, installed a rule for the tunnel and none for the uplink, and logged that
+it had succeeded. It is put back explicitly now, and the copy is all-or-nothing
+so that a group which cannot be read back is a failure rather than a silent
+skip.
+
+### Nothing about the topology is a constant
+
+The only fixed numbers are the band to start looking in (`REPLY_TABLE_BASE`,
+`REPLY_RULE_BASE`), how far up to look (`REPLY_BAND_SPAN`), the address cap, and
+the readiness timeout. Every one of those is a bound or a starting point, never
+an answer: the ids actually used are whichever in that band are found free, and
+an occupied band is refused rather than reused.
+
+Everything describing the machine is read off the machine:
+
+| | Derived from |
+| --- | --- |
+| which interfaces are uplinks | having a default route in the pre-tunnel main table |
+| what goes in an uplink's table | every route `ip` reports for that device |
+| which addresses get a rule | the device's own global, non-tentative addresses |
+| the tunnel device and its addresses | `TUNDEV` and the device itself |
+| whether an interface is alive | its `LOWER_UP` flag |
+| **the tunnel's catch-all route** | **the shape of the tunnel's own routes** |
+| **the default route's probe** | **whichever candidate currently resolves through that device and is not covered by one of its own prefixes** |
+
+The last two were assumptions first, and are worth naming as the kind of thing
+that hides. The tunnel table needs one route matching everything -- copying the
+gateway's pushed prefixes would catch only the peers already going the right
+way -- and `default dev <tundev>` is correct for a point-to-point device whose
+routes carry no gateway, which every tun device this has met does. That is a
+property of those tunnels, not a law, so the device is asked and whatever shape
+its own routes have is the shape the catch-all takes.
+
+The probe was a fixed documentation address, which is a probe of the default
+route only while nothing more specific covers it. On a machine that routes that
+space somewhere -- a lab, a blackhole -- it would have tested a different route
+and reported the default's behaviour unchanged without ever having asked about
+it. Candidates are now tried until one resolves through the right device, and
+ones falling inside the device's own prefixes are skipped, because those
+resolve on-link rather than through the default.
+
+### Two things that cannot be known in advance
+
+**The uplink's default route, in a full tunnel.** The stock script *replaces* it
+and keeps its own backup. So the helper captures it before it launches
+`openconnect` — not for convenience, but because that is the only moment the
+pre-tunnel value exists. In a split tunnel it survives in the main table and
+could be read at any time; the snapshot is taken the same way in both cases
+rather than having two paths and one of them rarely exercised.
+
+**How many tables are needed.** The uplink count is discovered, so table ids and
+rule priorities are allocated from a band, each verified empty before use. An id
+already in use is refused with a line in the log, never reused — this is the one
+place a wrong guess would quietly steal another tool's routing.
+
+### Teardown is the hard half
+
+`vpnc-script` is **not** guaranteed to run on the way out. The ladder's last
+rung is `SIGKILL`, and the table in [Teardown](#teardown) says plainly that no
+script runs there. Anything undone from the `disconnect` transition is therefore
+undone only most of the time, which for a routing rule is not a guarantee at
+all.
+
+So the helper owns both ends. It installs after the tunnel is up and removes
+where it already deletes a leftover device and re-checks the default route —
+the path that has three independent guards behind it, not the one that has a
+hole.
+
+What is removed is read from a manifest written into the session directory
+under `/run/asuvpn`, beside [the DNS marker](#who-owns-dns) and for the same
+reason: what was actually created is a **fact**, and re-deriving it at teardown
+would be an inference drawn from a machine whose addresses may have changed
+since. Only what this session recorded is ever removed, and each entry is
+confirmed to still look like what was recorded before it goes. It is the role
+that ifindex ownership plays for the device, applied to a rule.
+
+Four deaths, four answers:
+
+| What dies | What removes the rules |
+| --- | --- |
+| a clean disconnect | the helper, on its normal teardown path |
+| `openconnect`, by any rung of the ladder including `SIGKILL` | the helper, after reaping it |
+| the tray | the control pipe closes, the helper tears down, as above |
+| **the helper itself** (`kill -9`, OOM) | nothing, in that moment; the next helper sweeps the manifest it finds |
+
+The fourth is the residual, and it is survivable by construction rather than by
+promise. The tunnel's table empties itself, because the kernel drops routes with
+their device, so that rule falls through to main. The uplink's table still holds
+what the uplink's routes were, which is what they still are. Neither survives a
+reboot. A stale rule is therefore inert or correct, never wrong — and the sweep
+is tidiness, not repair.
+
+### Failing open, in every direction
+
+| Situation | What happens |
+| --- | --- |
+| DHCP moves an address | the rule stops matching; traffic falls through to main |
+| an uplink disappears | its table is stale but still describes that uplink |
+| the tunnel dies uncleanly | the kernel drops the routes with the device; the table is empty |
+| no default route at all when the tunnel starts | no uplink is found and no rule is made |
+| a table id is already in use | nothing is installed, and the log says which |
+| the post-install check sees a destination move | the whole install is rolled back, tunnel untouched |
+| the whole feature throws | it is caught, logged, and routing is left exactly as the stock script made it |
+
+The last row is the invariant that outranks this entire section. This is an
+addition to a machine's routing, and an addition that cannot be made is an
+addition that is not made.
+
+### What this deliberately does not do
+
+**Connection marking.** `CONNMARK` plus an `fwmark` rule is the more correct
+mechanism: replies would follow the interface the connection arrived on
+regardless of addressing, surviving address changes and NAT that this does not.
+It is rejected because it requires writing into the machine's packet filter —
+`nftables`, possibly with `ufw` owning the ruleset and flushing it from under us
+on reload. Taking a stake in the firewall is a large, stateful, poorly
+revertible surface, and the failure mode this project is built around is a
+machine with no working network until it reboots. A routing rule can be deleted;
+a half-applied filter cannot always be. The margin is real and it is not worth
+that.
+
+**Excluding prefixes from the tunnel.** The address that needs the exception is
+the *remote peer's*, which is not known in advance and changes between
+connections. It cannot be configured around, and asking the user to try requires
+them to have diagnosed this first.
+
+**Changing what the stock script does.** Nothing here touches the main table.
+The stock script's routing is still "configured exactly as it would have been";
+this adds a policy layer above it that the stock script neither reads nor
+writes. The installed `vpnc-script` uses no policy routing and no alternate
+table — checked, not assumed — so the two cannot collide.
+
 ## Concurrency
 
 ### asuvpn-tray
@@ -1133,6 +1381,11 @@ where it can be, checked by `asuvpn selftest`.
 | No root process outlives the tray | control pipe, `PR_SET_PDEATHSIG`, no `--background` | `SIGKILL` the tray and look for survivors; `pdeath.sh` SIGKILLs the *helper* and asserts openconnect died with it |
 | Only a device this session created is ever deleted | ifindex ownership, free-name selection | `--interface <existing>` is refused (exit 23, wiring tier), and the logic tier drives `verify_teardown` both ways: a foreign ifindex is left alone, our own is deleted |
 | A device name never reaches the filesystem or `ip` unvalidated | `INTERFACE_RE`, checked at both ends — where produced and where consumed | logic + wiring tiers, with traversal and whitespace payloads |
+| Replies leave by the interface their request arrived on | one rule per address, each pointing at a faithful copy of that interface's own routes | logic tier drives the categorising and rendering rules; the behaviour itself is measured in a network namespace, which is **not yet a shipped scenario** — see [Still unproven](#still-unproven) |
+| Installing reply routing never moves ordinary traffic | every probe answered before the rules go in is asked again after, and any difference rolls the whole install back | mutation-verified by hand: drop the on-link route from the copy and the check catches the shadowed table and reverts. Not yet a shipped scenario |
+| A reply-routing rule never outlives the tunnel that needed it | the helper removes them on every path out, including the `SIGKILL` rung where `vpnc-script` never runs; a helper killed outright leaves a manifest the next connect sweeps | the teardown call sits before `verify_teardown` on the single exit path; the sweep shares `prune_stale_channels` |
+| Only rules this session created are ever removed | the manifest in `/run/asuvpn` records what was made; teardown reads it rather than re-deriving | the same discipline as ifindex ownership, and for the same reason: the machine's addresses can change in between |
+| A value read from `ip -j` never reaches `ip`(8) unvalidated | `route_args` checks every field as an address, a prefix, a device name, a known scope or a bounded integer | logic tier, with option-like, traversal and shell-punctuation payloads |
 | The variables the DNS handover reads still exist upstream | nothing enforces this; it is asserted rather than assumed | environment tier reads `CISCO_DEF_DOMAIN`, `CISCO_SPLIT_DNS` and `INTERNAL_IP4_DNS` out of the installed `libopenconnect`'s own strings |
 | `openconnect` cannot forge a helper message | `[vpn] ` prefix on every relayed line | logic tier, with `\r` and `\n` payloads |
 | A state event cannot inject a line or a field | reject impossible device names; collapse every field to one token | wiring tier, with space-and-`=` payloads |

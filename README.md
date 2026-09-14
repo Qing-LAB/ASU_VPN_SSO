@@ -35,6 +35,16 @@ the tunnel's own link instead, correctly scoped and nobody else's to overwrite,
 and the watchdog checks every twenty seconds that it is still there. See
 [DNS, and why it is not written to `/etc/resolv.conf`](#dns-and-why-it-is-not-written-to-etcresolvconf).
 
+It fixes a second thing of the same kind, in the same place. While a tunnel
+is up, anything that connects *to* this machine — remote desktop, SSH, anything
+a firewall forwards here — can stop being answered, because the reply leaves by
+the tunnel instead of the way the request came in and is dropped for carrying
+the wrong return address. Nothing reports it: the tunnel is healthy, the routes
+are what the gateway asked for, and the caller simply times out. The applet adds
+a routing rule for the life of the tunnel so replies go back the way they came,
+and removes it when the tunnel goes. See
+[Staying reachable while connected](#staying-reachable-while-connected).
+
 Most of the engineering here is in the part nobody enjoys: making sure that
 however the tunnel ends — you disconnect, you log out, the applet crashes, the
 helper is killed — `openconnect` still gets to put your routes and DNS back.
@@ -260,6 +270,18 @@ answer `asuvpn --version` gives, and the applet logs it once at startup.
 **Start on login (applet only)** puts the icon in your tray at login without
 connecting — so you are not met with a Duo push before you have asked for one.
 
+**Use IPv6 through the tunnel** is on by default. Untick it if your VPN
+advertises IPv6 that does not actually work — see
+[When IPv6 makes things worse](#when-ipv6-makes-things-worse).
+
+**Send replies back the way they came** keeps anything this machine serves to
+the outside — remote desktop, SSH, anything behind a port forward — answering
+while the tunnel is up. On by default, and it changes nothing about how *your*
+traffic is routed. See
+[Staying reachable while connected](#staying-reachable-while-connected) for
+what goes wrong without it, which is worth reading if you have ever had a
+forwarded connection time out for no visible reason while on the VPN.
+
 ### What it tells you, and when
 
 A badge quietly changing to a spinner is easy to miss, so every transition that
@@ -305,8 +327,9 @@ dpd = 30
 Most of it takes effect without reconnecting: the built-in health checker
 (the "watchdog" below) re-reads the file on every check, so changing
 `health-interval`, `probe`, `probe-target` or the rate limits applies within
-seconds. `dpd`, `dns` and `dns-domains` reach `openconnect` and its script on
-the command line, so those three need a reconnect. A malformed line costs that setting its default
+seconds. `dpd`, `dns`, `dns-domains`, `reply-routing` and `ipv6` reach
+`openconnect` and its script on the command line, so those five need a
+reconnect. A malformed line costs that setting its default
 and logs a sentence saying so — a config file is never a reason to be unable to
 connect.
 
@@ -317,6 +340,8 @@ connect.
 | `dpd` | `30` | Dead-peer probe interval, forced on. **`0` leaves the server's choice alone** — the escape hatch if forcing it ever misbehaves. |
 | `dns` | `on` | Put the resolver the VPN pushes on the tunnel's own link, through `systemd-resolved`, instead of letting `vpnc-script` rewrite `/etc/resolv.conf`. This is what makes internal names resolve *and keep resolving*. See [DNS, and why it is not written to `/etc/resolv.conf`](#dns-and-why-it-is-not-written-to-etcresolvconf). |
 | `dns-domains` | *(empty)* | Which names to resolve through the tunnel when the gateway names none itself. Empty derives one from `server` — `sslvpn.asu.edu` gives `asu.edu`. What the gateway pushes always wins over both. |
+| `ipv6` | `on` | Ask the gateway for IPv6. **Off** passes `--disable-ipv6` to `openconnect`, so the tunnel negotiates no IPv6 at all — no address, no routes, nothing of yours carried over it. Turn it off on a network that advertises IPv6 and then does not carry it, where the symptom is a long stall rather than an error. See [When IPv6 makes things worse](#when-ipv6-makes-things-worse). |
+| `reply-routing` | `on` | Send replies back out the way the request came in, so anything this machine serves to the outside keeps working while the tunnel is up. Adds routing rules for the life of the tunnel and removes them with it; the main routing table is never touched. See [Staying reachable while connected](#staying-reachable-while-connected). |
 | `health-interval` | `20` | Seconds between checks. **`0` turns the watchdog off** — the config file is still re-read at the default cadence, so turning it back on needs no restart. |
 | `health-strikes` | `2` | Consecutive bad checks before the badge stops claiming Connected. |
 | `probe` | `on` | Ask the network whether traffic still flows. The only check that catches a tunnel that looks perfect and delivers nothing. |
@@ -371,6 +396,8 @@ asuvpn quit             # close the tunnel and stop the applet
 asuvpn tray             # run the applet in the foreground, do not connect
 asuvpn selftest         # check this installation against this machine
 asuvpn autoreconnect    # show or set automatic reconnection: [on|off]
+asuvpn reply-routing    # show or set return-path rules: [on|off]
+asuvpn ipv6             # show or set IPv6 through the tunnel: [on|off]
 ```
 
 Every command prints the resulting state, so nothing happens silently.
@@ -727,17 +754,50 @@ none appear anywhere in this repository.
 
 ## How it works
 
+The longest section here, and the one you can most safely skip: nothing below is
+needed to *use* the app. It is here because several of these decisions look
+arbitrary until you know what went wrong without them.
+
+- [Why pkexec instead of sudo](#why-pkexec-instead-of-sudo)
+- [Knowing whether it is connected](#knowing-whether-it-is-connected)
+- [When the link drops](#when-the-link-drops)
+- [Watching the tunnel itself](#watching-the-tunnel-itself)
+- [DNS, and why it is not written to `/etc/resolv.conf`](#dns-and-why-it-is-not-written-to-etcresolvconf)
+- [When IPv6 makes things worse](#when-ipv6-makes-things-worse)
+- [Staying reachable while connected](#staying-reachable-while-connected)
+- [The control pipe](#the-control-pipe)
+- [Every way of stopping it](#every-way-of-stopping-it)
+- [Putting the network back](#putting-the-network-back)
+- [Why the sign-in needs its own browser window](#why-the-sign-in-needs-its-own-browser-window)
+- [Two upstream quirks worth knowing](#two-upstream-quirks-worth-knowing)
+
 Connecting is split across a privilege boundary, which is the whole point of the
 design:
 
-```
-  you ──▶ asuvpn-tray ──▶ openconnect-sso ──▶ browser window (ASU SSO + Duo)
-              │                  │
-              │                  └──▶ host + certificate fingerprint + cookie
-              │
-              └──▶ pkexec ──▶ asuvpn-helper (root) ──▶ openconnect ──▶ asuvpn0
-                                    ▲
-                          cookie on stdin, never on argv
+```mermaid
+flowchart LR
+    you(["you"])
+    subgraph asyou["runs as you"]
+        direction TB
+        tray["<b>asuvpn-tray</b><br/>applet, CLI, state machine"]
+        sso["<b>openconnect-sso</b><br/>--authenticate=shell"]
+        browser["browser window<br/>ASU SSO + Duo"]
+        tray --> sso --> browser
+    end
+    subgraph asroot["runs as root, via pkexec"]
+        direction TB
+        helper["<b>asuvpn-helper</b><br/>owns openconnect's lifetime<br/>and the teardown"]
+        oc["<b>openconnect</b>"]
+        notify["<b>asuvpn-notify</b><br/>run by openconnect at<br/>every transition"]
+        helper --> oc --> notify
+    end
+    dev(["asuvpn0<br/>the tunnel"])
+
+    you --> tray
+    browser -. "host + certificate<br/>fingerprint + cookie" .-> tray
+    tray == "pkexec<br/><b>cookie on stdin,<br/>never on argv</b>" ==> helper
+    oc --> dev
+    notify -. "state events" .-> helper
 ```
 
 - **`asuvpn-tray`** runs as you. It drives `openconnect-sso --authenticate=shell`,
@@ -1162,6 +1222,150 @@ Every connect logs what was done:
 
 `dns = off` turns the whole thing off and gives `vpnc-script` its old job back.
 
+### When IPv6 makes things worse
+
+Leave `ipv6` on unless something is actually broken. Where IPv6 works, a tunnel
+that carries it is the better tunnel, and ASU's does push an IPv6 address and
+routes.
+
+The case for turning it off is narrow and specific: a network that *advertises*
+IPv6 without actually carrying it. That fails in the most annoying way
+available — not an error, a **stall**. A machine that has an IPv6 address tries
+IPv6 first for any name that resolves to both, waits for a connection timeout,
+and only then falls back to IPv4. Everything still works; everything is just
+slow to start, in a way that looks like a bad network rather than a
+misconfiguration.
+
+Two commands tell you whether that is what you have:
+
+```bash
+curl -6 -m 5 -o /dev/null -s -w 'IPv6: %{time_total}s\n' https://example.com
+curl -4 -m 5 -o /dev/null -s -w 'IPv4: %{time_total}s\n' https://example.com
+```
+
+If the IPv6 line hangs until the timeout and the IPv4 line answers instantly,
+IPv6 is being advertised and not carried:
+
+```bash
+asuvpn ipv6 off
+asuvpn reconnect
+```
+
+**What off actually does.** It passes `--disable-ipv6` to `openconnect`, so the
+client never asks the gateway for IPv6 in the first place. The tunnel comes up
+with no IPv6 address and no IPv6 routes, and your machine's own IPv6 — on the
+network you are physically connected to — is left exactly as it was. It is not
+a system-wide IPv6 switch and it does not touch `sysctl`; it only decides what
+this tunnel negotiates.
+
+[Reply routing](#staying-reachable-while-connected) follows the same switch: with
+no IPv6 in the tunnel there is no IPv6 address to write a rule about, so it
+installs IPv4 rules only.
+
+The self-check confirms the flag exists in your installed `openconnect` rather
+than assuming it — `asuvpn selftest` reports **openconnect supports
+--disable-ipv6**. If a future release renames it, you find out from the
+self-check instead of from a connect that is refused.
+
+### Staying reachable while connected
+
+If nothing ever connects *to* this machine, you can skip this. If something
+does — you remote-desktop into it, you SSH to it, it serves anything at all —
+this is the setting that keeps that working while the VPN is up.
+
+**The problem it solves.** Your machine has two ways out: its network
+connection, and the VPN tunnel. When a request arrives and your machine writes
+a reply, it decides which way to send that reply based only on *where the reply
+is going*. It never considers *where the request came from*.
+
+A VPN claims large ranges of addresses — "anything addressed to these goes
+down the tunnel". If whoever is connecting to you happens to fall inside one of
+those ranges, then:
+
+1. Their request arrives over your **network connection**
+2. Your machine writes a reply and looks up their address
+3. The VPN has claimed it, so the reply goes into the **tunnel**
+4. The tunnel drops it, because the reply carries the wrong return address
+
+They never get an answer. Their client sits there and eventually times out.
+
+```mermaid
+flowchart TB
+    subgraph OFF["reply-routing = off"]
+        direction TB
+        A1["request arrives over<br/>your network connection"] --> B1["machine writes a reply"]
+        B1 --> C1["looks up only<br/><b>where the reply is going</b>"]
+        C1 --> D1["the VPN claims that range,<br/>so the reply enters the tunnel"]
+        D1 --> E1["dropped — wrong return address<br/><b>caller times out</b>"]
+    end
+    subgraph ON["reply-routing = on"]
+        direction TB
+        A2["request arrives over<br/>your network connection"] --> B2["machine writes a reply"]
+        B2 --> C2["the reply carries your network<br/>connection's return address"]
+        C2 --> D2["a rule sends it back out<br/>the network connection"]
+        D2 --> E2["arrives — <b>caller gets an answer</b>"]
+    end
+```
+
+
+The tunnel is fine throughout. Its routes are exactly what the gateway asked
+for, DNS resolves, the watchdog is green, `asuvpn status` says Connected — and
+everything this machine offers to the outside has silently stopped answering.
+Nothing reports it, because from the tunnel's point of view nothing is wrong.
+
+It happens in both directions. A request that arrives over the *tunnel* can
+have its reply pulled out onto the local network the same way, if your local
+network advertises a more specific route for the address than the VPN does.
+
+**What the setting does.** It adds one rule per address: a reply carrying your
+network connection's address goes out the network connection, and a reply
+carrying the tunnel's address goes down the tunnel. Replies leave the way their
+request came in, and nothing gets dropped.
+
+It does **not** make this machine reachable — a firewall still has to forward
+something to it. It stops the tunnel breaking the replies of whatever already
+was.
+
+**What it does not touch.** Your main routing table, which `vpnc-script` still
+configures exactly as it always did. This sits above it. Your ordinary traffic
+— web, internal servers, the machines on your own network — goes exactly where
+it went before, and the applet proves that rather than assuming it: it checks
+where a set of real destinations would go before and after installing, and if
+anything moved that should not have, it removes everything it added and leaves
+routing alone.
+
+**When it is removed.** When the tunnel goes, every time:
+
+| How the tunnel ends | What happens |
+| --- | --- |
+| you disconnect | removed on the way out |
+| `openconnect` dies, however badly | removed when the applet reaps it |
+| the applet is closed or crashes | the control pipe closes; same teardown |
+| the root helper is killed outright | the next connect sweeps them up |
+
+That last row is the only gap, and it is harmless: a leftover rule points at a
+copy of the routes your network connection was already using, so it is either
+inert or simply correct. None of it survives a reboot, and nothing is written
+to any file outside `/run`.
+
+**Turning it off.**
+
+```bash
+asuvpn reply-routing off
+```
+
+or untick **Send replies back the way they came** in the menu. Either takes
+effect on the next connect. Turn it off if you want routing left entirely to
+the stock `vpnc-script`, or if you have something that binds to your machine's
+own network address and expects to reach the VPN through it — that is the one
+case this changes, and it was already broken before, in a quieter way.
+
+To see what it did, look in the log:
+
+```bash
+asuvpn log | grep "reply routing"
+```
+
 ### The control pipe
 
 The helper keeps reading the same stdin pipe for the life of the tunnel. Closing
@@ -1194,6 +1398,19 @@ and gets 15 seconds to run `vpnc-script` before anything harsher is considered.
 | **Logging out** (`SIGTERM`) | Same as Ctrl+C. |
 | The applet **crashes** or is `kill -9`ed | The control pipe closes, the helper sees EOF and tears the tunnel down. Nothing is left holding your routes. |
 | The **helper** itself dies (out of memory, `kill -9`) | The kernel itself notices — the helper registered for that (`PR_SET_PDEATHSIG`) — and signals `openconnect`, so the routing script still runs. |
+
+Three independent guards, one for each way the chain can break — whichever
+link dies, something else still gets `vpnc-script` run:
+
+```mermaid
+flowchart LR
+    d1["the <b>tray</b> dies<br/><i>crash, kill -9, log out</i>"] --> g1["the control pipe closes<br/>and the helper sees EOF"]
+    d2["the <b>helper</b> dies<br/><i>OOM, kill -9</i>"] --> g2["PR_SET_PDEATHSIG:<br/>the kernel signals openconnect"]
+    d3["<b>openconnect</b> dies"] --> g3["the helper reaps it, removes a<br/>leftover device, re-checks routing"]
+    g1 --> ok(["<b>routes and DNS restored</b>"])
+    g2 --> ok
+    g3 --> ok
+```
 
 > [!NOTE]
 > `asuvpn connect` from a terminal puts the applet in its own session and
@@ -1402,6 +1619,8 @@ teardown, and logged precisely so a declined action never reads as a hang.
 | Badge says **not carrying traffic** | The watchdog found the tunnel device or its routes gone, or nothing answering through it. It has already nudged `openconnect` once; `asuvpn log` says what it saw. If it does not recover, the automatic sign-in fires (unless turned off) — or `asuvpn reconnect` yourself. |
 | Badge says **DNS not configured** | The resolver the VPN pushed is no longer on the tunnel's link, so internal names resolve to whatever public DNS says. The applet asks `openconnect` to re-establish, which reconfigures it. `resolvectl dns asuvpn0` shows the live state. |
 | `ssh` to an internal host hangs while the VPN is up | The name is resolving to a public address instead of the internal one — `resolvectl query <host>` says which, and `resolvectl dns asuvpn0` says whether the VPN's resolver is on the link. If it is empty, `asuvpn log` will say why the handover did not take. With `dns = off` this is the stock `vpnc-script` behaviour and is expected to come back. |
+| Everything is slow to *start* while connected — pages hang for seconds then load fine | Classic broken IPv6: something advertises an IPv6 route it cannot actually carry, your machine tries IPv6 first and waits for a timeout before falling back to IPv4. Confirm with `curl -6 -m 5 https://example.com` (hangs) versus `curl -4` (instant), then `asuvpn ipv6 off` and reconnect. |
+| Something that connects **to** this machine times out while the VPN is up (remote desktop, SSH, anything port-forwarded) | The reply is leaving by the wrong interface. Confirm it with `ss -tan 'sport = :3389'` (or your port) *while the caller is trying*: a socket stuck in `SYN-RECV` means the request arrived and the reply never got back. `reply-routing` is on by default and fixes this; check it with `asuvpn reply-routing` and `asuvpn log \| grep "reply routing"`. See [Staying reachable while connected](#staying-reachable-while-connected). |
 | Badge says **…; rebuilding** | The tunnel died on its own and the applet will sign in again shortly, up to three times. **Stop reconnecting** in the menu — or `asuvpn disconnect` — calls it off. |
 | `sign-in did not finish within 300s` | A sign-in sat unanswered — usually a Duo push or browser window with nobody at the keyboard — and was ended by `signin-timeout`. Connect again when you are there to answer it. |
 | Tunnel silently stops working, badge stays green | Should no longer happen: `--force-dpd 30` is passed because ASU negotiates DPD off, and the watchdog covers what DPD cannot see. If it recurs, `asuvpn log` now records every check. |

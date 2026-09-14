@@ -103,7 +103,6 @@ C = _contract()
 OPENCONNECT_CANDIDATES = ("/usr/sbin/openconnect", "/usr/bin/openconnect")
 PR_SET_PDEATHSIG = 1
 PR_GET_PDEATHSIG = 2
-IP_CANDIDATES = ("/usr/sbin/ip", "/sbin/ip", "/usr/bin/ip")
 TUNNEL_PREFIXES = ("tun", "tap", "vpn")
 HERE = os.path.dirname(os.path.abspath(__file__))
 NOTIFY = os.path.join(HERE, "asuvpn-notify")
@@ -300,10 +299,26 @@ def prune_stale_channels():
         entries = os.listdir(RUNTIME_ROOT)
     except OSError:
         return
+    ip = find_ip()
     for name in entries:
         pid = name.partition("-")[0]
-        if pid.isdigit() and not os.path.exists(f"/proc/{pid}"):
-            shutil.rmtree(os.path.join(RUNTIME_ROOT, name), ignore_errors=True)
+        if not pid.isdigit() or os.path.exists(f"/proc/{pid}"):
+            continue
+        directory = os.path.join(RUNTIME_ROOT, name)
+        # The one thing in a stale directory that is not merely litter. A
+        # helper killed outright never reached its teardown, so its routing
+        # rules are still in the kernel with nothing left that knows about
+        # them -- except this file, which is why it is written. Harmless if
+        # left (see DESIGN.md: a stale rule is inert or correct, never wrong)
+        # but this is the sweep that stops "harmless" accumulating.
+        if ip is not None:
+            marker = os.path.join(directory, C.REPLY_MARKER)
+            if os.path.exists(marker):
+                taken = remove_reply_routing(ip, marker)
+                if taken:
+                    log(f"removed {taken} reply-routing rule(s) left by a"
+                        f" helper that did not shut down (pid {pid})")
+        shutil.rmtree(directory, ignore_errors=True)
 
 
 def event_channel():
@@ -331,7 +346,7 @@ def event_channel():
         return None, None, None
 
 
-def serve_events(server, token, ifname, owned):
+def serve_events(server, token, ifname, owned, reply=None):
     """Translate openconnect's script events into state lines for the tray.
 
     A return from here is one-way: the tray latches on the first real event and
@@ -394,6 +409,24 @@ def serve_events(server, token, ifname, owned):
             index = C.interface_index(device or ifname)
             if index is not None:
                 owned["ifindex"] = index
+            # A reconnect fires this again, and it may bring a different
+            # tunnel address with it -- which would leave the installed rule
+            # naming an address that no longer exists. That fails open rather
+            # than wrong (a rule matching nothing falls through to main), but
+            # failing open is still not working, so the address is compared
+            # and the rules are rebuilt when it has moved.
+            if reply is not None and address:
+                if reply.get("address") != address:
+                    if reply.get("installed"):
+                        remove_reply_routing(reply["ip"], reply["marker"])
+                        reply["installed"] = False
+                    reply["address"] = address
+                    threading.Thread(
+                        target=reply_routing_install,
+                        args=(reply["ip"], reply["snapshot"],
+                              device or ifname, reply["marker"], reply,
+                              reply["families"]),
+                        daemon=True).start()
         # Sanitised here rather than trusted from the sender. asuvpn-notify
         # already strips separators, but the rule has to hold where the line is
         # built: a newline in either field ends the line early and the rest
@@ -509,8 +542,13 @@ def find_openconnect():
 
 
 def find_ip():
-    """The absolute paths only: this runs as root and `ip` deletes devices."""
-    return C.find_program("ip", IP_CANDIDATES)
+    """The absolute paths only: this runs as root and `ip` deletes devices.
+
+    The list moved to the contract when reply routing became a second caller
+    of it. Two copies of "where does ip live" is two chances to disagree about
+    whether this machine has one.
+    """
+    return C.ip_path()
 
 
 def requested_interface(extra):
@@ -713,6 +751,548 @@ def drop_link_dns(ifname):
     result = run([binary, "revert", ifname], timeout=C.RESOLVECTL_TIMEOUT)
     if result is not None and result.returncode == 0:
         log(f"per-link DNS on {ifname} reverted")
+
+
+
+# --------------------------------------------------------------- reply routing
+#
+# Replies leave by the interface their request arrived on. Everything here is
+# an *addition* above the main routing table, which is never touched: the stock
+# vpnc-script still configures routing exactly as it would have. See
+# "Who owns the return path" in DESIGN.md for why this is needed and why it is
+# shaped this way.
+
+
+def ip_json(ip, *argv):
+    """One `ip -j` query, parsed. [] on any failure, and it never raises.
+
+    Structured output rather than scraped: a column that moves is a bug nobody
+    sees until the day it moves.
+    """
+    import json
+
+    try:
+        done = subprocess.run([ip, "-j", *argv], stdin=subprocess.DEVNULL,
+                              stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                              timeout=C.IP_TIMEOUT, check=False)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return []
+    if done.returncode != 0:
+        return []
+    try:
+        parsed = json.loads(done.stdout or b"[]")
+    except ValueError:
+        return []
+    return parsed if isinstance(parsed, list) else []
+
+
+def run_ip(ip, *argv, quiet=False):
+    """One ip command. True if it exited 0; never raises.
+
+    `quiet` is for the rollback and the teardown, which run against state that
+    is usually already gone -- "No such process" on every clean disconnect is
+    noise that teaches the reader to skim these lines.
+    """
+    try:
+        done = subprocess.run([ip, *argv], stdin=subprocess.DEVNULL,
+                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                              timeout=C.IP_TIMEOUT, check=False)
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        if not quiet:
+            log(f"reply routing: ip {argv[0]} failed: {exc}")
+        return False
+    if done.returncode != 0:
+        if not quiet:
+            detail = done.stdout.decode("utf-8", "replace").strip().replace("\n", "; ")
+            log(f"reply routing: ip {' '.join(argv)} exited"
+                f" {done.returncode}: {detail}")
+        return False
+    return True
+
+
+def has_carrier(link):
+    """Is this link actually passing traffic?
+
+    `operstate` is the obvious field and it is the wrong one: a tun device
+    reports UNKNOWN for its whole life, so the obvious test excludes the one
+    device the tunnel half of this depends on while reading perfectly
+    sensibly. LOWER_UP is the flag that means what operstate looks like it
+    means.
+    """
+    flags = link.get("flags") or []
+    return "UP" in flags and "LOWER_UP" in flags and "LOOPBACK" not in flags
+
+
+def source_addresses(ip, device, family):
+    """Addresses on `device` that could be the source of a reply.
+
+    Global scope only: a host or link-scope address never appears as the source
+    of a reply to somebody off this machine. Tentative and deprecated IPv6
+    addresses are skipped because the kernel will not choose them for new
+    traffic either, so a rule naming one would match nothing.
+    """
+    out = []
+    for link in ip_json(ip, "-f", family, "addr", "show", "dev", device):
+        for info in link.get("addr_info") or []:
+            if info.get("scope") != "global":
+                continue
+            if info.get("tentative") or info.get("deprecated"):
+                continue
+            local = info.get("local")
+            if not local:
+                continue
+            try:
+                import ipaddress
+                text = str(ipaddress.ip_address(local))
+            except ValueError:
+                continue  # about to be an argv to a root command
+            if text not in out:
+                out.append(text)
+    return out[:C.MAX_REPLY_ADDRESSES]
+
+
+def uplink_snapshot(ip, families=("inet", "inet6")):
+    """Which interfaces reach the world, and the routes they do it with.
+
+    Taken **before** openconnect is launched, and that is not merely tidy: in a
+    full tunnel the stock script replaces the default route, so this is the only
+    moment the pre-tunnel value exists. In a split tunnel it survives in the
+    main table and could be read at any time; one path is taken in both cases
+    rather than two with one of them rarely exercised.
+
+    An interface is an uplink if the main table has a default route through it.
+    Not its name, not its driver, not "the one that is not the tunnel" -- that
+    property is precisely the one that makes an interface able to answer a peer
+    anywhere on the internet, which is the question being asked. A machine with
+    ethernet and wifi gets both, and a machine with neither gets nothing, with
+    no special case for either.
+    """
+    snapshot = {}
+    carrier = {link.get("ifname"): has_carrier(link)
+               for link in ip_json(ip, "link", "show")}
+    for family in families:
+        for route in ip_json(ip, "-f", family, "route", "show", "default"):
+            device = route.get("dev")
+            if not device or not C.INTERFACE_RE.match(device):
+                continue
+            if not carrier.get(device):
+                continue
+            # Every route the device owns, not just the default. A table
+            # carrying only a default *shadows* the more-specific routes in
+            # main -- an on-link neighbour would be sent to the gateway
+            # instead of straight out the wire. This is the one thing an
+            # implementation can get wrong in a way that matters.
+            # `dev` is *absent* from every route here: asking by device
+            # makes ip drop the field it would otherwise print, because the
+            # query implies it. Put it back, or every route fails to render
+            # and the table is built empty -- which is how this first shipped
+            # a rule for the tunnel, none for the uplink, and a log line
+            # saying it had worked.
+            routes = [{**r, "dev": device}
+                      for r in ip_json(ip, "-f", family, "route",
+                                       "show", "dev", device)
+                      if r.get("dst")]
+            if routes:
+                snapshot.setdefault(device, {})[family] = routes
+    return snapshot
+
+
+# Scope values ip(8) accepts. Compared against rather than passed through, for
+# the usual reason: this becomes an argument to a command running as root.
+ROUTE_SCOPES = ("global", "link", "host", "site", "nowhere")
+
+
+def route_args(route):
+    """One route from `ip -j` rendered back as `ip route add` arguments.
+
+    None if anything in it is not what it claims to be. Every field is checked
+    rather than passed through: these came from a parser reading the machine's
+    own state, but they are about to be arguments to a root command, and the
+    rule in this project is that such a check lives where the call is.
+
+    `protocol` is deliberately dropped. Re-adding a kernel-proto route as
+    kernel-proto is a claim the kernel put it there, which would be false.
+    """
+    import ipaddress
+
+    dst = route.get("dst")
+    if not dst:
+        return None
+    if dst != "default":
+        try:
+            dst = str(ipaddress.ip_network(dst, strict=False))
+        except ValueError:
+            return None
+    device = route.get("dev")
+    if not device or not C.INTERFACE_RE.match(device):
+        return None
+    args = [dst]
+    gateway = route.get("gateway")
+    if gateway:
+        try:
+            args += ["via", str(ipaddress.ip_address(gateway))]
+        except ValueError:
+            return None
+    args += ["dev", device]
+    scope = route.get("scope")
+    if scope:
+        if scope not in ROUTE_SCOPES:
+            return None
+        args += ["scope", scope]
+    source = route.get("prefsrc")
+    if source:
+        try:
+            args += ["src", str(ipaddress.ip_address(source))]
+        except ValueError:
+            return None
+    metric = route.get("metric")
+    if metric is not None:
+        if not isinstance(metric, int) or not 0 <= metric < 2 ** 32:
+            return None
+        args += ["metric", str(metric)]
+    return args
+
+
+# Candidates for the default route's probe, in documentation space (RFC 5737
+# and RFC 3849). Nothing is ever sent to them -- this is a routing question,
+# not a packet -- and a fixture that is never somebody's machine is the rule
+# everywhere else in this project too. Several, because the *first* one is only
+# a probe of the default route on a machine that has no more specific route
+# covering it, and this cannot know that in advance: it asks.
+DEFAULT_PROBES = ("192.0.2.1", "198.51.100.1", "203.0.113.1")
+DEFAULT_PROBES6 = ("2001:db8::1", "2001:db8:1::1", "2001:db8:2::1")
+
+
+def probe_targets(ip, routes, device, family):
+    """One destination per route, to ask the kernel where it would go.
+
+    The point of the check these feed is narrow: installing a rule must not
+    move anything that was already going somewhere sensible. So the probes are
+    the machine's own routes, asked about one at a time.
+
+    The default route's probe is **chosen by asking**, not fixed. A hardcoded
+    address is only a probe of the default route while nothing more specific
+    covers it -- and on a machine that does route documentation space somewhere
+    (a lab, a blackhole route) the fixed address would quietly test a different
+    route and the default's own behaviour would go unchecked. So candidates are
+    tried until one currently resolves through the device whose table is about
+    to be copied, and if none does, the default simply contributes no probe
+    rather than a misleading one.
+    """
+    import ipaddress
+
+    out = []
+    for route in routes:
+        dst = route.get("dst")
+        if dst == "default":
+            # A candidate inside one of the device's *own* prefixes resolves
+            # through the device by the on-link route, not the default -- it
+            # would look like a valid probe and test the wrong thing. The
+            # prefixes are right here, so they are checked against.
+            covered = []
+            for other in routes:
+                other_dst = other.get("dst")
+                if not other_dst or other_dst == "default":
+                    continue
+                try:
+                    covered.append(ipaddress.ip_network(other_dst, strict=False))
+                except ValueError:
+                    continue
+            pool = DEFAULT_PROBES6 if family == "inet6" else DEFAULT_PROBES
+            for candidate in pool:
+                address = ipaddress.ip_address(candidate)
+                if any(address.version == net.version and address in net
+                       for net in covered):
+                    continue
+                answers = ip_json(ip, "-f", family, "route", "get", candidate)
+                if answers and answers[0].get("dev") == device:
+                    out.append(candidate)
+                    break
+            continue
+        try:
+            out.append(str(ipaddress.ip_network(dst, strict=False).network_address))
+        except (ValueError, TypeError):
+            continue
+    return out
+
+
+def where_would_it_go(ip, destination, source, family):
+    """How the kernel answers "from here, to there" right now, as one string.
+
+    Asked **with** a source, which is the whole point. `ip route get` without
+    one issues a single lookup, and the behaviour this guards against only
+    appears on the second: with the source unspecified the kernel resolves a
+    route, takes the source it implies, and looks up again with that source
+    set -- and it is that second lookup the rules are consulted on. A check
+    that omitted `from` would pass on exactly the configuration it exists to
+    catch.
+    """
+    answers = ip_json(ip, "-f", family, "route", "get", destination,
+                      "from", source)
+    if not answers:
+        return ""
+    first = answers[0]
+    return " ".join(str(first.get(k, "")) for k in ("dev", "gateway", "prefsrc"))
+
+
+def table_is_free(ip, table):
+    """Nothing lives in this table, in either family.
+
+    Checked rather than assumed. A table id already carrying somebody else's
+    routes is the one place a wrong guess here would quietly steal another
+    tool's routing, so it is refused rather than reused.
+    """
+    for family in ("inet", "inet6"):
+        if ip_json(ip, "-f", family, "route", "show", "table", str(table)):
+            return False
+    return True
+
+
+def priority_is_free(ip, priority):
+    """No rule already sits at this priority, in either family."""
+    for family in ("inet", "inet6"):
+        for rule in ip_json(ip, "-f", family, "rule", "show"):
+            if rule.get("priority") == priority:
+                return False
+    return True
+
+
+def tunnel_catch_all(ip, device, family):
+    """A catch-all for the tunnel table, shaped like the tunnel's own routes.
+
+    The tunnel table needs one route that matches everything, because its whole
+    job is to catch replies to peers the main table would have sent elsewhere --
+    copying the gateway's pushed prefixes would catch only the peers already
+    going the right way.
+
+    What that route looks like is **read off the device, not assumed**. A tun
+    device is point-to-point and its routes carry no gateway, so `dev` alone is
+    the correct form -- but that is a property of this tunnel, not a law, and a
+    gateway that does push a next hop would make `dev` alone wrong. So the
+    device is asked, and whatever shape its own routes have is the shape this
+    takes.
+    """
+    for route in ip_json(ip, "-f", family, "route", "show", "dev", device):
+        gateway = route.get("gateway")
+        if gateway:
+            return {"dst": "default", "dev": device, "gateway": gateway}
+    return {"dst": "default", "dev": device}
+
+
+def plan_reply_routing(ip, snapshot, device, addresses,
+                       families=("inet", "inet6")):
+    """What to create: one group per (interface, family), or [] if nothing to do.
+
+    `verify` says whether the group carries a "nothing moves" promise. The
+    uplink groups do -- their table is a faithful copy of the routes the main
+    table already had for that device, so every probe must answer exactly as it
+    did. The tunnel group does not, and must not be held to it: moving replies
+    from the uplink back onto the tunnel is the whole point of it, so a check
+    demanding nothing changed would reject the fix as a regression.
+    """
+    groups = []
+    for uplink, by_family in sorted(snapshot.items()):
+        for family, routes in sorted(by_family.items()):
+            sources = source_addresses(ip, uplink, family)
+            if sources and routes:
+                groups.append({"device": uplink, "family": family,
+                               "routes": routes, "sources": sources,
+                               "verify": True})
+    if device and addresses:
+        for family in families:
+            sources = [a for a in addresses
+                       if (":" in a) == (family == "inet6")]
+            if sources:
+                groups.append({"device": device, "family": family,
+                               "routes": [tunnel_catch_all(ip, device, family)],
+                               "sources": sources, "verify": False})
+    return groups
+
+
+def install_reply_routing(ip, groups, marker):
+    """Create the tables and rules, prove nothing moved, record what was made.
+
+    Returns True if reply routing is now in force. Any failure leaves the
+    machine exactly as it was found: this is an *addition* to a working
+    routing table, and an addition that cannot be made completely is one that
+    is not made at all.
+    """
+    created = []          # (family, table, priority, address) for the manifest
+    tables = []           # (family, table) to flush on the way out
+    table = C.REPLY_TABLE_BASE
+    priority = C.REPLY_RULE_BASE
+    baseline = []
+
+    def undo():
+        for family, tbl, prio, address in reversed(created):
+            run_ip(ip, "-f", family, "rule", "del", "from", address,
+                   "table", str(tbl), "priority", str(prio), quiet=True)
+        for family, tbl in reversed(tables):
+            run_ip(ip, "-f", family, "route", "flush", "table", str(tbl),
+                   quiet=True)
+
+    for group in groups:
+        family, sources = group["family"], group["sources"]
+        while table < C.REPLY_TABLE_BASE + C.REPLY_BAND_SPAN and \
+                not table_is_free(ip, table):
+            table += 1
+        while priority < C.REPLY_RULE_BASE + C.REPLY_BAND_SPAN and \
+                not priority_is_free(ip, priority):
+            priority += 1
+        if table >= C.REPLY_TABLE_BASE + C.REPLY_BAND_SPAN or \
+                priority >= C.REPLY_RULE_BASE + C.REPLY_BAND_SPAN:
+            log("reply routing: no free routing table or rule priority in"
+                f" {C.REPLY_TABLE_BASE}-{C.REPLY_TABLE_BASE + C.REPLY_BAND_SPAN};"
+                " leaving routing alone")
+            undo()
+            return False
+
+        if group["verify"]:
+            for address in sources:
+                for target in probe_targets(ip, group["routes"],
+                                            group["device"], family):
+                    baseline.append((family, address, target,
+                                     where_would_it_go(ip, target, address, family)))
+
+        # All of it or none of it. A half-copied table is the dangerous
+        # shape: it keeps the default route, loses a more-specific one, and
+        # sends traffic that was going straight out the wire to the gateway
+        # instead. Skipping the group quietly is no better -- that is what
+        # made the first version claim success while protecting nothing.
+        rendered = [route_args(route) for route in group["routes"]]
+        if not rendered or any(args is None for args in rendered):
+            log(f"reply routing: could not read {group['device']}'s"
+                f" {family} routes back; leaving routing alone")
+            undo()
+            return False
+        for args in rendered:
+            if not run_ip(ip, "-f", family, "route", "add", *args,
+                          "table", str(table)):
+                log(f"reply routing: could not copy {group['device']}'s"
+                    f" {family} routes; leaving routing alone")
+                undo()
+                return False
+        tables.append((family, table))
+        for address in sources:
+            if run_ip(ip, "-f", family, "rule", "add", "from", address,
+                      "table", str(table), "priority", str(priority)):
+                created.append((family, table, priority, address))
+        table += 1
+        priority += 1
+
+    if not created:
+        undo()
+        return False
+
+    # The effect, not the exit status. Every probe that had an answer before
+    # must have the same answer now: these tables are copies of routes the main
+    # table already had, so anything that moved means the copy was not faithful
+    # -- and an unfaithful copy sends ordinary traffic somewhere it does not
+    # belong, which is the failure this whole project is organised around.
+    for family, address, target, before in baseline:
+        after = where_would_it_go(ip, target, address, family)
+        if before and after != before:
+            log(f"reply routing: {target} from {address} would move"
+                f" ({before!r} -> {after!r}); rolling back and leaving"
+                " routing alone")
+            undo()
+            return False
+
+    try:
+        with open(marker, "w", encoding="utf-8") as handle:
+            for family, tbl, prio, address in created:
+                handle.write(f"{family} {tbl} {prio} {address}\n")
+    except OSError as exc:
+        log(f"reply routing: could not record what was created ({exc});"
+            " rolling back rather than leaving rules nothing will remove")
+        undo()
+        return False
+
+    where = ", ".join(sorted({f"{address} via {group['device']}"
+                              for group in groups
+                              for address in group["sources"]
+                              if any(c[3] == address for c in created)}))
+    log(f"reply routing: {where}; replies leave by the interface their"
+        " request arrived on")
+    return True
+
+
+def remove_reply_routing(ip, marker):
+    """Take away exactly what the manifest says was created, and nothing else.
+
+    Read from the record rather than re-derived. The machine's addresses can
+    change between install and teardown, so a list rebuilt now describes a
+    different machine -- and deleting by pattern is how you remove somebody
+    else's rule. The same discipline as ifindex ownership for the device.
+    """
+    try:
+        with open(marker, encoding="utf-8") as handle:
+            lines = handle.read().splitlines()
+    except OSError:
+        return 0
+    removed = 0
+    seen = set()
+    for line in lines:
+        parts = line.split()
+        if len(parts) != 4:
+            continue
+        family, table, priority, address = parts
+        if family not in ("inet", "inet6") or not table.isdigit() \
+                or not priority.isdigit():
+            continue
+        if run_ip(ip, "-f", family, "rule", "del", "from", address,
+                  "table", table, "priority", priority, quiet=True):
+            removed += 1
+        seen.add((family, table))
+    for family, table in seen:
+        run_ip(ip, "-f", family, "route", "flush", "table", table, quiet=True)
+    try:
+        os.unlink(marker)
+    except OSError:
+        pass
+    return removed
+
+
+# How long to wait for the stock script to finish configuring the tunnel before
+# installing. asuvpn-notify reports the event and *then* execs the real script,
+# so the device exists but is not yet addressed when the event lands. Waiting on
+# the observable condition beats sleeping a guessed interval, and a bound means
+# a script that never finishes costs nothing but this.
+REPLY_READY_TIMEOUT = 10
+REPLY_READY_POLL = 0.25
+
+
+def reply_routing_install(ip, snapshot, device, marker, state,
+                          families=("inet", "inet6")):
+    """Wait for the tunnel to be configured, then install. Own thread.
+
+    The wait is for a fact rather than a duration: the tunnel's address
+    appearing on the tunnel's device is the stock script having done its work,
+    and it is the same thing this needs before it can describe the tunnel in a
+    rule. A device that never gets one simply never arms this; the uplink half
+    would still be worth having, but installing half of a symmetry is how the
+    third failure in DESIGN.md survived the first two being fixed.
+    """
+    deadline = time.monotonic() + REPLY_READY_TIMEOUT
+    addresses = []
+    while time.monotonic() < deadline:
+        links = ip_json(ip, "link", "show", "dev", device)
+        if links and has_carrier(links[0]):
+            addresses = [a for family in families
+                         for a in source_addresses(ip, device, family)]
+            if addresses:
+                break
+        time.sleep(REPLY_READY_POLL)
+    if not addresses:
+        log(f"reply routing: {device} never took an address; leaving routing alone")
+        return
+    groups = plan_reply_routing(ip, snapshot, device, addresses, families)
+    if not groups:
+        log("reply routing: no uplink with a default route was found;"
+            " nothing to do")
+        return
+    if install_reply_routing(ip, groups, marker):
+        state["installed"] = True
 
 
 def verify_teardown(ifname, before, was_killed, owned, dns_on_link=None):
@@ -959,6 +1539,13 @@ def main():
                         help="domains to resolve through the tunnel when the"
                              " gateway names none; empty derives one from"
                              " --host. Omit to leave DNS to vpnc-script")
+    parser.add_argument("--no-ipv6", action="store_true",
+                        help="do not ask the gateway for IPv6 connectivity"
+                             " (openconnect --disable-ipv6)")
+    parser.add_argument("--reply-routing", action="store_true",
+                        help="add routing rules so replies leave by the"
+                             " interface their request arrived on, and remove"
+                             " them with the tunnel")
     parser.add_argument("extra", nargs=argparse.REMAINDER)
     args = parser.parse_args()
 
@@ -1116,6 +1703,16 @@ def main():
             " a server that negotiates it off leaves a dropped tunnel"
             " looking connected")
 
+    # Added here rather than in openconnect_command so it sits beside the DPD
+    # forcing above: both are this program deciding something on the user's
+    # behalf, and both are said out loud for the same reason. Not added twice
+    # if the caller already passed it -- their command line, their choice.
+    if args.no_ipv6 and not any(
+            a == "--disable-ipv6" or a.startswith("--disable-ipv6=")
+            for a in extra):
+        extra = [*extra, "--disable-ipv6"]
+        log("not asking for IPv6: the tunnel will carry IPv4 only")
+
     command = openconnect_command(openconnect, args, extra)
 
     # Announced explicitly rather than left to be parsed out of the command line
@@ -1134,6 +1731,34 @@ def main():
     # Filled in once the device actually appears. Until then there is nothing
     # this session can claim to own, and teardown deletes nothing.
     owned: dict[str, int] = {}
+
+    # Taken here and nowhere else: this is the last moment the routing table is
+    # the one this machine had *without* a tunnel. In a full tunnel the stock
+    # script replaces the default route, so afterwards the pre-tunnel value is
+    # simply gone. Cheap, and skipped entirely when the feature is off or the
+    # session has no channel to trigger the install from.
+    reply = None
+    # With IPv6 off there is no tunnel IPv6 address and no IPv6 route, so an
+    # IPv6 rule would name an address that does not exist and protect a family
+    # that is not carried. One switch, followed rather than second-guessed.
+    reply_families = ("inet",) if args.no_ipv6 else ("inet", "inet6")
+    if args.reply_routing:
+        reply_ip = find_ip()
+        if reply_ip is None:
+            log("reply routing: no 'ip' on this machine; leaving routing alone")
+        elif event_dir is None:
+            log("reply routing: no event channel, so there is no moment to"
+                " install at; leaving routing alone")
+        else:
+            reply = {"ip": reply_ip,
+                     "snapshot": uplink_snapshot(reply_ip,
+                                                 families=reply_families),
+                     "marker": os.path.join(event_dir, C.REPLY_MARKER),
+                     "families": reply_families,
+                     "installed": False, "address": None}
+            if not reply["snapshot"]:
+                log("reply routing: no uplink carries a default route;"
+                    " nothing to protect")
 
     # Handlers go up *before* the spawn. A signal landing between Popen and
     # signal.signal() would take the default action and kill this process,
@@ -1172,7 +1797,8 @@ def main():
     holder["tunnel"] = tunnel
     if events is not None:
         threading.Thread(
-            target=serve_events, args=(events, token, ifname, owned), daemon=True
+            target=serve_events, args=(events, token, ifname, owned, reply),
+            daemon=True
         ).start()
     # Kept as a second, independent source: if the script never fires we still
     # learn the device's identity from the kernel -- but only once the kernel
@@ -1204,6 +1830,15 @@ def main():
         returncode = 128 - returncode
     else:
         log(f"openconnect exited with status {returncode}")
+    # Before verify_teardown, which may delete the device: the tunnel table's
+    # routes go with it, and a rule left pointing at a table that emptied
+    # itself is inert rather than wrong -- but "inert rather than wrong" is the
+    # fallback, not the plan. This is the plan, and it runs on every path out
+    # of here including the one where openconnect had to be killed and its
+    # script never ran at all.
+    if reply is not None and reply.get("installed"):
+        taken = remove_reply_routing(reply["ip"], reply["marker"])
+        log(f"reply routing: {taken} rule(s) removed")
     verify_teardown(ifname, interfaces_before, tunnel.killed,
                     owned.get("ifindex"), dns_owner(event_dir))
     closing.set()  # the socket close below is deliberate, not a failure

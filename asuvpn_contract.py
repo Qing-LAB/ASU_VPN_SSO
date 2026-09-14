@@ -215,6 +215,37 @@ DNS_MARKER = "dns-owner"
 DNS_OWNER_LINK = "link"
 DNS_OWNER_SCRIPT = "script"
 
+# ------------------------------------------------------------ reply routing
+#
+# Written by the helper into its own session directory: exactly which rules and
+# tables it created, so teardown removes those and nothing else. A fact, not an
+# inference -- the machine's addresses can change between install and teardown,
+# and re-deriving the list from a changed machine is how you delete somebody
+# else's rule. The same reasoning as DNS_MARKER above, and the same reasoning
+# as ifindex ownership for the tunnel device.
+REPLY_MARKER = "reply-routing"
+
+# The band this allocates from. Numeric ids are used deliberately: naming a
+# table means writing /etc/iproute2/rt_tables, which is a file this project
+# does not own and which does not exist at all on a stock Ubuntu. Every id and
+# priority is verified free before it is used, and refused rather than reused.
+#
+# The two bands are the same numbers on purpose: rule priority 7710 points at
+# table 7710, so `ip rule` and `ip route show table` can be read against each
+# other without a lookup. Above 0 (local) and far below 32766 (main), which is
+# what makes these rules consulted before the main table and nothing else.
+REPLY_TABLE_BASE = 7710
+REPLY_RULE_BASE = 7710
+# One rule per address, and a machine with more global addresses than this on
+# its uplinks is not the case this was written for. A cap because every rule is
+# walked on every route lookup.
+MAX_REPLY_ADDRESSES = 16
+# How far up from the base to look for a free table or priority. Separate from
+# the address cap, which it was briefly the same number as: one bounds how many
+# addresses get a rule, the other how many ids may be stepped over on the way to
+# a free one. Conflating them means raising either silently changes the other.
+REPLY_BAND_SPAN = 32
+
 # The helper says this when its event thread dies mid-tunnel, and the tray
 # tests for it to re-arm the log-matching fallback. Shared rather than spelled
 # out twice: the helper's sentence promises the tray will fall back, and for a
@@ -413,12 +444,22 @@ def interface_index(name):
 # where it detects resolved. Absolute paths and no PATH lookup: asuvpn-notify
 # calls this as root, in an environment openconnect handed it.
 RESOLVECTL_PATHS = ("/usr/bin/resolvectl", "/bin/resolvectl")
+# ip(8) lives in /usr/sbin on merged-usr distributions and /sbin elsewhere;
+# /usr/bin is where Debian's merged layout actually keeps the binary that the
+# other two symlink to. No PATH fallback, for the same reason resolvectl has
+# none: this is executed as root.
+IP_PATHS = ("/usr/sbin/ip", "/sbin/ip", "/usr/bin/ip", "/bin/ip")
+
 
 # Generous for a call that answers in milliseconds; the point is that there is a
 # bound at all. openconnect waits for the script, so a resolved that has wedged
 # must cost the connection a few seconds rather than hang it -- and the tray
 # must not freeze for longer than that with its menu open.
 RESOLVECTL_TIMEOUT = 5
+# Same bound, same reason, for ip(8). These calls answer in milliseconds; the
+# point is that a wedged one costs the connect a few seconds rather than
+# hanging it.
+IP_TIMEOUT = 5
 
 
 def find_program(name, candidates=(), use_path=False, user_local=False):
@@ -452,6 +493,17 @@ def find_program(name, candidates=(), use_path=False, user_local=False):
         if os.access(fallback, os.X_OK):
             return fallback
     return None
+
+
+def ip_path():
+    """Where ip(8) is, or None if this machine has none.
+
+    Asked by the helper, which runs it as root, and by asuvpn selftest, which
+    checks the answer against the machine. Absent is a real answer rather than
+    an error: reply routing is an addition to routing, and an addition that
+    cannot be made is one that is not made.
+    """
+    return find_program("ip", IP_PATHS)
 
 
 def resolvectl_path():
@@ -685,6 +737,30 @@ SCHEMA = (
             " the server address -- vpn.example.com gives example.com -- which"
             " right wherever the endpoint lives in the domain it serves. What"
             " the gateway does push always wins over both."),
+    Setting("ipv6", "bool", True,
+            "Ask the gateway for IPv6 connectivity. Off passes"
+            " --disable-ipv6 to openconnect, so the tunnel never negotiates"
+            " IPv6 at all: no address, no routes, and nothing of yours pulled"
+            " over it. The reason to turn it off is a network where IPv6 is"
+            " advertised but does not actually work -- the failure is a long"
+            " stall rather than an error, because a client that has an IPv6"
+            " address tries it first and waits for a timeout before falling"
+            " back. Leave it on unless something is actually broken; a tunnel"
+            " that carries IPv6 is the better tunnel where IPv6 works."),
+    Setting("reply-routing", "bool", True,
+            "Send replies back out the way the request came in. Without this,"
+            " a connection that reaches this machine from outside -- forwarded"
+            " to it by a firewall, or arriving over the tunnel itself -- is"
+            " answered through whichever interface the routing table likes for"
+            " the caller's address, which while a tunnel is up is usually the"
+            " wrong one. The reply is then dropped, the caller waits and times"
+            " out, and nothing here looks broken: the tunnel is healthy, its"
+            " routes are exactly what the gateway asked for, and every service"
+            " this machine offers to the outside has silently stopped"
+            " answering. Adds one routing rule per address for the life of the"
+            " tunnel and removes them with it; the main routing table is never"
+            " touched. Turn it off to leave routing entirely to the stock"
+            " vpnc-script."),
     Setting("health-interval", "int", 20,
             "Seconds between checks of the tunnel device and its routes."
             " 0 turns the watchdog off; this file is still re-read at the"

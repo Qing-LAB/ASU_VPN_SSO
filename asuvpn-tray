@@ -2071,6 +2071,27 @@ class VpnTray(StateMachine):
         self.autoreconnect_item.connect("toggled", self._on_autoreconnect_toggled)
         self.menu.append(self.autoreconnect_item)
 
+        # On by default. Named for the operation rather than the benefit: it
+        # does not *make* this machine reachable -- a firewall still has to
+        # forward something to it -- it stops the tunnel breaking the replies
+        # of whatever already was. Claiming the larger thing would be a promise
+        # this cannot keep.
+        self.reply_routing_item = Gtk.CheckMenuItem(
+            label="Send replies back the way they came")
+        self.reply_routing_item.set_active(SETTINGS["reply-routing"])
+        self.reply_routing_item.connect("toggled", self._on_reply_routing_toggled)
+        self.menu.append(self.reply_routing_item)
+
+        # On by default: a tunnel that carries IPv6 is the better tunnel where
+        # IPv6 works. The reason to untick it is a network that advertises
+        # IPv6 and then does not carry it, where the symptom is a long stall
+        # rather than an error -- a client with an IPv6 address tries it first
+        # and waits for a timeout before falling back.
+        self.ipv6_item = Gtk.CheckMenuItem(label="Use IPv6 through the tunnel")
+        self.ipv6_item.set_active(SETTINGS["ipv6"])
+        self.ipv6_item.connect("toggled", self._on_ipv6_toggled)
+        self.menu.append(self.ipv6_item)
+
         self.menu.append(Gtk.SeparatorMenuItem())
 
         quit_item = Gtk.MenuItem(label="Quit")
@@ -2597,6 +2618,14 @@ class VpnTray(StateMachine):
             C.AC_VERSION,
         ]
         command += ["--dpd", str(SETTINGS["dpd"])]
+        if not SETTINGS["ipv6"]:
+            command += ["--no-ipv6"]
+        if SETTINGS["reply-routing"]:
+            # Presence is the switch, like --dns-domains below. The helper does
+            # the work itself rather than asuvpn-notify, because the rules have
+            # to come off even when the script never runs -- which is the whole
+            # of the SIGKILL rung.
+            command += ["--reply-routing"]
         if SETTINGS["dns"]:
             # Presence is the switch. The value may well be empty -- that only
             # says no fallback domain was configured, and the helper derives
@@ -2742,6 +2771,16 @@ class VpnTray(StateMachine):
             item.handler_block_by_func(self._on_autoreconnect_toggled)
             item.set_active(SETTINGS["autoreconnect"])
             item.handler_unblock_by_func(self._on_autoreconnect_toggled)
+        item = self.ipv6_item
+        if item.get_active() != SETTINGS["ipv6"]:
+            item.handler_block_by_func(self._on_ipv6_toggled)
+            item.set_active(SETTINGS["ipv6"])
+            item.handler_unblock_by_func(self._on_ipv6_toggled)
+        item = self.reply_routing_item
+        if item.get_active() != SETTINGS["reply-routing"]:
+            item.handler_block_by_func(self._on_reply_routing_toggled)
+            item.set_active(SETTINGS["reply-routing"])
+            item.handler_unblock_by_func(self._on_reply_routing_toggled)
         if SETTINGS["health-interval"] != self._health_interval:
             self._health_interval = SETTINGS["health-interval"]
             self._schedule_health_check()
@@ -3081,6 +3120,32 @@ class VpnTray(StateMachine):
         self.log("[tray] automatic reconnection "
                  + ("enabled" if item.get_active() else "disabled"))
 
+    def _on_reply_routing_toggled(self, item):
+        try:
+            write_setting("reply-routing", item.get_active())
+        except OSError as exc:
+            self.log(f"[tray] could not change the setting: {exc}")
+            item.handler_block_by_func(self._on_reply_routing_toggled)
+            item.set_active(not item.get_active())
+            item.handler_unblock_by_func(self._on_reply_routing_toggled)
+            return
+        self.log("[tray] reply routing "
+                 + ("enabled" if item.get_active() else "disabled")
+                 + "; takes effect on the next connect")
+
+    def _on_ipv6_toggled(self, item):
+        try:
+            write_setting("ipv6", item.get_active())
+        except OSError as exc:
+            self.log(f"[tray] could not change the setting: {exc}")
+            item.handler_block_by_func(self._on_ipv6_toggled)
+            item.set_active(not item.get_active())
+            item.handler_unblock_by_func(self._on_ipv6_toggled)
+            return
+        self.log("[tray] IPv6 through the tunnel "
+                 + ("enabled" if item.get_active() else "disabled")
+                 + "; takes effect on the next connect")
+
     def _write_autostart(self, enabled):
         if enabled:
             AUTOSTART_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -3241,7 +3306,7 @@ def serve_ipc(tray, server):
 # ------------------------------------------------------------- command line
 
 COMMANDS = ("connect", "disconnect", "reconnect", "status", "log", "tray", "quit",
-            "selftest", "autoreconnect")
+            "selftest", "autoreconnect", "reply-routing", "ipv6")
 
 COMMAND_HELP = """
 commands:
@@ -3302,6 +3367,41 @@ def run_autoreconnect(argv):
         print(f"could not change the setting: {exc}", file=sys.stderr)
         return 1
     print(C.SCHEMA_BY_NAME["autoreconnect"].render(SETTINGS["autoreconnect"]))
+    return 0
+
+
+def run_ipv6(argv):
+    if not argv:
+        print(C.SCHEMA_BY_NAME["ipv6"].render(SETTINGS["ipv6"]))
+        return 0
+    if len(argv) > 1 or argv[0] not in ("on", "off"):
+        print("usage: asuvpn ipv6 [on|off]", file=sys.stderr)
+        return 2
+    try:
+        write_setting("ipv6", argv[0] == "on")
+    except OSError as exc:
+        print(f"could not change the setting: {exc}", file=sys.stderr)
+        return 1
+    print(C.SCHEMA_BY_NAME["ipv6"].render(SETTINGS["ipv6"]))
+    print("takes effect on the next connect", file=sys.stderr)
+    return 0
+
+
+def run_reply_routing(argv):
+    if not argv:
+        print(C.SCHEMA_BY_NAME["reply-routing"].render(SETTINGS["reply-routing"]))
+        return 0
+    if len(argv) > 1 or argv[0] not in ("on", "off"):
+        print("usage: asuvpn reply-routing [on|off]", file=sys.stderr)
+        return 2
+    try:
+        write_setting("reply-routing", argv[0] == "on")
+    except OSError as exc:
+        print(f"could not change the setting: {exc}", file=sys.stderr)
+        return 1
+    print(C.SCHEMA_BY_NAME["reply-routing"].render(SETTINGS["reply-routing"]))
+    if argv[0] == "on":
+        print("takes effect on the next connect", file=sys.stderr)
     return 0
 
 
@@ -3503,6 +3603,10 @@ def main():
     # so a change here takes effect on a running tray with no message passing.
     if argv and argv[0] == "autoreconnect":
         return run_autoreconnect(argv[1:])
+    if argv and argv[0] == "reply-routing":
+        return run_reply_routing(argv[1:])
+    if argv and argv[0] == "ipv6":
+        return run_ipv6(argv[1:])
     if "--" in argv:
         separator = argv.index("--")
         argv, passthrough = argv[:separator], argv[separator + 1 :]

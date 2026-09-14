@@ -295,6 +295,106 @@ def check_interface_names(C, r):
             f"wrongly accepted: {accepted} — these reach 'ip link delete' as root")
 
 
+def check_reply_routing(helper, C, r):
+    """The rules that decide which routes get copied, and how they render.
+
+    Driven against fabricated `ip -j` output rather than the machine, because
+    the interesting cases -- a tun device's operstate, a route with no `dev`,
+    a gateway that is not an address -- are ones this machine does not
+    happen to have today and might on any other.
+    """
+    # A tun device reports operstate UNKNOWN for its whole life. Anything
+    # keying on operstate excludes the one device the tunnel half depends on.
+    tun = {"ifname": "asuvpn0", "operstate": "UNKNOWN",
+           "flags": ["POINTOPOINT", "UP", "LOWER_UP"]}
+    wire = {"ifname": "eno1", "operstate": "UP",
+            "flags": ["BROADCAST", "UP", "LOWER_UP"]}
+    dead = {"ifname": "lxcbr0", "operstate": "DOWN",
+            "flags": ["NO-CARRIER", "BROADCAST", "UP"]}
+    loop = {"ifname": "lo", "operstate": "UNKNOWN",
+            "flags": ["LOOPBACK", "UP", "LOWER_UP"]}
+    r.check("a tun device counts as alive despite operstate UNKNOWN",
+            helper.has_carrier(tun),
+            "operstate is the wrong field; LOWER_UP is the right one")
+    r.check("a live wire counts as alive", helper.has_carrier(wire))
+    r.check("a bridge with no carrier does not", not helper.has_carrier(dead))
+    r.check("loopback is never an uplink", not helper.has_carrier(loop))
+
+    # `ip route show dev X` omits dev. A route that cannot name its device
+    # cannot be rendered, and rendering it anyway would build a broken table.
+    r.check("a route with no device is refused",
+            helper.route_args({"dst": "default", "gateway": "192.0.2.1"}) is None,
+            "this is what `ip route show dev X` actually returns")
+    rendered = helper.route_args({"dst": "default", "gateway": "192.0.2.1",
+                                  "dev": "eno1"})
+    r.check("a default route renders with its gateway and device",
+            rendered == ["default", "via", "192.0.2.1", "dev", "eno1"],
+            f"rendered as {rendered}")
+    onlink = helper.route_args({"dst": "192.0.2.0/24", "dev": "eno1",
+                                "scope": "link", "prefsrc": "192.0.2.10"})
+    r.check("an on-link route keeps its scope and source",
+            onlink == ["192.0.2.0/24", "dev", "eno1", "scope", "link",
+                       "src", "192.0.2.10"],
+            f"rendered as {onlink}. Losing these is how a copied table stops"
+            " being faithful and starts sending on-link traffic to the gateway")
+
+    # Everything here becomes an argument to ip(8) running as root.
+    hostile = [
+        {"dst": "default", "dev": "eno1", "gateway": "--bogus"},
+        {"dst": "default", "dev": "../../etc", "gateway": "192.0.2.1"},
+        {"dst": "not-a-prefix", "dev": "eno1"},
+        {"dst": "default", "dev": "eno1", "scope": "; rm -rf /"},
+        {"dst": "default", "dev": "eno1", "prefsrc": "$(id)"},
+        {"dst": "default", "dev": "eno1", "metric": "1024; sh"},
+    ]
+    accepted = [h for h in hostile if helper.route_args(h) is not None]
+    r.check("a route field that is not what it claims is refused",
+            not accepted,
+            f"wrongly accepted: {accepted} — these reach ip(8) as root")
+
+    # The probe targets the post-install check asks about. `/nonexistent/ip`
+    # makes every query come back empty, which is exactly the "no candidate
+    # resolves through this device" case: the default must then contribute
+    # nothing rather than a probe that tests some other route.
+    routes = [{"dst": "default"}, {"dst": "198.51.100.0/24"}]
+    targets = helper.probe_targets("/nonexistent/ip", routes, "eno1", "inet")
+    r.check("a prefix route always contributes its network address",
+            targets == ["198.51.100.0"], f"got {targets}")
+    r.check("a default route contributes no probe when none can be confirmed",
+            "192.0.2.1" not in targets,
+            "a fixed probe would silently test whatever route happens to cover"
+            " it, leaving the default's own behaviour unchecked")
+
+    # The tunnel's catch-all is read off the device, not assumed. Driven
+    # against fabricated output because this machine's tunnel has no gateway
+    # and the interesting case is the one where it does.
+    plain = helper.tunnel_catch_all("/nonexistent/ip", "asuvpn0", "inet")
+    r.check("a tunnel with no gateway gets a device-only catch-all",
+            plain == {"dst": "default", "dev": "asuvpn0"}, f"got {plain}")
+
+    # The tunnel group must not be held to "nothing moved": moving replies
+    # back onto the tunnel is the whole point of it.
+    snapshot = {"eno1": {"inet": [{"dst": "default", "dev": "eno1"}]}}
+    # A path that cannot exist: every ip(8) query returns empty, so the
+    # uplink group finds no addresses and only the tunnel group is planned --
+    # which is the branch this is about.
+    groups = helper.plan_reply_routing("/nonexistent/ip", snapshot, "asuvpn0",
+                                       ["198.51.100.9"])
+    verified = {g["device"]: g["verify"] for g in groups}
+    r.check("the tunnel group is exempt from the nothing-moved check",
+            verified.get("asuvpn0") is False,
+            f"verify flags: {verified}. Holding the tunnel group to it would"
+            " reject the fix as a regression")
+
+    r.check("the table and rule bands are the same numbers",
+            C.REPLY_TABLE_BASE == C.REPLY_RULE_BASE,
+            "they are meant to be readable against each other")
+    r.check("the rule band sits below the main table's priority",
+            C.REPLY_RULE_BASE + C.MAX_REPLY_ADDRESSES < 32766,
+            "a rule at or above 32766 would be consulted after main,"
+            " which is the same as not being there")
+
+
 def check_option_parsing(helper, r):
     """getopt gives openconnect the *last* occurrence; so must we."""
     argv = ["--interface", "docker0", "-i", "asuvpn3", "--script=/a/b"]
@@ -2722,6 +2822,31 @@ def check_openconnect(helper, r):
     return binary
 
 
+def check_disable_ipv6(binary, r):
+    """The installed openconnect really has --disable-ipv6.
+
+    Asked of the binary rather than remembered, because the `ipv6` setting is
+    the only thing standing between "off" and a tunnel that quietly carries
+    IPv6 anyway. openconnect refuses an unknown option outright, so a flag that
+    has been renamed upstream would turn every connect into a refusal -- and
+    the setting that caused it would be the last place anyone looked.
+    """
+    if not binary:
+        return
+    import subprocess
+    try:
+        done = subprocess.run([binary, "--help"], stdin=subprocess.DEVNULL,
+                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                              timeout=10, check=False)
+    except (OSError, subprocess.SubprocessError) as exc:
+        r.warn("openconnect supports --disable-ipv6", f"could not ask it: {exc}")
+        return
+    text = done.stdout.decode("utf-8", "replace")
+    r.check("openconnect supports --disable-ipv6", "--disable-ipv6" in text,
+            "the `ipv6 = off` setting passes this flag; without it every"
+            " connect with IPv6 turned off would be refused by openconnect")
+
+
 def check_gives_up(helper, r, binary):
     """openconnect stops retrying by itself, which is what arms the rebuild.
 
@@ -4138,6 +4263,7 @@ def main():
         guarded(check_contract, C, r)
         guarded(check_option_blocklist, helper, r)
         guarded(check_interface_names, C, r)
+        guarded(check_reply_routing, helper, C, r)
         guarded(check_option_parsing, helper, r)
         guarded(check_reason_contract, C, r)
         guarded(check_split_dns, C, r)
@@ -4181,6 +4307,7 @@ def main():
         guarded(check_default_script, helper, C, binary, r)
         guarded(check_message_catalogue, tray, binary, r)
         guarded(check_standin_catalogue, binary, r)
+        guarded(check_disable_ipv6, binary, r)
         guarded(check_script_variables, binary, r)
         guarded(check_sso_method, C, r)
         guarded(check_desktop_stack, tray, r)
