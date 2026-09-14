@@ -415,18 +415,18 @@ def serve_events(server, token, ifname, owned, reply=None):
             # than wrong (a rule matching nothing falls through to main), but
             # failing open is still not working, so the address is compared
             # and the rules are rebuilt when it has moved.
-            if reply is not None and address:
-                if reply.get("address") != address:
-                    if reply.get("installed"):
-                        remove_reply_routing(reply["ip"], reply["marker"])
-                        reply["installed"] = False
-                    reply["address"] = address
-                    threading.Thread(
-                        target=reply_routing_install,
-                        args=(reply["ip"], reply["snapshot"],
-                              device or ifname, reply["marker"], reply,
-                              reply["families"]),
-                        daemon=True).start()
+            if reply is not None and address \
+                    and reply.get("address") != address:
+                if reply.get("installed"):
+                    remove_reply_routing(reply["ip"], reply["marker"])
+                    reply["installed"] = False
+                reply["address"] = address
+                threading.Thread(
+                    target=reply_routing_install,
+                    args=(reply["ip"], reply["snapshot"],
+                          device or ifname, reply["marker"], reply,
+                          reply["families"]),
+                    daemon=True).start()
         # Sanitised here rather than trusted from the sender. asuvpn-notify
         # already strips separators, but the rule has to hold where the line is
         # built: a newline in either field ends the line early and the rest
