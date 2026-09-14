@@ -37,7 +37,7 @@ before believing a bug report from your own desktop.
 | Checks | `asuvpn selftest` — three tiers, count in its own summary line; scenario suite in [tests/sandbox](tests/sandbox/README.md), every scenario asserting its outcome |
 | Analysers | ruff, pyflakes, pylint, mypy, bandit, vulture, shellcheck — all clean |
 | Tested against | openconnect v9.12-3.3, Ubuntu, GNOME, ASU's `sslvpn.asu.edu` |
-| Released | `v0.12.0` — the first release with a gate: a tag push runs neither of `checks.yml`'s triggers, so until 0.12.0 the publish could finish before the tests reported, or after they failed. `workflow.yml` now has a `verify` job the publish `needs` |
+| Released | `v0.13.0` — the first release with a gate: a tag push runs neither of `checks.yml`'s triggers, so until 0.12.0 the publish could finish before the tests reported, or after they failed. `workflow.yml` now has a `verify` job the publish `needs` |
 
 **It works.** A real tunnel has been established, run, watched and torn down
 cleanly, with `default route restored:` confirmed on the way out.
