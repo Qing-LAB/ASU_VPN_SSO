@@ -728,15 +728,46 @@ Everything describing the machine is read off the machine:
 | the tunnel device and its addresses | `TUNDEV` and the device itself |
 | whether an interface is alive | its `LOWER_UP` flag |
 | **the tunnel's catch-all route** | **the shape of the tunnel's own routes** |
+| **whether the tunnel's table catches everything at all** | **whether any other interface had a default route for that family** |
 | **the default route's probe** | **whichever candidate currently resolves through that device and is not covered by one of its own prefixes** |
 
-The last two were assumptions first, and are worth naming as the kind of thing
-that hides. The tunnel table needs one route matching everything -- copying the
+These were assumptions first, and are worth naming as the kind of thing that
+hides. The tunnel table wants one route matching everything -- copying the
 gateway's pushed prefixes would catch only the peers already going the right
 way -- and `default dev <tundev>` is correct for a point-to-point device whose
 routes carry no gateway, which every tun device this has met does. That is a
 property of those tunnels, not a law, so the device is asked and whatever shape
 its own routes have is the shape the catch-all takes.
+
+**But a catch-all is only safe while the rule above it can match nothing but a
+reply**, and that is not always true. The rule names the tunnel's address, so
+it catches a packet only when the kernel chose that address as the source --
+which it does for a reply, and *also* for ordinary outbound traffic whenever
+the tunnel holds the only address of that family the machine has. On a home
+network with no IPv6 of its own, the tunnel's IPv6 address is the only one
+there is: every outbound IPv6 connection then matched the rule and was handed
+to a tunnel carrying only the gateway's prefixes, which dropped it in silence.
+
+Silence is the expensive part. An error would have sent the client straight to
+the other family; a black hole costs it the full connect timeout instead, and a
+client holding an address of a family tries that family *first*. So the machine
+did not break, it went slow -- 0.2s of stall per new host in a browser, tens of
+seconds in anything without fallback logic, and only for dual-stack
+destinations, which reads as "some sites are slow" rather than as a routing
+fault. IPv4 escaped it for one reason: there was a second address to source
+from, so the rule saw only replies.
+
+The condition is therefore per family, and detected rather than assumed -- the
+snapshot already answers it, since an interface is in there only because the
+main table had a default route through it for that family. Where another way
+out existed, the table gets the catch-all as before. Where the tunnel is the
+only way out, the table gets **the tunnel's own routes, read off the device**:
+replies to the peers the tunnel really reaches still return through it, and
+anything else finds no route in that table, falls through to main, and fails at
+once -- which is exactly what lets a client give up on that family and use the
+one that works. A family whose device has no routes to mirror contributes no
+group at all, because an empty table aborts the whole install and would take
+the working uplink halves down with it.
 
 The probe was a fixed documentation address, which is a probe of the default
 route only while nothing more specific covers it. On a machine that routes that
@@ -1558,6 +1589,10 @@ breaking the code on purpose:
 | gate the failure scan behind the event latch again | a failure sentence is scrubbed — driven with events latched |
 | map every helper message to NOTE, warnings included | a deliberate event-channel close is silent (its kind-counting half) |
 | silence the no-default-route warning after teardown | a teardown that left no default route says so |
+| always give the tunnel table a catch-all, whatever else the machine routes | a tunnel that is the only way out mirrors its own routes |
+| always mirror, never catch all | a tunnel beside another way out still catches everything |
+| stop restoring `dev` on the mirrored routes | the mirrored routes are read off the device, dev restored |
+| emit a tunnel group with no routes to mirror | a family the tunnel has no routes for is left alone |
 | drop the `preexec_fn` that arms the parent-death signal | `pdeath.sh`: openconnect outlived its dead helper |
 | drop `asuvpn-notify` from the helper's refusal tuple | `sec.sh` (e2): a world-writable notify executed |
 | drop the reconnect verb from the control channel | `watchdog-test.sh`: the nudge was logged but never delivered |

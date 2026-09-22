@@ -295,6 +295,105 @@ def check_interface_names(C, r):
             f"wrongly accepted: {accepted} — these reach 'ip link delete' as root")
 
 
+def check_reply_table_shape(helper, C, r):
+    """The tunnel's reply table catches everything only where it safely can.
+
+    The bug this pins was found live, as slow web browsing. On a home network
+    with no IPv6 of its own the tunnel's address is the *only* global IPv6
+    address the machine has, so the kernel hands it to every outbound IPv6
+    connection -- not just to replies. The source rule therefore matched
+    everything, and the table's catch-all gave the whole IPv6 internet to a
+    tunnel carrying only the gateway's prefixes, which dropped it in silence.
+    A silent drop costs an application its full connect timeout, and a client
+    holding an address of a family tries that family first: measured at 0.2s
+    per new host in a browser and tens of seconds in anything without fallback
+    logic, on dual-stack destinations only -- which reads as "some sites are
+    slow" rather than as a routing fault.
+
+    IPv4 escaped it only because the machine had a second address to source
+    from, and that -- not the family -- is the condition tested here. A v4-only
+    tunnel on a machine with no other v4 route would get the same care.
+    """
+    with tempfile.TemporaryDirectory() as directory:
+        os.chmod(directory, 0o700)
+        stub = os.path.join(directory, "ip")
+        with open(stub, "w", encoding="utf-8") as handle:
+            # Answers route queries the way ip(8) does -- including omitting
+            # `dev`, which the query implies and which the reader has to put
+            # back -- and nothing else, so no address is ever found and only
+            # the tunnel group is planned.
+            handle.write("""#!/usr/bin/python3
+import json, sys
+argv = sys.argv[1:]
+family = argv[argv.index("-f") + 1] if "-f" in argv else "inet"
+if "route" in argv and "show" in argv and "dev" in argv:
+    device = argv[argv.index("dev") + 1]
+    if device == "asuvpn0" and family == "inet6":
+        print(json.dumps([{"dst": "2001:db8:5::/48"},
+                          {"dst": "2001:db8:5:9::/64"}]))
+    elif device == "asuvpn0":
+        print(json.dumps([{"dst": "198.51.100.0/24"}]))
+    else:
+        print(json.dumps([]))
+else:
+    print(json.dumps([]))
+""")
+        os.chmod(stub, 0o700)
+
+        said = []
+        original = helper.log
+        helper.log = said.append
+        try:
+            # The tunnel is the only IPv6 way out: the snapshot has no inet6
+            # uplink, because no other interface had a default route for it.
+            alone = helper.plan_reply_routing(
+                stub, {"eno1": {"inet": [{"dst": "default", "dev": "eno1"}]}},
+                "asuvpn0", ["2001:db8:5:9::ab"], ("inet6",))
+            # Another interface carries IPv6, so ordinary traffic sources from
+            # that one and this rule sees only replies.
+            shared = helper.plan_reply_routing(
+                stub, {"eno1": {"inet6": [{"dst": "default", "dev": "eno1"}]}},
+                "asuvpn0", ["2001:db8:5:9::ab"], ("inet6",))
+            # A family the tunnel carries no routes for contributes no group
+            # at all, rather than an empty table -- an empty one aborts the
+            # whole install and would take the uplink halves down with it.
+            barren = helper.plan_reply_routing(
+                stub, {"eno1": {"inet": [{"dst": "default", "dev": "eno1"}]}},
+                "asuvpn9", ["2001:db8:5:9::ab"], ("inet6",))
+        finally:
+            helper.log = original
+
+    mirrored = [g for g in alone if g["device"] == "asuvpn0"]
+    dsts = [route.get("dst") for g in mirrored for route in g["routes"]]
+    r.check("a tunnel that is the only way out mirrors its own routes",
+            len(mirrored) == 1 and "default" not in dsts
+            and dsts == ["2001:db8:5::/48", "2001:db8:5:9::/64"],
+            f"got {dsts} — a catch-all here matches every outbound connection,"
+            " not just replies, and hands the internet to a tunnel that does"
+            " not carry it")
+    r.check("the mirrored routes are read off the device, dev restored",
+            all(route.get("dev") == "asuvpn0"
+                for g in mirrored for route in g["routes"]),
+            f"got {mirrored} — `ip route show dev X` omits dev, and a route"
+            " that cannot name its device cannot be rendered")
+    r.check("the decision is said out loud in the log",
+            any("only" in line and "inet6" in line for line in said),
+            f"logged {said} — a table shaped differently from the other"
+            " families is exactly the thing a later reader needs told")
+
+    caught = [g for g in shared if g["device"] == "asuvpn0"]
+    r.check("a tunnel beside another way out still catches everything",
+            len(caught) == 1
+            and [x.get("dst") for x in caught[0]["routes"]] == ["default"],
+            f"got {caught} — replies to a peer anywhere need the catch-all,"
+            " and here nothing else can match this rule")
+
+    r.check("a family the tunnel has no routes for is left alone",
+            [g for g in barren if g["device"] == "asuvpn9"] == [],
+            f"got {barren} — an empty table aborts the entire install, so the"
+            " uplink groups would go down with it")
+
+
 def check_reply_routing(helper, C, r):
     """The rules that decide which routes get copied, and how they render.
 
@@ -4305,6 +4404,7 @@ def main():
         guarded(check_option_blocklist, helper, r)
         guarded(check_interface_names, C, r)
         guarded(check_reply_routing, helper, C, r)
+        guarded(check_reply_table_shape, helper, C, r)
         guarded(check_option_parsing, helper, r)
         guarded(check_reason_contract, C, r)
         guarded(check_split_dns, C, r)

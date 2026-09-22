@@ -1334,6 +1334,23 @@ where a set of real destinations would go before and after installing, and if
 anything moved that should not have, it removes everything it added and leaves
 routing alone.
 
+That promise needs one piece of care, because it was briefly broken. The rule
+recognises a reply by the address it carries — so where the tunnel holds the
+*only* address of its kind on the machine, ordinary outbound traffic carries
+that address too and is indistinguishable from a reply. That is the normal case
+for IPv6 on a home connection that has none of its own: every outbound IPv6
+connection matched, and went into a tunnel that does not carry the wider
+internet, where it was dropped silently. Nothing errored; things just took
+seconds to start, and only the sites that have IPv6 at all, which reads as "some
+sites are slow" rather than as a routing problem.
+
+So where the tunnel is the only way out for a family, the applet gives that
+family's rules **only the routes the tunnel actually carries**, read off the
+tunnel itself. Replies still come back the way they arrived, and anything the
+tunnel does not carry now fails immediately instead of hanging — which is what
+lets your browser drop straight to the connection that works. Where you do have
+both, nothing changes.
+
 **If your machine's address changes.** A rule names one literal address — if
 DHCP renews this machine onto a different one, that rule would match nothing
 and you would quietly be back to the broken behaviour. So the applet re-checks

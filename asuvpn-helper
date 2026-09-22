@@ -1057,6 +1057,20 @@ def priority_is_free(ip, priority):
     return True
 
 
+def device_routes(ip, device, family):
+    """Every route the main table has through this device, as installed.
+
+    `dev` is *absent* from each route when ip is asked by device -- the query
+    implies it -- so it is put back, or the route cannot be rendered later and
+    the table is built empty. Read live, never assumed: whatever shape the
+    gateway's own routes have is the shape a copy of them has to take.
+    """
+    return [{**route, "dev": device}
+            for route in ip_json(ip, "-f", family, "route", "show",
+                                 "dev", device)
+            if route.get("dst")]
+
+
 def tunnel_catch_all(ip, device, family):
     """A catch-all for the tunnel table, shaped like the tunnel's own routes.
 
@@ -1101,9 +1115,7 @@ def uplink_routes_now(ip, device, family, snapshotted):
     So: live routes, and the snapshotted default only when the live view has
     lost one.
     """
-    live = [{**route, "dev": device}
-            for route in ip_json(ip, "-f", family, "route", "show", "dev", device)
-            if route.get("dst")]
+    live = device_routes(ip, device, family)
     if any(route.get("dst") == "default" for route in live):
         return live
     return live + [r for r in snapshotted if r.get("dst") == "default"]
@@ -1130,13 +1142,59 @@ def plan_reply_routing(ip, snapshot, device, addresses,
                                "routes": routes, "sources": sources,
                                "verify": True})
     if device and addresses:
+        # Which families already had another way out, asked of the snapshot
+        # rather than assumed: an interface is in there only because the main
+        # table had a default route through it for that family, which is
+        # exactly the property that decides the shape of the tunnel's table.
+        elsewhere = {family for by_family in snapshot.values()
+                     for family in by_family}
         for family in families:
             sources = [a for a in addresses
                        if (":" in a) == (family == "inet6")]
-            if sources:
+            if not sources:
+                continue
+            if family in elsewhere:
+                # Ordinary outbound traffic has another interface to leave by,
+                # so the kernel gives it that interface's address as its source
+                # and this rule -- which names the tunnel's -- never sees it.
+                # Only genuine replies match, and a reply to a peer anywhere
+                # needs the catch-all.
+                routes = [tunnel_catch_all(ip, device, family)]
+            else:
+                # Nothing else carries this family, so the tunnel's address is
+                # the only source the kernel can choose: *every* outbound
+                # connection matches this rule, not just replies. A catch-all
+                # would then hand the whole internet to a tunnel that carries
+                # only the gateway's own prefixes, which drops it in silence --
+                # and silence costs an application its full connect timeout,
+                # while a client holding an address of this family tries that
+                # family first. That is how a working machine goes slow instead
+                # of erroring: dual-stack destinations stall for seconds and
+                # single-stack ones do not, which reads as "some sites are
+                # slow" rather than as a routing fault. Measured at 0.2s per
+                # new host in a browser and tens of seconds in anything without
+                # fallback logic.
+                #
+                # So the table becomes the tunnel's own routes, read off the
+                # device exactly as the gateway installed them. Replies to the
+                # peers this tunnel really reaches still return through it;
+                # anything else finds no route here, falls through to the main
+                # table, and fails at once -- which is what lets a client give
+                # up on this family and use the one that works.
+                routes = device_routes(ip, device, family)
+            if routes:
                 groups.append({"device": device, "family": family,
-                               "routes": [tunnel_catch_all(ip, device, family)],
-                               "sources": sources, "verify": False})
+                               "routes": routes, "sources": sources,
+                               "verify": False})
+                if family not in elsewhere:
+                    log(f"reply routing: {device} is this machine's only"
+                        f" {family} route out, so its table mirrors the"
+                        " tunnel's own routes instead of catching everything:"
+                        " what the tunnel does not carry fails fast rather"
+                        " than stalling")
+            else:
+                log(f"reply routing: {device} has no {family} routes to"
+                    " mirror, so that family is left to the main table")
     return groups
 
 
