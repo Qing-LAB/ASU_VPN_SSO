@@ -2466,11 +2466,32 @@ def check_liveness_probe(tray, r):
             alive is None and bad_alive is None,
             f"empty: alive={alive!r} ({detail});"
             f" unresolvable: alive={bad_alive!r} ({bad_detail})")
-    # RFC 5737 documentation space: it either black-holes or is unreachable.
-    # Either way the one answer it must never give is "alive".
+    # RFC 5737 documentation space: it either black-holes or is unreachable,
+    # so the one answer it must never give is "alive". This is the one check
+    # here whose verdict a network decides -- the two above stage theirs for
+    # exactly that reason -- and a gateway that terminates every outbound
+    # port-53 connection at itself, whatever address it was aimed at, answers
+    # for this one and turns the assertion into a lie about the code. So ask
+    # the same unroutable address on a port nobody redirects: if that one does
+    # not answer either, this network intercepts DNS and the check has no
+    # verdict to give. Said rather than skipped, because probe-port is what
+    # gets the verdict back.
     alive, detail = tray.probe_tunnel("198.51.100.1", 53, 2)
-    r.check("an address that cannot answer is never reported as alive",
-            alive is not True, f"got alive={alive!r} ({detail})")
+    if alive is not True:
+        r.ok("an address that cannot answer is never reported as alive")
+    else:
+        control, control_detail = tray.probe_tunnel("198.51.100.1", 9999, 2)
+        r.warn("an address that cannot answer is never reported as alive",
+               f"port 53 was answered ({detail}), so the assertion cannot be"
+               " made here — "
+               + (f"port 9999 to the same address was not ({control_detail}),"
+                  " which is a transparent DNS proxy: a probe target whose"
+                  " route no longer points through the tunnel can still be"
+                  " answered by the gateway, so set probe-port to one this"
+                  " network does not redirect"
+                  if control is not True else
+                  f"so was port 9999 ({control_detail}), so nothing here is"
+                  " unreachable and no probe-port will see silence"))
 
 
 def check_state_payload(tray, r):
