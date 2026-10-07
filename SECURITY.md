@@ -54,13 +54,16 @@ the only version question with an answer.
   `asuvpn-notify` is reached with an environment the gateway has a hand in,
   never through a polkit dialog;
 - the polkit action, and anything that widens what it authorises;
-- what `bootstrap.sh` fetches and runs: it downloads `uv` only when none is
-  installed, from a pinned release URL, and verifies a SHA-256 recorded in the
-  script before executing it. `uv` then fetches a Python build and
-  `openconnect-sso` with its dependencies from PyPI, and those are **not**
-  pinned by this project (the versions `openconnect-sso` allows are what you
-  get). That is the same trust this project always placed in PyPI; it is named
-  here because the download is new;
+- what `bootstrap.sh` fetches and runs. It does nothing about `uv` unless you
+  ask: with none installed it offers to run `uv`'s official installer
+  (`https://astral.sh/uv/install.sh`, downloaded to a file and run, not piped)
+  or to stop so you can install `uv` yourself. **Nothing is pinned by this
+  project** — not the installer script, not `uv`, not the Python build, not
+  `openconnect-sso` or its dependencies from PyPI (the versions it allows are
+  what you get). The trust is in `astral.sh`, GitHub and PyPI over TLS, and in
+  `uv`'s own checksum checks; the same kind this project always placed in PyPI,
+  now extended to two more hosts. Choosing "install it myself" keeps all of it
+  in your hands;
 - the control socket's uid gate — it is an abstract socket with no file
   permissions, so `SO_PEERCRED` is the only thing between another local
   account and your tunnel;

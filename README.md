@@ -153,7 +153,7 @@ and what it never touches is in
 | Flag | Effect |
 | --- | --- |
 | `--server HOST` | The endpoint for both the launcher and the `asuvpn` command (default `sslvpn.asu.edu`) |
-| `--yes` | Never prompt: accepts the `uv` download. It does not remove a third-party apt source — that needs a typed `y` |
+| `--yes` | Never prompt: if `uv` is missing, runs its official installer. It does not remove a third-party apt source — that needs a typed `y` |
 | `--reset` | Rebuild the sign-in environment from nothing, even if it works |
 | `--no-deps` | Skip the system packages, the extension and the sign-in tool; just install and register the app |
 | `--link` | Run from the checkout instead of copying into `~/.local` |
@@ -499,7 +499,7 @@ an update is applied.)
 | --- | --- | --- | --- |
 | 1. System packages | Installs whichever of the packages below are absent. | system (`apt`, Debian/Ubuntu) | only if one is absent |
 | 2. Tray extension | Enables the AppIndicator extension on GNOME. | one dconf setting in your profile | no |
-| 3. Sign-in tool | Fetches [`uv`](https://docs.astral.sh/uv/) if you have none, then builds `openconnect-sso` on a Python 3.12 that `uv` owns. | `$HOME` only | no |
+| 3. Sign-in tool | Needs [`uv`](https://docs.astral.sh/uv/): uses yours, or — **your choice** — runs uv's official installer, or stops so you can install it yourself. Then builds `openconnect-sso` on a Python 3.12 that `uv` owns. | `$HOME` only | no |
 | 4. The app | `install.sh`: copies the programs, writes the launcher and settings, then runs the self-check. | `$HOME` only | no |
 
 On a distribution without `apt`, step 1 prints what is missing and the command
@@ -526,20 +526,38 @@ missing. **No compiler or build tools are installed**: `lxml` comes as a wheel.
 
 | Path | What | When |
 | --- | --- | --- |
-| `~/.local/bin/uv`, `uvx` | The package manager that builds the sign-in tool. About 35 MB. | Only if there is no `uv` on `PATH` or in `~/.local/bin`. An existing one is used as it is and never replaced. |
+| `~/.local/bin/uv`, `uvx` | The package manager that builds the sign-in tool. About 35 MB. | Only if there is no `uv` on `PATH` or in `~/.local/bin` **and you choose** to let uv's installer run. An existing one is used as it is and never replaced. |
 | `~/.local/share/uv/python/` | A Python 3.12 that `uv` fetched — not your system Python. About 70–110 MB. | Built once; reused. |
 | `~/.local/share/uv/tools/openconnect-sso/` | `openconnect-sso`, its dependencies (Qt6 WebEngine is most of it) and the `setuptools<71` pin. Roughly 340–580 MB. | Built once; rebuilt only if it stops working, or on `--reset`. |
 | `~/.local/bin/openconnect-sso` | Symlink into that environment. | With the environment. |
 | `~/.cache/uv/` | `uv`'s download cache. Up to about 0.5 GB, and shared with anything else you use `uv` for. | `uv cache clean` removes it; nothing here depends on it afterwards. |
 
 **What is downloaded, and from where.** From your distribution's mirrors, the
-packages in step 1. For step 3: `uv` itself from `github.com/astral-sh/uv`
-(about 23 MB, only if you have none) with a SHA-256 that is pinned in
-`bootstrap.sh` and checked before anything runs, so a tampered or truncated
-file is refused; the Python build, which `uv` fetches from its own release
-channel; and `openconnect-sso` and its dependencies from PyPI. `bootstrap.sh`
-asks before downloading `uv`. A machine that cannot reach those hosts can
-install `uv` by hand and the rest follows.
+packages in step 1. For step 3: if you have no `uv` and choose the official
+installer, `https://astral.sh/uv/install.sh`, which in turn fetches `uv` itself
+(about 23 MB) from GitHub and checks it against checksums it carries; then the
+Python build, which `uv` fetches from its own release channel; and
+`openconnect-sso` and its dependencies from PyPI. `bootstrap.sh` never
+downloads `uv` unless you say so, and on a machine that cannot reach those
+hosts you can install `uv` by hand and the rest follows.
+
+**If you have no `uv`, you are asked.** On a terminal:
+
+```
+uv was not found. ...
+  [i]  let this script run uv's official installer (https://astral.sh/uv/install.sh)
+       It installs into ~/.local/bin and edits none of your shell files.
+  [m]  I will install uv myself -- show me how
+Choose [i/m] (default m):
+```
+
+`m` — or just Enter — prints how (the installer one-liner, `pipx install uv`,
+your distribution's package, and the page listing every option) and stops, so
+you can install it your way and re-run. `i` downloads the installer to a file
+(it is not piped into a shell), then runs it with `UV_UNMANAGED_INSTALL` pointed
+at `~/.local/bin`, which makes it install there and nowhere else, edit no shell
+startup file, and leave out its self-updater. With no terminal, the answer is
+`m`; `--yes` is `i`.
 
 **What installing never touches.** `/etc` (the one exception is a stale apt
 source an earlier version added, which it asks about — see
@@ -671,7 +689,7 @@ unless you remove it, because you may use it for other things:
 uv tool uninstall openconnect-sso      # the sign-in environment and its link
 uv python uninstall 3.12               # the Python uv fetched (skip if other uv projects use it)
 uv cache clean                         # uv's download cache (shared with all your uv use)
-rm -f ~/.local/bin/uv ~/.local/bin/uvx # uv itself, only if bootstrap.sh downloaded it
+rm -f ~/.local/bin/uv ~/.local/bin/uvx # uv itself, only if uv's installer put it there at your request
 ```
 
 The apt packages, the AppIndicator GNOME extension, your keyring entries and
@@ -770,9 +788,9 @@ refused afterwards. `sec.sh` case (e3) stages exactly that, with a payload, so
   is confined to `$HOME` and needs no root at all. `bootstrap.sh` is the sole
   exception, and only on the dependency pass: it runs `apt` under `sudo` for
   packages that are absent, and enables the AppIndicator GNOME extension (a
-  dconf setting in your own profile). It downloads `uv` only if you have none,
-  checks it against a SHA-256 pinned in the script before running it, and asks
-  first. It removes a third-party apt source only on a typed `y`, never on
+  dconf setting in your own profile). If you have no `uv` it asks whether to
+  run uv's official installer or leave that to you, and does nothing unless you
+  say so. It removes a third-party apt source only on a typed `y`, never on
   `--yes`. `--no-deps` skips all of it. The full list is under
   [Scope of impact](#scope-of-impact-on-your-system).
 - **Never leaves a privileged process behind.** See
@@ -1698,10 +1716,9 @@ uv tool install --managed-python --python 3.12 \
 ```
 
 `bootstrap.sh` finds `uv` on your `PATH` or in `~/.local/bin` and uses it as it
-is. With none, it asks, then downloads a pinned release from
-`github.com/astral-sh/uv` and checks it against a SHA-256 recorded in the
-script before running it. Everything lands in `$HOME`; nothing is added to the
-system, and no PPA is involved.
+is. With none, it asks you: install it yourself (it shows how), or let uv's
+official installer do it into `~/.local/bin`. Everything lands in `$HOME`;
+nothing is added to the system, and no PPA is involved.
 
 Why this and not apt: an earlier version used Ubuntu's deadsnakes PPA and
 `pipx`. Upgrading to Ubuntu 26.04 removed both and the PPA's source was

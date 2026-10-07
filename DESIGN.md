@@ -241,8 +241,14 @@ interim releases, and the upgrade disables third-party sources besides). So
 `$HOME` (`--managed-python` forbids it from adopting a system one). One tool, with
 a known starting point, in place of a package manager, a PPA and a second
 installer that each had to be right. It also removes the toolchain: `lxml`
-installs from a wheel. The cost is one pinned, checksummed download when `uv`
-is absent, and `uv` itself is never replaced if the user already has one.
+installs from a wheel. The cost is that `uv` must be there. The user decides how: install it their own
+way, or let `uv`'s official installer put it in `~/.local/bin`. An earlier draft
+pinned a release URL and a SHA-256 in `bootstrap.sh` instead. That put the trust
+in this repository, but it was a maintenance trap (constants that go stale), it
+covered only two CPU/libc combinations, and it protected one link of a chain
+whose other links — the Python build, `openconnect-sso` and its dependencies —
+are not pinned either. So nothing is hardcoded now, and an existing `uv` is
+never replaced.
 
 Cleaning up after the old arrangement follows the same instinct. What a previous
 version made is removed only once its replacement is verified — except an

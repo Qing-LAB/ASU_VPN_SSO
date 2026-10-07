@@ -103,6 +103,71 @@ check "--yes never removes a third-party apt source"  test -e "$APT_SOURCES_DIR/
 can_ask() { return 0; }
 retire_legacy 2>&1 | grep -q 'python3.12' && { echo "  FAIL never advise removing python3.12"; FAILED=1; } || echo "  ok   never advises removing python3.12 (it is the system python on 24.04)"
 
+echo "ensure_uv: the user's choice"
+export HOME="$T/uvhome"; mkdir -p "$HOME"
+CURL_LOG="$T/curl.log"; INST_LOG="$T/installer.log"
+reset_uv() { rm -rf "$HOME/.local" "$CURL_LOG" "$INST_LOG"; mkdir -p "$HOME"; }
+# A stand-in for curl that "downloads" an installer which records its
+# environment and makes a uv reporting $FAKE_UV_VERSION.
+# shellcheck disable=SC2329  # called by install_uv_official
+curl() {
+  local out="" url=""
+  while [ $# -gt 0 ]; do case "$1" in -o) out="$2"; shift 2 ;; http*) url="$1"; shift ;; *) shift ;; esac; done
+  echo "$url" >> "$CURL_LOG"
+  cat > "$out" <<INSTEOF
+#!/bin/sh
+echo "UNMANAGED=\$UV_UNMANAGED_INSTALL NOPATH=\$UV_NO_MODIFY_PATH" >> "$INST_LOG"
+mkdir -p "\$UV_UNMANAGED_INSTALL"
+printf '#!/bin/sh\necho "uv %s (fake)"\n' "$FAKE_UV_VERSION" > "\$UV_UNMANAGED_INSTALL/uv"
+chmod +x "\$UV_UNMANAGED_INSTALL/uv"
+INSTEOF
+}
+find_uv() { return 1; }               # a machine with no uv
+FAKE_UV_VERSION=9.9.9
+
+reset_uv; ASSUME_YES=0
+check "no terminal and no --yes: the answer is manual"        test "$(ask_uv_choice </dev/null 2>/dev/null)" = manual
+ASSUME_YES=1
+check "--yes: the answer is install"                          test "$(ask_uv_choice 2>/dev/null)" = install
+ASSUME_YES=0
+
+ask_uv_choice() { echo manual; }
+# shellcheck disable=SC2218  # defined by the sourced bootstrap.sh; stubbed again further down
+( ensure_uv ) >"$T/out.txt" 2>&1; rc=$?
+check "choosing to install it yourself stops the run"         test "$rc" -ne 0
+check "...and tells you how, with the official installer"     grep -q 'astral.sh/uv/install.sh' "$T/out.txt"
+check "...and where every other option is listed"             grep -q 'docs.astral.sh' "$T/out.txt"
+check "...and downloads nothing at all"                       test ! -e "$CURL_LOG"
+
+ask_uv_choice() { echo install; }
+reset_uv
+# shellcheck disable=SC2218  # defined by the sourced bootstrap.sh; stubbed again further down
+( ensure_uv; echo "UV=$UV" > "$T/uvvar.txt" ) >/dev/null 2>&1; rc=$?
+check "choosing the official installer succeeds"              test "$rc" -eq 0
+check "...fetching uv's own installer URL"                    grep -qx 'https://astral.sh/uv/install.sh' "$CURL_LOG"
+check "...into ~/.local/bin, with PATH editing off"           grep -qx "UNMANAGED=$HOME/.local/bin NOPATH=1" "$INST_LOG"
+check "...and uv is where ensure_uv says it is"               grep -qx "UV=$HOME/.local/bin/uv" "$T/uvvar.txt"
+check "...touching no shell startup file"                     test ! -e "$HOME/.bashrc" -a ! -e "$HOME/.profile" -a ! -e "$HOME/.zshrc"
+
+reset_uv; FAKE_UV_VERSION=0.1.0
+# shellcheck disable=SC2218  # defined by the sourced bootstrap.sh; stubbed again further down
+( ensure_uv ) >"$T/out.txt" 2>&1; rc=$?
+check "an installed uv that is too old is refused"            test "$rc" -ne 0
+FAKE_UV_VERSION=9.9.9
+
+reset_uv
+# shellcheck disable=SC2329
+find_uv() { echo "$T/present-uv"; }
+printf '#!/bin/sh\necho "uv 9.9.9"\n' > "$T/present-uv"; chmod +x "$T/present-uv"
+ask_uv_choice() { echo "ASKED" >> "$T/asked.log"; echo install; }
+rm -f "$T/asked.log"
+# shellcheck disable=SC2218  # defined by the sourced bootstrap.sh; stubbed again further down
+( ensure_uv ) >/dev/null 2>&1
+check "a uv that is already there is used without asking"     test ! -e "$T/asked.log"
+check "...and nothing is downloaded"                          test ! -e "$CURL_LOG"
+unset -f curl find_uv ask_uv_choice
+export HOME="$T/home"
+
 echo "ordering: when the old pipx environment goes"
 # A fake uv that records whether the old environment still existed at the
 # moment it was asked to build, then builds a working one.

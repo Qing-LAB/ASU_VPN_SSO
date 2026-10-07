@@ -7,7 +7,7 @@
 #   ./bootstrap.sh                          # install or repair, then register
 #   ./bootstrap.sh --reset                  # rebuild the sign-in environment anyway
 #   ./bootstrap.sh --server vpn.other.edu   # a different endpoint
-#   ./bootstrap.sh --yes                    # never prompt
+#   ./bootstrap.sh --yes                    # never prompt (lets uv's installer run if uv is missing)
 #   ./bootstrap.sh --no-deps                # only install the app, skip packages
 #   ./bootstrap.sh --link                   # run from this checkout, do not copy
 set -euo pipefail
@@ -49,13 +49,12 @@ PY=3.12
 SSO_SPEC='openconnect-sso'
 SETUPTOOLS_PIN='setuptools<71'
 
-# The uv this script fetches only when the machine has none. Pinned, with the
-# checksum of each archive recorded here: the trust is in this file, not in a
-# second download from the same host. Needs UV_MIN or newer when one is found.
-UV_VERSION="0.11.19"
+# What uv must be at least, when the machine already has one. Nothing is pinned
+# beyond that: a uv the user installs, or one from uv's own installer, is taken
+# as it comes.
 UV_MIN="0.5.0"
-UV_SHA256_x86_64="7035608168e106375b36d0c818d537a889c51a8625fe7f8f7cad5e62b947c368"
-UV_SHA256_aarch64="83b13ab184a45b7d9a3b0e4b10eaebd50ad41e66cb16dcce8e60aa7be13ae399"
+UV_INSTALLER_URL="https://astral.sh/uv/install.sh"
+UV_DOCS_URL="https://docs.astral.sh/uv/getting-started/installation/"
 
 # What the applet itself imports, from the *system* python3.
 APT_RUNTIME=(python3-gi gir1.2-gtk-3.0 gir1.2-ayatanaappindicator3-0.1 gir1.2-notify-0.7 openconnect)
@@ -332,11 +331,72 @@ version_at_least() {             # $1 have, $2 need
   [ "$(printf '%s\n%s\n' "$2" "$1" | sort -V | head -1)" = "$2" ]
 }
 
-# One tool, found or fetched into $HOME, so the starting point is known and
+# The user's call, not ours: install uv themselves, or let uv's own installer do
+# it. Prints "install" or "manual" -- the menu goes to stderr so only the word is
+# captured. --yes is the answer for someone who has said not to ask; no terminal
+# without --yes is "manual", because nobody is there to agree.
+ask_uv_choice() {
+  local reply
+  if [ "$ASSUME_YES" -eq 1 ]; then echo install; return 0; fi
+  if [ ! -t 0 ]; then echo manual; return 0; fi
+  {
+    printf '\n'
+    printf '  uv was not found. It builds the sign-in tool (openconnect-sso) on a Python 3.12\n'
+    printf '  of its own, entirely under your home directory.\n\n'
+    printf '    [i]  let this script run uv'"'"'s official installer (%s)\n' "$UV_INSTALLER_URL"
+    printf '         It installs into ~/.local/bin and edits none of your shell files.\n'
+    printf '    [m]  I will install uv myself -- show me how\n\n'
+  } >&2
+  read -r -p "  Choose [i/m] (default m): " reply
+  case "$reply" in [iI]*) echo install ;; *) echo manual ;; esac
+}
+
+uv_manual_instructions() {
+  warn "install uv in whichever way suits this machine, then re-run ./bootstrap.sh:"
+  warn "    curl -LsSf $UV_INSTALLER_URL | sh      # uv's official installer"
+  warn "    pipx install uv                                  # or, if you use pipx"
+  warn "    ...or your distribution's own package, where it has one"
+  warn "  every option: $UV_DOCS_URL"
+  warn "  (--yes lets this script run the official installer for you instead)"
+}
+
+# uv's official installer, fetched to a file first rather than piped into a
+# shell, and pointed at ~/.local/bin with UV_UNMANAGED_INSTALL -- which, per the
+# installer itself, also turns off its edits to shell startup files and its
+# self-updater. It verifies the archive it downloads against checksums it
+# carries; this script adds nothing to that and pins nothing of its own.
+install_uv_official() {
+  local tmp have
+  command -v curl >/dev/null 2>&1 || {
+    command -v apt-get >/dev/null 2>&1 || die "curl is needed to fetch uv's installer; install curl, or install uv yourself ($UV_DOCS_URL)"
+    apt_install_missing curl ca-certificates
+  }
+  tmp="$(mktemp -d)"
+  say "fetching uv's installer from $UV_INSTALLER_URL"
+  if ! curl -fsSL --retry 2 --max-time 120 -o "$tmp/install.sh" "$UV_INSTALLER_URL"; then
+    rm -rf "$tmp"
+    die "could not download $UV_INSTALLER_URL -- is the network up? (a proxy needs https_proxy set)"
+  fi
+  mkdir -p "$HOME/.local/bin"
+  say "running it: uv goes into ~/.local/bin, nothing else on the system is touched"
+  if ! UV_UNMANAGED_INSTALL="$HOME/.local/bin" UV_NO_MODIFY_PATH=1 sh "$tmp/install.sh"; then
+    rm -rf "$tmp"
+    die "uv's installer failed; install uv yourself ($UV_DOCS_URL), then re-run"
+  fi
+  rm -rf "$tmp"
+  UV="$HOME/.local/bin/uv"
+  have="$("$UV" --version 2>/dev/null | awk '{print $2}')" ||
+    die "uv was installed but will not run here; install it another way ($UV_DOCS_URL), then re-run"
+  version_at_least "${have:-0}" "$UV_MIN" ||
+    die "the uv that was installed is $have, older than $UV_MIN; update it ('uv self update'), then re-run"
+  say "uv $have installed in ~/.local/bin"
+}
+
+# One tool, found or installed into $HOME, so the starting point is known and
 # nothing is added to the system. An existing uv is used as it is and never
 # replaced -- it is the user's.
 ensure_uv() {
-  local have triple expect archive url tmp
+  local have
   if UV="$(find_uv)"; then
     have="$("$UV" --version 2>/dev/null | awk '{print $2}')"
     version_at_least "${have:-0}" "$UV_MIN" ||
@@ -344,41 +404,12 @@ ensure_uv() {
     say "uv ${have} ($UV)"
     return 0
   fi
-
-  case "$(uname -m)-$(uname -s)" in
-    x86_64-Linux)  triple=x86_64-unknown-linux-gnu;  expect="$UV_SHA256_x86_64" ;;
-    aarch64-Linux) triple=aarch64-unknown-linux-gnu; expect="$UV_SHA256_aarch64" ;;
-    *) die "no uv build is pinned for $(uname -m); install uv yourself (https://docs.astral.sh/uv/), then re-run" ;;
+  case "$(ask_uv_choice)" in
+    install) install_uv_official ;;
+    *)
+      uv_manual_instructions
+      die "uv is required for the sign-in tool; install it, then re-run." ;;
   esac
-  command -v curl >/dev/null 2>&1 || {
-    command -v apt-get >/dev/null 2>&1 || die "curl is needed to fetch uv; install it, then re-run"
-    apt_install_missing curl ca-certificates
-  }
-  archive="uv-$triple.tar.gz"
-  url="https://github.com/astral-sh/uv/releases/download/$UV_VERSION/$archive"
-  confirm "Download uv $UV_VERSION (~20 MB) from github.com/astral-sh/uv into ~/.local/bin?" ||
-    die "uv is required for the sign-in tool. Install it yourself (https://docs.astral.sh/uv/), then re-run."
-
-  tmp="$(mktemp -d)"
-  say "fetching $archive"
-  if ! curl -fsSL --retry 2 --max-time 180 -o "$tmp/$archive" "$url"; then
-    rm -rf "$tmp"
-    die "could not download $url -- is the network up? (a proxy needs https_proxy set)"
-  fi
-  if [ "$(sha256sum "$tmp/$archive" | awk '{print $1}')" != "$expect" ]; then
-    rm -rf "$tmp"
-    die "$archive does not match the checksum pinned in this script; refusing to run it"
-  fi
-  tar -xzf "$tmp/$archive" -C "$tmp"
-  mkdir -p "$HOME/.local/bin"
-  install -m 0755 "$tmp/uv-$triple/uv" "$tmp/uv-$triple/uvx" "$HOME/.local/bin/"
-  rm -rf "$tmp"
-  UV="$HOME/.local/bin/uv"
-  # The pinned build is glibc. On a musl system the checksum matches, the file
-  # installs, and the first use fails with an error about a missing loader.
-  "$UV" --version >/dev/null 2>&1 ||
-    die "the downloaded uv will not run here (a musl distribution, perhaps); install uv yourself (https://docs.astral.sh/uv/), then re-run"
-  say "uv $UV_VERSION installed in ~/.local/bin"
 }
 
 # ------------------------------------------------------------- openconnect-sso
