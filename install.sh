@@ -271,6 +271,10 @@ if [ -x "$INSTALL_DIR/asuvpn-selftest" ]; then
     echo "self-check passed"
   else
     echo "self-check found problems; run 'asuvpn selftest' for the full report." >&2
-    [ "$STRICT" -eq 1 ] && exit 3
+    # An if, not `[ ... ] && exit 3`: as the last statement of the script, a
+    # false && list is the script's exit status, so without --strict this
+    # exited 1 -- turning an advisory report into a failed install, which broke
+    # the release gate (a bare runner has no openconnect, and that is fine).
+    if [ "$STRICT" -eq 1 ]; then exit 3; fi
   fi
 fi

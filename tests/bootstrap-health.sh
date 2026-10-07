@@ -168,6 +168,27 @@ check "...and nothing is downloaded"                          test ! -e "$CURL_L
 unset -f curl find_uv ask_uv_choice
 export HOME="$T/home"
 
+echo "install.sh: exit status of the closing self-check"
+# The self-check finding problems is advisory by default -- installing before
+# bootstrap.sh has run is a legitimate order, and a bare CI runner has no
+# openconnect -- so it must not turn into a failed install. --strict is how a
+# caller asks for the verdict. Run against a copy whose self-check always fails.
+INSTSRC="$T/instsrc"; mkdir -p "$INSTSRC"
+cp "$HERE"/../asuvpn-tray "$HERE"/../asuvpn-helper "$HERE"/../asuvpn-notify \
+   "$HERE"/../asuvpn_contract.py "$HERE"/../asuvpn.svg "$HERE"/../install.sh "$INSTSRC/"
+printf '#!/bin/sh\nexit 1\n' > "$INSTSRC/asuvpn-selftest"; chmod +x "$INSTSRC/asuvpn-selftest"
+run_install() {                  # $@ = install.sh flags; sets RC
+  rm -rf "$T/ihome"; mkdir -p "$T/ihome"
+  env -i HOME="$T/ihome" PATH="$PATH" bash "$INSTSRC/install.sh" "$@" >/dev/null 2>&1; RC=$?
+}
+run_install
+check "a failing self-check does not fail the install"          test "$RC" -eq 0
+run_install --strict
+check "--strict turns the same failure into exit 3"             test "$RC" -eq 3
+printf '#!/bin/sh\nexit 0\n' > "$INSTSRC/asuvpn-selftest"
+run_install --strict
+check "--strict with a passing self-check is exit 0"            test "$RC" -eq 0
+
 echo "ordering: when the old pipx environment goes"
 # A fake uv that records whether the old environment still existed at the
 # moment it was asked to build, then builds a working one.
