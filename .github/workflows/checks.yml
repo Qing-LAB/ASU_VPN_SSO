@@ -120,7 +120,11 @@ jobs:
 
       - name: the wheel builds, installs, and the installed copy self-checks
         run: |
-          pipx run build
+          # --spec, not the bare name: with uv on PATH (installed above for
+          # openconnect-sso) pipx runs through uv, which refuses `build` because
+          # that package's executable is called pyproject-build. Naming it
+          # works under either backend.
+          pipx run --spec build pyproject-build
           python3 -m venv /tmp/wheel-venv
           /tmp/wheel-venv/bin/pip -q install dist/*.whl
           # A throwaway HOME: the same install.sh the repo ships runs from
