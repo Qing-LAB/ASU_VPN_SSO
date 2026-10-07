@@ -3390,25 +3390,28 @@ def check_desktop_stack(tray, r):
 
 
 def check_sso_environment(tray, sso, r):
-    """The setuptools pin, checked by its effect rather than by its command.
+    """Can openconnect-sso start at all, and is the setuptools pin in effect?
 
-    openconnect-sso imports pkg_resources -- in its sign-in browser process --
-    and current setuptools no longer ships it, so bootstrap.sh pins
-    setuptools<71 inside its venv. That pin silently did
-    nothing for a long time: `pipx inject` skips a package that is already
-    present *without looking at the version*, prints a notice that was being
-    redirected to /dev/null, and returns 0 — so every run reported success while
-    the venv kept a setuptools that breaks sign-in at import time. It needs
-    --force.
+    Two ways it fails to, both silent until a sign-in is attempted. Its
+    environment can be gone: an OS upgrade removes the interpreter the venv was
+    built on and leaves the console script behind, so the file exists and
+    nothing runs -- `ModuleNotFoundError` at the first import. Or the pin: it
+    imports pkg_resources in its sign-in browser process, which current
+    setuptools no longer ships, so bootstrap.sh pins setuptools<71.
 
-    A pin is only observable in its effect, so that is what is checked here.
+    Both are only observable in their effect, so that is what is checked: the
+    environment's own interpreter imports the program and the module. The same
+    question bootstrap.sh asks before deciding whether to rebuild it.
     """
-    name = "openconnect-sso can import pkg_resources"
+    name = "openconnect-sso can start (imports, and pkg_resources is present)"
     python = tray.sso_interpreter(sso)
     if not python or not os.access(python, os.X_OK):
-        r.warn(name, f"could not work out which python runs {sso}")
+        r.fail(name,
+               f"the interpreter behind {sso} is gone or unknown -- an OS upgrade\n"
+               "            does this. Rebuild it: ./bootstrap.sh --reset")
         return
-    probe = ("import pkg_resources, importlib.metadata as m\n"
+    probe = ("import warnings; warnings.simplefilter('ignore')\n"
+             "import openconnect_sso, pkg_resources, importlib.metadata as m\n"
              "print(m.version('setuptools'))\n")
     try:
         out = subprocess.run([python, "-c", probe], stdin=subprocess.DEVNULL,
@@ -3417,11 +3420,12 @@ def check_sso_environment(tray, sso, r):
         r.warn(name, str(exc))
         return
     if out.returncode == 0:
-        r.ok(name, f"setuptools {out.stdout.strip()} in its own venv")
+        r.ok(name, f"setuptools {out.stdout.strip()} in its own environment")
     else:
+        last = (out.stderr.strip().splitlines() or ["no error text"])[-1]
         r.fail(name,
-               "sign-in dies at import. The setuptools pin did not take:\n"
-               "            pipx inject openconnect-sso 'setuptools<71' --force")
+               f"sign-in dies at import ({last}).\n"
+               "            Rebuild it: ./bootstrap.sh --reset")
 
 
 def check_pipx_copy_is_the_running_one(C, r):

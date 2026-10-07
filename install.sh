@@ -4,10 +4,11 @@
 # Nothing is written outside $HOME and no system settings are touched.
 # Dependencies are bootstrap.sh's job.
 #
-#   ./install.sh [--server HOST] [--link]
+#   ./install.sh [--server HOST] [--link] [--strict]
 #
 #   --link   run from this checkout instead of copying into ~/.local, so edits
 #            take effect immediately. The checkout then has to stay put.
+#   --strict exit 3 if the closing self-check fails (default: report, exit 0).
 set -euo pipefail
 
 # Everything below installs into $HOME. Under sudo that is /root, so the whole
@@ -41,6 +42,7 @@ DESKTOP_FILE="$APPS_DIR/asuvpn.desktop"
 # asuvpn_contract.py, and this value must exist before the tray is installed.
 SERVER="sslvpn.asu.edu"
 LINK_MODE=0
+STRICT=0
 REMOVE_STALE_COPY=0
 
 while [ $# -gt 0 ]; do
@@ -48,6 +50,7 @@ while [ $# -gt 0 ]; do
     --server) SERVER="${2:?--server needs a value}"; shift 2 ;;
     --server=*) SERVER="${1#*=}"; shift ;;
     --link) LINK_MODE=1; shift ;;
+    --strict) STRICT=1; shift ;;
     -h|--help) awk 'NR>1 && /^#/ {sub(/^# ?/, ""); print; next} NR>1 {exit}' "${BASH_SOURCE[0]}"; exit 0 ;;
     *) echo "unknown option: $1" >&2; exit 1 ;;
   esac
@@ -268,5 +271,6 @@ if [ -x "$INSTALL_DIR/asuvpn-selftest" ]; then
     echo "self-check passed"
   else
     echo "self-check found problems; run 'asuvpn selftest' for the full report." >&2
+    [ "$STRICT" -eq 1 ] && exit 3
   fi
 fi

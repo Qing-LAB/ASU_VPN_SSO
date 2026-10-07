@@ -43,19 +43,20 @@ jobs:
           grep -q "^$(id -un):" /etc/subgid || \
             echo "$(id -un):200000:65536" | sudo tee -a /etc/subgid
 
-      - name: cache the openconnect-sso venv (lxml compiles from source)
+      - name: cache openconnect-sso and the Python 3.12 uv fetched for it
         uses: actions/cache@v4
         with:
           path: |
-            ~/.local/share/pipx/venvs/openconnect-sso
+            ~/.local/share/uv
             ~/.local/bin/openconnect-sso
-          key: ${{ runner.os }}-openconnect-sso-v1
+          key: ${{ runner.os }}-openconnect-sso-uv-v1
 
       - name: openconnect-sso (enter.sh refuses to stage without the real one)
         run: |
+          command -v uv >/dev/null || pipx install uv
           command -v openconnect-sso >/dev/null || \
-            pipx install --python python3 'openconnect-sso[full]'
-          pipx inject openconnect-sso 'setuptools<71' --force >/dev/null
+            uv tool install --managed-python --python 3.12 \
+              --with 'setuptools<71' openconnect-sso
 
       - name: the headless scenarios
         run: |

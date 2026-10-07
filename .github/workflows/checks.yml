@@ -23,24 +23,29 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             openconnect vpnc-scripts policykit-1 \
             python3-gi gir1.2-gtk-3.0 gir1.2-ayatanaappindicator3-0.1 \
-            gir1.2-notify-0.7 \
-            build-essential libxml2-dev libxslt1-dev zlib1g-dev libffi-dev \
-            libssl-dev pkg-config
+            gir1.2-notify-0.7
 
-      - name: cache the openconnect-sso venv (lxml compiles from source)
+      - name: cache openconnect-sso and the Python 3.12 uv fetched for it
         uses: actions/cache@v4
         with:
           path: |
-            ~/.local/share/pipx/venvs/openconnect-sso
+            ~/.local/share/uv
             ~/.local/bin/openconnect-sso
-          key: ${{ runner.os }}-openconnect-sso-v1
+          key: ${{ runner.os }}-openconnect-sso-uv-v1
 
       - name: openconnect-sso, so the self-test checks a complete install
         run: |
+          # The same command bootstrap.sh runs; uv itself comes from pipx,
+          # which the runner already has. --with is how the pin applies.
+          command -v uv >/dev/null || pipx install uv
           command -v openconnect-sso >/dev/null || \
-            pipx install --python python3 'openconnect-sso[full]'
-          # --force is load-bearing; bootstrap.sh says why at length.
-          pipx inject openconnect-sso 'setuptools<71' --force >/dev/null
+            uv tool install --managed-python --python 3.12 \
+              --with 'setuptools<71' openconnect-sso
+
+      # Hermetic, and the only test of the decision bootstrap.sh makes about a
+      # broken sign-in environment -- the one an OS upgrade leaves behind.
+      - name: bootstrap.sh finds a dead environment and cleans up after the old one
+        run: bash tests/bootstrap-health.sh
 
       - name: the whole self-test, all three tiers
         run: /usr/bin/python3 -I asuvpn-selftest
@@ -109,7 +114,7 @@ jobs:
           pipx run vulture --min-confidence 70 /tmp/asuvpn-lint/*.py
           pipx run mypy --ignore-missing-imports /tmp/asuvpn-lint/*.py
           pipx run --spec shellcheck-py shellcheck -S style \
-            bootstrap.sh install.sh tests/sandbox/*.sh \
+            bootstrap.sh install.sh tests/bootstrap-health.sh tests/sandbox/*.sh \
             tests/sandbox/bin/pkexec tests/sandbox/bin/sso-python \
             tests/sandbox/bin/vpnc-script
 

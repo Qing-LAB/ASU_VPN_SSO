@@ -96,12 +96,13 @@ configuration:
   needs re-running afterwards. The applet itself is plain Python and GTK 3.
 
 > [!NOTE]
-> On a machine that is missing them, `bootstrap.sh` installs around thirty apt
-> packages including a build toolchain, compiles `lxml` from source, may add the
-> deadsnakes PPA for Python 3.12, and enables a GNOME extension. It checks first
-> and installs only what is absent — on a desktop that already has everything it
-> asks for no password — but read [Requirements](#requirements) first if any of
-> that matters to you.
+> On a machine that is missing them, `bootstrap.sh` installs a couple of dozen
+> apt packages and enables a GNOME extension, and — on any distribution — fetches
+> [`uv`](https://docs.astral.sh/uv/) into `~/.local/bin` if you have none, which
+> then builds `openconnect-sso` on its own Python 3.12 under `~/.local/share/uv`.
+> It checks first and installs only what is absent — on a desktop that already
+> has everything it asks for no password — but read
+> [Requirements](#requirements) first if any of that matters to you.
 
 ---
 
@@ -139,15 +140,22 @@ missing before it reaches for `sudo` at all: on a desktop that already has
 everything, it installs nothing and asks for no password. When something *is*
 missing it runs `sudo apt-get update` first, because stale package lists cause
 packages to be silently skipped — so that is the run that asks for `sudo`.
-`--no-deps` skips the dependency half entirely. It asks
-before adding the deadsnakes PPA (see [Requirements](#requirements) for why
-Python 3.12 is needed).
+`--no-deps` skips the dependency half entirely — packages and the sign-in tool
+both.
+
+**It repairs as well as installs.** A broken sign-in environment — the usual
+casualty of an OS upgrade — is detected and rebuilt, and what older versions left
+behind is cleaned up afterwards; see
+[Old installs](#old-installs-detection-and-cleanup). What it installs, where,
+and what it never touches is in
+[What gets installed, and where](#what-gets-installed-and-where).
 
 | Flag | Effect |
 | --- | --- |
 | `--server HOST` | The endpoint for both the launcher and the `asuvpn` command (default `sslvpn.asu.edu`) |
-| `--yes` | Never prompt, including for the PPA |
-| `--no-deps` | Skip system packages, just install and register the app |
+| `--yes` | Never prompt: accepts the `uv` download. It does not remove a third-party apt source — that needs a typed `y` |
+| `--reset` | Rebuild the sign-in environment from nothing, even if it works |
+| `--no-deps` | Skip the system packages, the extension and the sign-in tool; just install and register the app |
 | `--link` | Run from the checkout instead of copying into `~/.local` |
 
 **There is no credential step.** Signing in happens in your browser, on ASU's
@@ -185,7 +193,7 @@ asuvpn-bootstrap                # system packages, then the app
 ```
 
 `asuvpn-bootstrap` is `bootstrap.sh` — the same apt packages, the same
-`openconnect-sso` on Python 3.12, the same GNOME extension — and it finishes by
+`openconnect-sso` on Python 3.12 (via `uv`), the same GNOME extension — and it finishes by
 running the user-half install itself, so that is the only command you need.
 
 **Run it as yourself, not with `sudo`.** It asks for `sudo` where it needs it,
@@ -207,8 +215,8 @@ do is the part no wheel can carry — the GTK bindings, `openconnect`, `pkexec`,
 the GNOME tray extension are apt packages and a shell extension, not Python
 distributions. On Ubuntu/Debian one line covers the minimum
 (`asuvpn-bootstrap` installs all of this except `vpnc-scripts`, which apt
-pulls in behind `openconnect` as a Recommends, plus the Python 3.12 story in
-[Requirements](#requirements)):
+pulls in behind `openconnect` as a Recommends, plus the sign-in tool described
+in [Requirements](#requirements)):
 
 ```bash
 sudo apt install openconnect vpnc-scripts policykit-1 python3-gi \
@@ -472,10 +480,87 @@ use, so it also catches the case where `install.sh` was re-run with a new
 
 ## What gets installed, and where
 
-Everything lands in your home directory — the program under `~/.local`, your
-settings under `~/.config/asuvpn`. Nothing is written outside `$HOME`, no
-system files are touched, and no part of the installation needs root. The
-program is **copied**, so the checkout can be moved or deleted afterwards.
+Installing has two halves with very different reach. **The system half** —
+packages and a GNOME extension — is the only part that touches anything outside
+your home directory, it is the only part that needs `sudo`, and it is skipped
+by `--no-deps`. (The one other system-level act, removing a stale apt source an
+earlier version added, happens only if you type `y`.) **The user half** — the sign-in tool and the app itself —
+lives entirely under `$HOME` and needs no privileges at all.
+
+### How a run goes
+
+`./bootstrap.sh` asks the machine what is wrong and fixes only that, in this
+order. Each step is skipped when there is nothing to do, and a run on a machine
+that is already fine installs no dependency, downloads nothing, and asks for no
+password. (Step 4 always runs: it refreshes the app's files, which is also how
+an update is applied.)
+
+| Step | What it does | Reach | Asks for `sudo`? |
+| --- | --- | --- | --- |
+| 1. System packages | Installs whichever of the packages below are absent. | system (`apt`, Debian/Ubuntu) | only if one is absent |
+| 2. Tray extension | Enables the AppIndicator extension on GNOME. | one dconf setting in your profile | no |
+| 3. Sign-in tool | Fetches [`uv`](https://docs.astral.sh/uv/) if you have none, then builds `openconnect-sso` on a Python 3.12 that `uv` owns. | `$HOME` only | no |
+| 4. The app | `install.sh`: copies the programs, writes the launcher and settings, then runs the self-check. | `$HOME` only | no |
+
+On a distribution without `apt`, step 1 prints what is missing and the command
+to install it instead of running anything, and steps 3 and 4 still run — they
+need no distribution knowledge. Whatever the platform, the run ends by
+reporting the self-check's verdict: **"done" means `asuvpn selftest` passed**,
+and anything else says so and exits non-zero.
+
+### Scope of impact on your system
+
+**Packages (step 1, apt only, only the ones that are absent).** The applet's
+bindings — `python3-gi`, `gir1.2-gtk-3.0`, `gir1.2-ayatanaappindicator3-0.1`,
+`gir1.2-notify-0.7` — plus `openconnect`; the libraries the sign-in window loads
+at run time — `libnss3`, `libxcomposite1`, `libxdamage1`, `libxrandr2`,
+`libxkbcommon-x11-0`, `libxcb-cursor0`, `libgl1`, `libegl1`, `libxtst6`,
+`libdbus-1-3`, `fontconfig`, `libasound2t64` (or `libasound2`); `pkexec` if
+there is none; and the GNOME AppIndicator extension if GNOME lacks one. `apt`
+then adds whatever those depend on. On a desktop most of this is already
+present, so the usual install is a handful of packages or none. `curl` and
+`ca-certificates` are added only if `uv` has to be downloaded and `curl` is
+missing. **No compiler or build tools are installed**: `lxml` comes as a wheel.
+
+**Under `$HOME`, outside the app (step 3).**
+
+| Path | What | When |
+| --- | --- | --- |
+| `~/.local/bin/uv`, `uvx` | The package manager that builds the sign-in tool. About 35 MB. | Only if there is no `uv` on `PATH` or in `~/.local/bin`. An existing one is used as it is and never replaced. |
+| `~/.local/share/uv/python/` | A Python 3.12 that `uv` fetched — not your system Python. About 70–110 MB. | Built once; reused. |
+| `~/.local/share/uv/tools/openconnect-sso/` | `openconnect-sso`, its dependencies (Qt6 WebEngine is most of it) and the `setuptools<71` pin. Roughly 340–580 MB. | Built once; rebuilt only if it stops working, or on `--reset`. |
+| `~/.local/bin/openconnect-sso` | Symlink into that environment. | With the environment. |
+| `~/.cache/uv/` | `uv`'s download cache. Up to about 0.5 GB, and shared with anything else you use `uv` for. | `uv cache clean` removes it; nothing here depends on it afterwards. |
+
+**What is downloaded, and from where.** From your distribution's mirrors, the
+packages in step 1. For step 3: `uv` itself from `github.com/astral-sh/uv`
+(about 23 MB, only if you have none) with a SHA-256 that is pinned in
+`bootstrap.sh` and checked before anything runs, so a tampered or truncated
+file is refused; the Python build, which `uv` fetches from its own release
+channel; and `openconnect-sso` and its dependencies from PyPI. `bootstrap.sh`
+asks before downloading `uv`. A machine that cannot reach those hosts can
+install `uv` by hand and the rest follows.
+
+**What installing never touches.** `/etc` (the one exception is a stale apt
+source an earlier version added, which it asks about — see
+[Old installs](#old-installs-detection-and-cleanup)); systemd units; the
+network, DNS or firewall configuration; kernel modules; `sudoers`; any polkit
+policy or rule — it installs none, and `pkexec` uses the distribution's stock
+action; your shell's startup files (earlier versions ran `pipx ensurepath`,
+which edits `~/.bashrc`; this does not, and says if `~/.local/bin` is not on
+your `PATH`); your system Python and every other Python environment you have.
+
+**Connecting is a different matter.** The *install* changes none of the
+network state above; *connecting* does — routes, policy-routing rules and the
+DNS settings of the tunnel's own link, while it is up — and all of it is
+undone on disconnect. That is
+what the root helper is for, and [Putting the network back](#putting-the-network-back)
+covers it.
+
+### The app itself
+
+The program is **copied**, so the checkout can be moved or deleted afterwards.
+Everything in this table lands under `$HOME`:
 
 | Path | What it is |
 | --- | --- |
@@ -506,9 +591,6 @@ Runtime state lives elsewhere, and is created on demand:
 | `~/.config/autostart/asuvpn-tray.desktop` | Written only when you tick "Start on login (applet only)" |
 | abstract socket `asuvpn-tray-$UID` | Single-instance guard and CLI channel; peer uid is checked, and it vanishes with the process |
 
-Separately, `bootstrap.sh` installs system packages with `apt`, and installs
-`openconnect-sso` into its own pipx venv under `~/.local/share/pipx/`.
-
 **Installing from PyPI lands in exactly the same places.** `pipx install
 asuvpn` only puts the wheel in a pipx venv of its own
 (`~/.local/share/pipx/venvs/asuvpn/`); nothing there is the app. Running
@@ -537,6 +619,30 @@ take effect immediately. The checkout then has to stay where it is.
 ./bootstrap.sh --link
 ```
 
+### Old installs: detection and cleanup
+
+Re-running `bootstrap.sh` is also the repair. The sign-in tool is judged by
+whether it **works** — whether `openconnect-sso` and `pkg_resources` import —
+not by whether a file with its name exists. That distinction is the whole
+point: an OS upgrade that removes the Python an environment was built on leaves
+the console script behind, so a check for the file reports "all present" over
+an install that dies at its first import. This is not hypothetical; upgrading
+to Ubuntu 26.04 did exactly that to a `pipx` environment on Python 3.12, and
+`asuvpn selftest` is the same question asked afterwards.
+
+| Found | What it does |
+| --- | --- |
+| A working `openconnect-sso`, whoever made it | Leaves it alone. Not even `uv` is downloaded to find that out. |
+| A broken one | Rebuilds it with `uv`, no password needed. |
+| `--reset` | Rebuilds it regardless, from nothing. |
+| An old `pipx` environment for `openconnect-sso`, **already broken** | Removed *before* the rebuild — there is nothing in it to lose. `pipx uninstall` is used if `pipx` is still there, because the link it removes is still its own. |
+| An old `pipx` environment that **still works** (only possible with `--reset`) | Removed *after* the replacement has been verified, so a failed rebuild cannot leave you with neither. Only the directory goes; `pipx` is not asked to unlink anything, since that name now belongs to `uv`'s script. |
+| The deadsnakes apt source an earlier version added | Listed, and removed only if you answer `y` at the prompt. `--yes` does **not** answer it — it may be serving other Pythons of yours — and with no terminal it is left, with the `sudo rm` command printed. |
+| `pipx`, `python3.12`, a compiler | Left alone. `pipx` is named if still installed. `python3.12` is not even suggested for removal: on Ubuntu 24.04 it is the system Python. |
+
+A working install from an earlier version is therefore **not migrated** unless
+you ask: `./bootstrap.sh --reset` moves it to `uv` and cleans up behind it.
+
 ## Removing it
 
 ```bash
@@ -558,10 +664,20 @@ where it lives in both cases. If you installed from PyPI, `pipx uninstall
 asuvpn` removes the delivery wheel as well; on its own it would leave the
 installed copy above running, since that is a copy and not a link.
 
-It deliberately leaves the things it did not own: `openconnect-sso`
-(`pipx uninstall openconnect-sso`), the apt packages, the deadsnakes PPA, the
-AppIndicator GNOME extension, your keyring entries, and any polkit rule you
-added by hand.
+That is the app. What `bootstrap.sh` set up around it is separate, and is left
+unless you remove it, because you may use it for other things:
+
+```bash
+uv tool uninstall openconnect-sso      # the sign-in environment and its link
+uv python uninstall 3.12               # the Python uv fetched (skip if other uv projects use it)
+uv cache clean                         # uv's download cache (shared with all your uv use)
+rm -f ~/.local/bin/uv ~/.local/bin/uvx # uv itself, only if bootstrap.sh downloaded it
+```
+
+The apt packages, the AppIndicator GNOME extension, your keyring entries and
+any polkit rule you added by hand are also left. Remove the packages with
+`apt` if nothing else on the machine needs them; the lists are under
+[What gets installed, and where](#what-gets-installed-and-where).
 
 ## Security
 
@@ -652,9 +768,13 @@ refused afterwards. `sec.sh` case (e3) stages exactly that, with a payload, so
   cookie header, no longer leaks it.
 - **Never modifies system files or settings — at run time.** Installing the app
   is confined to `$HOME` and needs no root at all. `bootstrap.sh` is the sole
-  exception, and only on the dependency pass: it runs `apt` under `sudo`, asks
-  before adding the deadsnakes PPA, and enables the AppIndicator GNOME extension
-  (a dconf setting in your own profile). `--no-deps` skips all of it.
+  exception, and only on the dependency pass: it runs `apt` under `sudo` for
+  packages that are absent, and enables the AppIndicator GNOME extension (a
+  dconf setting in your own profile). It downloads `uv` only if you have none,
+  checks it against a SHA-256 pinned in the script before running it, and asks
+  first. It removes a third-party apt source only on a typed `y`, never on
+  `--yes`. `--no-deps` skips all of it. The full list is under
+  [Scope of impact](#scope-of-impact-on-your-system).
 - **Never leaves a privileged process behind.** See
   [the control pipe](#the-control-pipe).
 
@@ -1558,7 +1678,7 @@ and CI runs the portable half on 3.10, 3.11 and 3.12+ on every push to
 `main` and every pull request, so the
 claim is tested rather than asserted. Note this is a *different* requirement
 from the Python 3.12 `openconnect-sso` needs below: that one lives in its own
-pipx venv and the applet never runs on it.
+environment and the applet never runs on it.
 
 Also needed: `openconnect`, `pkexec`, and the GNOME AppIndicator extension
 (`gnome-shell-ubuntu-extensions`) — without the extension GNOME has nowhere to
@@ -1567,37 +1687,44 @@ draw a tray icon.
 ### openconnect-sso needs Python 3.12
 
 This is the fiddly part. `openconnect-sso` pins `lxml <5` and
-`PyQt6-WebEngine <7`, and neither publishes wheels for Python 3.13+. Ubuntu
-26.04 ships only 3.14, so 3.12 has to come from the deadsnakes PPA, and `lxml`
-compiles from source, which needs a toolchain and headers:
+`PyQt6-WebEngine <7`, and neither publishes wheels for Python 3.13+, which is
+what current Ubuntu, Fedora and Arch ship. So it runs on a Python 3.12 of its
+own, and **[`uv`](https://docs.astral.sh/uv/) provides it** — the one tool
+`bootstrap.sh` uses for this, on every distribution:
 
 ```bash
-sudo add-apt-repository ppa:deadsnakes/ppa
-sudo apt install python3.12 python3.12-venv python3.12-dev \
-                 build-essential libxml2-dev libxslt1-dev zlib1g-dev \
-                 libffi-dev libssl-dev pkg-config
-pipx install --python /usr/bin/python3.12 'openconnect-sso[full]'
-pipx inject openconnect-sso 'setuptools<71' --force
+uv tool install --managed-python --python 3.12 \
+    --with 'setuptools<71' openconnect-sso
 ```
 
-Three details that are easy to miss:
+`bootstrap.sh` finds `uv` on your `PATH` or in `~/.local/bin` and uses it as it
+is. With none, it asks, then downloads a pinned release from
+`github.com/astral-sh/uv` and checks it against a SHA-256 recorded in the
+script before running it. Everything lands in `$HOME`; nothing is added to the
+system, and no PPA is involved.
 
-- The **`[full]` extra** pulls in keyring support.
+Why this and not apt: an earlier version used Ubuntu's deadsnakes PPA and
+`pipx`. Upgrading to Ubuntu 26.04 removed both and the PPA's source was
+disabled, leaving an environment on disk whose interpreter no longer existed —
+and a bootstrap that, finding the file, reported nothing to do. An environment
+in `$HOME` on an interpreter `uv` owns is not something an upgrade touches.
+
+Details that are easy to miss:
+
+- `--managed-python` means an interpreter `uv` fetched, never a system
+  `python3.12` — a half-removed one is how the failure above happened.
 - The **`setuptools<71` pin** matters. `openconnect-sso` imports
   `pkg_resources` — in its sign-in browser process, to load the `user.js` it
-  injects — and current setuptools no longer ships that module. Measured on
-  this machine: setuptools `78.1.1` still has `pkg_resources`, `83.0.0` does
-  not. So `<71` is a **known-good pin, not the exact boundary**; it is the
-  bound that has been made to work end to end, which is why it is not relaxed.
-- **`--force` on that inject is not optional.** `pipx` decides whether a
-  package is already injected with a version-blind test — it asks only whether
-  *some* `setuptools` is present, and one always is. Without `--force` it prints
-  "already seems to be injected", installs nothing, and **still exits 0**, so
-  the pin silently never applies and the venv keeps a `setuptools` that breaks
-  sign-in at import. `asuvpn selftest` checks the pin by its effect, not by
-  that exit status.
+  injects — and current setuptools no longer ships that module. Measured:
+  setuptools `78.1.1` still has it, `83.0.0` does not. So `<71` is a
+  **known-good pin, not the exact boundary**. `--with` makes the pin part of the
+  install, which `pipx inject` did not: it skipped the package whenever *any*
+  `setuptools` was present, printed a notice, and still exited 0.
+  `asuvpn selftest` checks the result by importing, not by trusting a command.
+- There is no `[full]` extra on current releases; keyring support is a hard
+  dependency. `lxml` installs from a wheel, so **no compiler is needed**.
 
-Qt6 WebEngine also dlopens a set of shared libraries for the sign-in window
+Qt6 WebEngine dlopens a set of shared libraries for the sign-in window
 (`libnss3`, `libxcomposite1`, `libxdamage1`, `libxrandr2`, `libxkbcommon-x11-0`,
 `libxcb-cursor0`, `libgl1`, `libegl1`, `libxtst6`, `libdbus-1-3`, `fontconfig`).
 `libxcb-cursor0` is the one people hit on X11 sessions.
@@ -1638,7 +1765,7 @@ teardown, and logged precisely so a declined action never reads as a hang.
 | `keyring did not answer` | The login keyring is locked, so the probe timed out rather than risk a blank answer being saved as your password. Unlock the keyring and connect again. |
 | `authorization cancelled` | The polkit dialog was dismissed, or the password was wrong. Run `asuvpn connect` again. |
 | No icon in the panel | `gnome-extensions enable ubuntu-appindicators@ubuntu.com` |
-| `asuvpn: command not found` | `~/.local/bin` is not on your `PATH`. Add it, or run `pipx ensurepath` and open a new terminal. |
+| `asuvpn: command not found` | `~/.local/bin` is not on your `PATH`. Add it to your shell's startup file and open a new terminal. |
 | The sign-in window never appears | That is `openconnect-sso`, not this applet. Run `openconnect-sso --server sslvpn.asu.edu --authenticate=shell` to see the real error. |
 | `could not load the Qt platform plugin "xcb"` | Missing `libxcb-cursor0`. Re-run `./bootstrap.sh`. |
 | Log stops at `signed in, starting openconnect` | The polkit dialog never appeared. Check that a polkit agent is running, and that you are in the `sudo` group. |
@@ -1647,7 +1774,7 @@ teardown, and logged precisely so a declined action never reads as a hang.
 | `refusing --background` / `refusing -bv` | That option would detach `openconnect` from the helper, leaving a root process nothing can stop. Drop it; write bundled short options separately (`-i lo`, not `-ilo`). |
 | `[helper] WARNING … is not executable, so openconnect's own default script is left in place` | The `vpnc-script` this system uses could not be found, so state falls back to reading `openconnect`'s output. Routing is unaffected. Install `vpnc-scripts`. |
 | `Script … returned error 127` | The `vpnc-script` failed, so routes and DNS were never configured. Install `vpnc-scripts`, then `asuvpn selftest`. |
-| `ModuleNotFoundError: No module named 'pkg_resources'` | The `setuptools<71` pin did not take. `pipx inject openconnect-sso 'setuptools<71' --force` — the `--force` is what makes it apply. |
+| `ModuleNotFoundError: No module named 'pkg_resources'` | The sign-in environment is broken or its `setuptools` pin is not in effect. `./bootstrap.sh --reset` rebuilds it, and `asuvpn selftest` names which. |
 | Badge says **not carrying traffic** | The watchdog found the tunnel device or its routes gone, or nothing answering through it. It has already nudged `openconnect` once; `asuvpn log` says what it saw. If it does not recover, the automatic sign-in fires (unless turned off) — or `asuvpn reconnect` yourself. |
 | Badge says **DNS not configured** | The resolver the VPN pushed is no longer on the tunnel's link, so internal names resolve to whatever public DNS says. The applet asks `openconnect` to re-establish, which reconfigures it. `resolvectl dns asuvpn0` shows the live state. |
 | `ssh` to an internal host hangs while the VPN is up | The name is resolving to a public address instead of the internal one — `resolvectl query <host>` says which, and `resolvectl dns asuvpn0` says whether the VPN's resolver is on the link. If it is empty, `asuvpn log` will say why the handover did not take. With `dns = off` this is the stock `vpnc-script` behaviour and is expected to come back. |
@@ -1670,6 +1797,7 @@ teardown, and logged precisely so a declined action never reads as a hang.
 | [`bootstrap.sh`](bootstrap.sh) | Installs dependencies, then calls `install.sh`. |
 | [`install.sh`](install.sh) | Copies the app into `~/.local` and registers it. No system changes. |
 | [`asuvpn.svg`](asuvpn.svg) | App icon. |
+| [`tests/bootstrap-health.sh`](tests/bootstrap-health.sh) | Hermetic test of the decisions `bootstrap.sh` makes: is the sign-in tool broken, and what is cleaned up, and in what order. No network, no `sudo`. |
 | [`tests/sandbox/`](tests/sandbox/README.md) | Scenario tests: the real programs run whole lifetimes against stand-ins, in a namespace. |
 | [`IMPLEMENTATION_GUIDE.md`](IMPLEMENTATION_GUIDE.md) | Read before changing anything: what is proven and what is only believed, the traps, and the lessons each bug paid for. |
 | [`ruff.toml`](ruff.toml) | Lint config. Its `ignore` list records which rules are off and why. |
@@ -1752,7 +1880,7 @@ pylint --disable=all --enable=E --ignored-modules=gi,gi.repository /tmp/asuvpn-l
 bandit -q -r /tmp/asuvpn-lint -ll
 vulture --min-confidence 70 /tmp/asuvpn-lint/*.py
 mypy --ignore-missing-imports /tmp/asuvpn-lint/*.py
-shellcheck -S style bootstrap.sh install.sh tests/sandbox/*.sh \
+shellcheck -S style bootstrap.sh install.sh tests/bootstrap-health.sh tests/sandbox/*.sh \
            tests/sandbox/bin/pkexec tests/sandbox/bin/sso-python \
            tests/sandbox/bin/vpnc-script
 ```

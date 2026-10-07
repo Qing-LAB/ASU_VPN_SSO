@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
-# One-shot setup for the ASU VPN tray applet on a fresh Ubuntu system.
-# Safe to re-run; anything already satisfied is skipped, except the setuptools
-# pin and the PATH check, which run every time on purpose — their comments say
-# why.
+# Setup, and repair, for the ASU VPN tray applet. Safe to re-run: it asks the
+# machine what is wrong and fixes only that. The sign-in tool is judged by
+# whether it *works*, not by whether a file with its name exists, so an OS
+# upgrade that leaves a dead environment behind is found and rebuilt.
 #
-#   ./bootstrap.sh                          # install everything, then register
+#   ./bootstrap.sh                          # install or repair, then register
+#   ./bootstrap.sh --reset                  # rebuild the sign-in environment anyway
 #   ./bootstrap.sh --server vpn.other.edu   # a different endpoint
-#   ./bootstrap.sh --yes                    # never prompt (adds the PPA silently)
+#   ./bootstrap.sh --yes                    # never prompt
 #   ./bootstrap.sh --no-deps                # only install the app, skip packages
 #   ./bootstrap.sh --link                   # run from this checkout, do not copy
 set -euo pipefail
@@ -15,6 +16,7 @@ SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SERVER="sslvpn.asu.edu"
 INSTALL_DEPS=1
 ASSUME_YES=0
+RESET=0
 INSTALL_ARGS=()
 NEEDS_RELOGIN=0
 # Whether the missing pieces are ours to have installed. Set when the
@@ -27,23 +29,36 @@ NEEDS_RELOGIN=0
 DEPS_SKIPPED=0
 
 # openconnect-sso needs Python 3.12: it pins lxml <5 and PyQt6-WebEngine <7,
-# and neither has wheels for 3.13+. Ubuntu 26.04 ships only 3.14, so 3.12 comes
-# from deadsnakes. The applet itself runs on the system python3, not this one.
+# and neither has wheels for 3.13+. The applet itself runs on the system
+# python3 and never sees this one.
+#
+# uv provides it, and is the only tool that does. Not apt and not a PPA: the
+# interpreter and the environment live under $HOME, so no distribution upgrade
+# can take them away -- which is exactly what the upgrade to Ubuntu 26.04 did
+# to the python3.12 and pipx this script used to depend on, leaving an
+# environment that existed on disk and could not start. Not a system python3.12
+# either (--managed-python below): a half-removed one is how that happened.
 PY=3.12
-PYBIN="/usr/bin/python$PY"
-DEADSNAKES_PPA="ppa:deadsnakes/ppa"
 
-# The [full] extra pulls in keyring support. setuptools must stay pinned:
-# openconnect-sso still imports pkg_resources, which current setuptools no
-# longer ships. <71 is the known-good bound, not the exact boundary — the
-# long comment inside install_openconnect_sso() has the measured versions.
-SSO_SPEC='openconnect-sso[full]'
+# openconnect-sso 0.8.1 has no [full] extra (uv says so); keyring support is a
+# hard dependency. setuptools must stay pinned: openconnect-sso still imports
+# pkg_resources, which current setuptools no longer ships. <71 is the
+# known-good bound, not the exact boundary -- measured: 78.1.1 still has it,
+# 83.0.0 does not. --with makes the pin part of the install itself, so it
+# cannot be skipped the way `pipx inject` skipped it (exit 0, nothing done).
+SSO_SPEC='openconnect-sso'
 SETUPTOOLS_PIN='setuptools<71'
 
+# The uv this script fetches only when the machine has none. Pinned, with the
+# checksum of each archive recorded here: the trust is in this file, not in a
+# second download from the same host. Needs UV_MIN or newer when one is found.
+UV_VERSION="0.11.19"
+UV_MIN="0.5.0"
+UV_SHA256_x86_64="7035608168e106375b36d0c818d537a889c51a8625fe7f8f7cad5e62b947c368"
+UV_SHA256_aarch64="83b13ab184a45b7d9a3b0e4b10eaebd50ad41e66cb16dcce8e60aa7be13ae399"
+
 # What the applet itself imports, from the *system* python3.
-APT_RUNTIME=(python3-gi gir1.2-gtk-3.0 gir1.2-ayatanaappindicator3-0.1 gir1.2-notify-0.7 openconnect pipx)
-# lxml 4.x compiles from source on 3.12, which needs a toolchain and headers.
-APT_BUILD=(build-essential libxml2-dev libxslt1-dev zlib1g-dev libffi-dev libssl-dev pkg-config)
+APT_RUNTIME=(python3-gi gir1.2-gtk-3.0 gir1.2-ayatanaappindicator3-0.1 gir1.2-notify-0.7 openconnect)
 # Shared libraries Qt6 WebEngine dlopens for the sign-in browser window.
 APT_QT=(libnss3 libxcomposite1 libxdamage1 libxrandr2 libxkbcommon-x11-0 libxcb-cursor0
         libgl1 libegl1 libxtst6 libdbus-1-3 fontconfig)
@@ -51,6 +66,11 @@ APT_QT=(libnss3 libxcomposite1 libxdamage1 libxrandr2 libxkbcommon-x11-0 libxcb-
 say()  { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m  ! \033[0m %s\n' "$*" >&2; }
 die()  { printf '\033[1;31merror\033[0m %s\n' "$*" >&2; exit 1; }
+
+# Whether a person is there to answer. confirm() would say "re-run with --yes"
+# on no terminal, which is the wrong advice for the one question --yes must not
+# answer (removing a third-party apt source), so that question asks this first.
+can_ask() { [ "$ASSUME_YES" -eq 0 ] && [ -t 0 ]; }
 
 confirm() {
   [ "$ASSUME_YES" -eq 1 ] && return 0
@@ -81,6 +101,7 @@ while [ $# -gt 0 ]; do
     --server) SERVER="${2:?--server needs a value}"; shift 2 ;;
     --server=*) SERVER="${1#*=}"; shift ;;
     --no-deps) INSTALL_DEPS=0; DEPS_SKIPPED=1; shift ;;
+    --reset) RESET=1; shift ;;
     --link) INSTALL_ARGS+=(--link); shift ;;
     -y|--yes) ASSUME_YES=1; shift ;;
     -h|--help) awk 'NR>1 && /^#/ {sub(/^# ?/, ""); print; next} NR>1 {exit}' "${BASH_SOURCE[0]}"; exit 0 ;;
@@ -115,7 +136,13 @@ for name, version in (("Gtk", "3.0"), ("AyatanaAppIndicator3", "0.1"),
     gi.require_version(name, version)
 GI_CHECK
 }
-have_openconnect() { command -v openconnect >/dev/null 2>&1; }
+# openconnect installs to /usr/sbin, which a normal user's PATH lacks on Debian;
+# a PATH-only test called it missing on every run there, and went to sudo for a
+# package that was installed. The applet looks in the sbin directories itself.
+have_openconnect() {
+  command -v openconnect >/dev/null 2>&1 ||
+    [ -x /usr/sbin/openconnect ] || [ -x /sbin/openconnect ]
+}
 
 is_gnome() {
   # XDG_CURRENT_DESKTOP alone was the test, and it is unset over ssh and on a
@@ -136,10 +163,40 @@ have_tray_extension() {
   gnome-extensions list 2>/dev/null | grep -qi appindicator
 }
 have_pkexec()      { command -v pkexec >/dev/null 2>&1; }
-have_sso() {
-  command -v openconnect-sso >/dev/null 2>&1 ||
-    [ -x "$HOME/.local/bin/openconnect-sso" ]
+# The sign-in tool is asked whether it works, never whether a file is there.
+# This used to be `[ -x ~/.local/bin/openconnect-sso ]`, and an OS upgrade that
+# removed the interpreter behind it left a symlink that still passed: the script
+# said "every dependency is already present" and repaired nothing, over an
+# install that died at import. Same question `asuvpn selftest` asks, so the two
+# cannot disagree.
+find_sso() {
+  command -v openconnect-sso 2>/dev/null && return 0
+  [ -x "$HOME/.local/bin/openconnect-sso" ] && { echo "$HOME/.local/bin/openconnect-sso"; return 0; }
+  return 1
 }
+
+# The interpreter that runs a console script. The python beside the real script
+# first, because uv writes an `sh` stub instead of a shebang when the path is
+# long or has a space in it; the shebang only for an install pip made.
+sso_python() {                   # $1 = console script
+  local real dir first py
+  real="$(readlink -f "$1" 2>/dev/null)" || return 1
+  dir="$(dirname "$real")"
+  [ -x "$dir/python" ] && { echo "$dir/python"; return 0; }
+  first="$(head -1 "$real" 2>/dev/null)"
+  case "$first" in "#!"*) py="$(printf '%s' "${first#\#!}" | awk '{print $1}')" ;; *) return 1 ;; esac
+  [ -n "$py" ] && [ -x "$py" ] && { echo "$py"; return 0; }
+  return 1
+}
+
+sso_healthy() {                  # $1 = console script (default: whichever is found)
+  local sso="${1:-}" py
+  [ -n "$sso" ] || sso="$(find_sso)" || return 1
+  py="$(sso_python "$sso")" || return 1
+  "$py" -W ignore -c 'import openconnect_sso, pkg_resources' >/dev/null 2>&1
+}
+have_sso() { sso_healthy; }
+
 
 # What provides each capability, per package manager. Reporting only: nothing
 # outside the apt path is installed automatically, because only the apt path is
@@ -213,14 +270,7 @@ report_missing() {               # $1 manager (may be empty)
   done < <(missing_capabilities)
   [ ${#all[@]} -gt 0 ] &&
     warn "  $(install_command "${manager:-unknown}" "${all[@]}")"
-  if ! have_sso; then
-    warn "openconnect-sso is also missing. It needs Python 3.12 -- it pins"
-    warn "lxml<5 and PyQt6-WebEngine<7, and neither builds on 3.13 or newer,"
-    warn "which is what Fedora and Arch ship as their system python. Install a"
-    warn "3.12 however your distribution provides one, then:"
-    warn "  pipx install --python python3.12 'openconnect-sso[full]'"
-    warn "  pipx inject openconnect-sso 'setuptools<71' --force"
-  fi
+  warn "openconnect-sso itself is built below by uv, on any distribution."
   warn "on GNOME, also enable the AppIndicator extension:"
   warn "    gnome-extensions enable ubuntu-appindicators@ubuntu.com"
   warn "the app itself is being installed now; nothing above needs this script"
@@ -230,7 +280,22 @@ report_missing() {               # $1 manager (may be empty)
 # --------------------------------------------------------------- apt helpers
 
 apt_known()   { apt-cache show "$1" >/dev/null 2>&1; }
-apt_present() { [ "$(dpkg-query -W -f='${db:Status-Status}' "$1" 2>/dev/null || true)" = "installed" ]; }
+# One status line per architecture, so a machine with multiarch enabled (i386
+# for wine or steam) answers "installedinstalled" for a library present in both
+# -- and an equality test on the whole string called those missing, and went to
+# apt, and so to sudo, for packages that were already there. Any installed
+# line counts.
+apt_present() { dpkg-query -W -f='${db:Status-Status}\n' "$1" 2>/dev/null | grep -qx installed; }
+
+# The fixed-name packages the sign-in window needs that dpkg says are absent.
+# dpkg only, so asking costs neither a password nor a network round trip.
+apt_gaps() {
+  local pkg
+  for pkg in "${APT_RUNTIME[@]}" "${APT_QT[@]}"; do
+    apt_present "$pkg" || echo "$pkg"
+  done
+  apt_present libasound2t64 || apt_present libasound2 || echo libasound2t64
+}
 
 # Some package names differ across releases; take the first one this one has.
 apt_first_available() {
@@ -255,139 +320,186 @@ apt_install_missing() {
   sudo apt-get install -y "${missing[@]}"
 }
 
-# ------------------------------------------------------------------ python312
+# ------------------------------------------------------------------------ uv
 
-is_ubuntu() {
-  # ID_LIKE is deliberately not consulted: Mint and Pop!_OS are Ubuntu
-  # derivatives that carry Ubuntu's own suites and can take the PPA, and they
-  # say so in ID_LIKE -- but so does every Debian derivative that cannot.
-  # UBUNTU_CODENAME is the field only an Ubuntu-suite system sets.
-  [ -r /etc/os-release ] || return 1
-  grep -q '^UBUNTU_CODENAME=' /etc/os-release
+find_uv() {
+  command -v uv 2>/dev/null && return 0
+  [ -x "$HOME/.local/bin/uv" ] && { echo "$HOME/.local/bin/uv"; return 0; }
+  return 1
 }
 
-ensure_python() {
-  if [ -x "$PYBIN" ]; then
-    say "python$PY present ($("$PYBIN" -V 2>&1))"
-    return
+version_at_least() {             # $1 have, $2 need
+  [ "$(printf '%s\n%s\n' "$2" "$1" | sort -V | head -1)" = "$2" ]
+}
+
+# One tool, found or fetched into $HOME, so the starting point is known and
+# nothing is added to the system. An existing uv is used as it is and never
+# replaced -- it is the user's.
+ensure_uv() {
+  local have triple expect archive url tmp
+  if UV="$(find_uv)"; then
+    have="$("$UV" --version 2>/dev/null | awk '{print $2}')"
+    version_at_least "${have:-0}" "$UV_MIN" ||
+      die "uv $have at $UV is older than $UV_MIN; update it ('uv self update'), then re-run"
+    say "uv ${have} ($UV)"
+    return 0
   fi
-  if ! apt_known "python$PY"; then
-    # A PPA is Launchpad, which is Ubuntu. detect_manager says "apt" for
-    # Debian too, and add-apt-repository there either refuses or -- worse --
-    # writes a source pinned to a suite deadsnakes does not publish, after
-    # which *every* apt update on the machine fails until someone finds and
-    # deletes the file. Nothing here removes it, and set -e means install.sh
-    # is never reached, so the run leaves a broken package manager and no app.
-    if ! is_ubuntu; then
-      warn "python$PY is not in this distribution's archive, and"
-      warn "$DEADSNAKES_PPA is an Ubuntu PPA -- adding it here would break apt."
-      warn "Install python$PY however this distribution provides one, then:"
-      warn "  pipx install --python python$PY '$SSO_SPEC'"
-      warn "  pipx inject openconnect-sso '$SETUPTOOLS_PIN' --force"
-      die "python$PY is required and cannot be installed automatically here."
-    fi
-    say "python$PY is not in the archive; it comes from deadsnakes"
-    confirm "Add $DEADSNAKES_PPA?" ||
-      die "python$PY is required. Add $DEADSNAKES_PPA yourself, or install python$PY another way."
-    apt_install_missing software-properties-common
-    sudo add-apt-repository -y "$DEADSNAKES_PPA"
-    APT_UPDATED=0
-    apt_refresh
+
+  case "$(uname -m)-$(uname -s)" in
+    x86_64-Linux)  triple=x86_64-unknown-linux-gnu;  expect="$UV_SHA256_x86_64" ;;
+    aarch64-Linux) triple=aarch64-unknown-linux-gnu; expect="$UV_SHA256_aarch64" ;;
+    *) die "no uv build is pinned for $(uname -m); install uv yourself (https://docs.astral.sh/uv/), then re-run" ;;
+  esac
+  command -v curl >/dev/null 2>&1 || {
+    command -v apt-get >/dev/null 2>&1 || die "curl is needed to fetch uv; install it, then re-run"
+    apt_install_missing curl ca-certificates
+  }
+  archive="uv-$triple.tar.gz"
+  url="https://github.com/astral-sh/uv/releases/download/$UV_VERSION/$archive"
+  confirm "Download uv $UV_VERSION (~20 MB) from github.com/astral-sh/uv into ~/.local/bin?" ||
+    die "uv is required for the sign-in tool. Install it yourself (https://docs.astral.sh/uv/), then re-run."
+
+  tmp="$(mktemp -d)"
+  say "fetching $archive"
+  if ! curl -fsSL --retry 2 --max-time 180 -o "$tmp/$archive" "$url"; then
+    rm -rf "$tmp"
+    die "could not download $url -- is the network up? (a proxy needs https_proxy set)"
   fi
-  apt_install_missing "python$PY" "python$PY-venv" "python$PY-dev"
-  [ -x "$PYBIN" ] || die "python$PY still missing after installation"
+  if [ "$(sha256sum "$tmp/$archive" | awk '{print $1}')" != "$expect" ]; then
+    rm -rf "$tmp"
+    die "$archive does not match the checksum pinned in this script; refusing to run it"
+  fi
+  tar -xzf "$tmp/$archive" -C "$tmp"
+  mkdir -p "$HOME/.local/bin"
+  install -m 0755 "$tmp/uv-$triple/uv" "$tmp/uv-$triple/uvx" "$HOME/.local/bin/"
+  rm -rf "$tmp"
+  UV="$HOME/.local/bin/uv"
+  # The pinned build is glibc. On a musl system the checksum matches, the file
+  # installs, and the first use fails with an error about a missing loader.
+  "$UV" --version >/dev/null 2>&1 ||
+    die "the downloaded uv will not run here (a musl distribution, perhaps); install uv yourself (https://docs.astral.sh/uv/), then re-run"
+  say "uv $UV_VERSION installed in ~/.local/bin"
 }
 
 # ------------------------------------------------------------- openconnect-sso
 
+# Build or repair the sign-in environment. Judged by effect: healthy means it
+# imports, so a working install -- whoever made it -- is left alone, and a dead
+# one is replaced whatever killed it. --reset replaces it regardless.
 install_openconnect_sso() {
-  local sso
-  command -v pipx >/dev/null || die "pipx is missing and could not be installed"
-  sso="$(command -v openconnect-sso || true)"
-  [ -n "$sso" ] || { [ -x "$HOME/.local/bin/openconnect-sso" ] && sso="$HOME/.local/bin/openconnect-sso"; }
-
-  if [ -n "$sso" ]; then
-    say "openconnect-sso already installed ($sso)"
-  else
-    say "installing $SSO_SPEC on python$PY (compiles lxml, so give it a few minutes)"
-    pipx install --python "$PYBIN" "$SSO_SPEC"
-    # Re-resolve: $sso was empty precisely because it was not installed yet, and
-    # the verification below needs the console script to read its shebang from.
-    # Without this the check is skipped on a *fresh* install — the one case it
-    # matters most for.
-    sso="$(command -v openconnect-sso || true)"
-    [ -n "$sso" ] || { [ -x "$HOME/.local/bin/openconnect-sso" ] && sso="$HOME/.local/bin/openconnect-sso"; }
+  local sso target found
+  # Ask first, fetch second. A working install -- a pipx one from an earlier
+  # version of this script, say -- needs no uv, and downloading one to find
+  # that out would be the exact surprise "leave a working install alone" rules
+  # out.
+  if [ "$RESET" -eq 0 ] && sso="$(find_sso)" && sso_healthy "$sso"; then
+    say "openconnect-sso works ($sso)"
+    return 0
+  fi
+  ensure_uv
+  if sso="$(find_sso)"; then
+    if [ "$RESET" -eq 1 ]; then
+      say "--reset: rebuilding openconnect-sso ($sso) from scratch"
+    else
+      warn "openconnect-sso at $sso does not work; replacing it"
+    fi
+  fi
+  # An old pipx environment that is already dead goes first: there is nothing in
+  # it to lose, and `pipx uninstall` is only safe *before* uv's console script
+  # exists, since it unlinks ~/.local/bin/openconnect-sso by name. A working
+  # one stays until the replacement is verified (retire_legacy, below), so a
+  # failed rebuild cannot leave a machine with neither.
+  if [ -f "$(legacy_pipx_venv)/pipx_metadata.json" ] &&
+     ! sso_healthy "$(legacy_pipx_venv)/bin/openconnect-sso"; then
+    retire_pipx_env before
   fi
 
-  # Always, never only on a fresh install: an earlier run that died between the
-  # install and this pin leaves openconnect-sso needing a pkg_resources that a
-  # current setuptools no longer ships. (Measured on this machine: setuptools
-  # 78.1.1 still has pkg_resources, 83.0.0 does not. <71 is a known-good pin
-  # rather than the exact boundary -- it is the bound that has been made to
-  # work, so it is left alone.)
-  #
-  # --force is load-bearing, and this comment used to claim the opposite ("pipx
-  # inject is idempotent, so re-running is free"). It is not idempotent, it is
-  # inert: pipx's skip test is `venv.has_package("setuptools")`, which only asks
-  # whether *a* setuptools is present — and one always is. So without --force
-  # pipx prints "already seems to be injected", installs nothing, and still
-  # returns 0. The pin silently never applied, set -e saw success, and the
-  # >/dev/null below hid even that notice.
-  #
-  # The `pipx list` guard is a separate matter: an openconnect-sso installed
-  # with `pip install --user` lands in the same ~/.local/bin and satisfies the
-  # check above, and `pipx inject` then exits 1 and killed the whole bootstrap
-  # under set -e, before the app was ever installed.
+  say "building openconnect-sso on Python $PY with uv (a minute or two)"
+  # --managed-python: a Python uv fetched and owns, never a system one -- a
+  # half-removed system python3.12 is what this exists to stop depending on.
+  # --force replaces a console script left by pipx or pip; --reinstall only on
+  # an explicit reset, since a repair has no reason to trust the old files.
+  local flags=(--force --managed-python --python "$PY" --with "$SETUPTOOLS_PIN")
+  [ "$RESET" -eq 1 ] && flags+=(--reinstall)
+  "$UV" tool install "${flags[@]}" "$SSO_SPEC"
 
-  maintain_openconnect_sso "$sso"
-}
-
-
-maintain_openconnect_sso() {
-  # The half the header promises runs every time: the setuptools pin, and the
-  # PATH check. Split out because it used to live inside the install-if-absent
-  # function, so the "everything is already present" fast path skipped both --
-  # and the pin is the documented repair for a venv that a later
-  # `pipx upgrade-all` rebuilt with a current setuptools, which is precisely
-  # the machine that reaches that fast path.
-  local sso="${1:-}"
-  command -v pipx >/dev/null || return 0
-  [ -n "$sso" ] || sso="$(command -v openconnect-sso || true)"
-  [ -n "$sso" ] || { [ -x "$HOME/.local/bin/openconnect-sso" ] && sso="$HOME/.local/bin/openconnect-sso"; }
-  [ -n "$sso" ] || return 0
-  if pipx list --short 2>/dev/null | grep -q "^openconnect-sso "; then
-    say "pinning $SETUPTOOLS_PIN inside its venv"
-    pipx inject openconnect-sso "$SETUPTOOLS_PIN" --force >/dev/null
-    verify_sso_venv "$sso"
-  else
-    warn "openconnect-sso is not managed by pipx; make sure its environment has $SETUPTOOLS_PIN"
+  # Verified at the path uv just wrote, not at whatever PATH finds first: a
+  # stale copy earlier on PATH must not be able to vouch for this one.
+  target="$("$UV" tool dir --bin)/openconnect-sso"
+  sso_healthy "$target" ||
+    die "openconnect-sso was rebuilt but still cannot start; run: $target --help"
+  say "openconnect-sso OK ($target)"
+  # Where the applet will look: PATH, then ~/.local/bin. A custom uv bin dir
+  # (UV_TOOL_BIN_DIR, XDG_BIN_HOME) outside both leaves it unfindable.
+  found="$(find_sso || true)"
+  if [ -z "$found" ]; then
+    warn "$target is not on PATH or in ~/.local/bin, so the applet cannot find it"
+  elif [ "$(readlink -f "$found")" != "$(readlink -f "$target")" ]; then
+    warn "$found comes first and shadows it; remove that one"
   fi
-  # Said out loud because it edits a shell rc file the user owns; hiding a
-  # write to someone's dotfiles behind /dev/null is how surprises are made.
-  say "pipx ensurepath (may add ~/.local/bin to your shell's PATH setup)"
-  pipx ensurepath >/dev/null 2>&1 || true
+  retire_legacy
 }
 
-# Check the outcome, not the exit status. The whole reason the pin needs --force
-# is that pipx reported success while doing nothing, so taking a second
-# command's word for it would repeat the mistake exactly. What actually matters
-# is whether openconnect-sso can still import pkg_resources, so ask that.
+# -------------------------------------------------------------- old installs
+
+legacy_pipx_venv() {
+  echo "${PIPX_HOME:-${XDG_DATA_HOME:-$HOME/.local/share}/pipx}/venvs/openconnect-sso"
+}
+
+# Remove the environment an earlier version of this script made with pipx.
+# pipx_metadata.json is what says it is pipx's, so nothing else is ever touched.
 #
-# The interpreter is read from the console script's shebang rather than guessed
-# from PIPX_HOME — the same way the applet finds it.
-verify_sso_venv() {
-  local sso="${1:-}" py version
-  [ -n "$sso" ] && [ -r "$sso" ] || return 0
-  py="$(head -1 "$sso" | sed 's|^#!||' | awk '{print $1}')"
-  [ -n "$py" ] && [ -x "$py" ] || return 0
-  version="$("$py" -c 'import importlib.metadata as m; print(m.version("setuptools"))' \
-             2>/dev/null || echo unknown)"
-  if "$py" -c 'import pkg_resources' >/dev/null 2>&1; then
-    say "openconnect-sso venv OK (setuptools $version, pkg_resources imports)"
-  else
-    warn "openconnect-sso cannot import pkg_resources (setuptools $version)."
-    warn "Sign-in will fail. Try: pipx inject openconnect-sso '$SETUPTOOLS_PIN' --force"
+#   before  the uv build has not run: `pipx uninstall` is allowed, and is the
+#           clean way, because the console script it unlinks is still pipx's.
+#   after   uv's script is in place under the same name, so pipx must not be
+#           asked to unlink anything -- only the directory goes.
+#
+# Either way the directory is removed by hand at the end: pipx may be gone (the
+# upgrade that broke this removed it), or may refuse a broken venv.
+retire_pipx_env() {              # $1 = before | after
+  local venv; venv="$(legacy_pipx_venv)"
+  [ -f "$venv/pipx_metadata.json" ] || return 0
+  say "removing the old pipx environment for openconnect-sso ($venv)"
+  if [ "$1" = before ] && command -v pipx >/dev/null 2>&1; then
+    pipx uninstall openconnect-sso >/dev/null 2>&1 || true
   fi
+  rm -rf "$venv"
+}
+
+# What earlier versions of this script left behind, removed only once the
+# replacement is verified -- never before, so a failed rebuild cannot leave a
+# machine with neither. (A dead old environment is the exception and goes
+# first; see install_openconnect_sso.) Everything here is a thing this script
+# itself made. What it merely used (pipx, python3.12, a toolchain) stays: the
+# user may use those for other work, so they are named, never removed.
+retire_legacy() {
+  local f stale=()
+
+  retire_pipx_env after
+
+  for f in "${APT_SOURCES_DIR:-/etc/apt/sources.list.d}"/deadsnakes*; do
+    [ -e "$f" ] && stale+=("$f")
+  done
+  if [ ${#stale[@]} -gt 0 ]; then
+    say "an earlier version of this script added the deadsnakes PPA; nothing here uses it now:"
+    printf '        %s\n' "${stale[@]}"
+    # --yes does not reach this: it means "do not ask me about what I am
+    # adding", and a third-party apt source that may be serving other Pythons
+    # is not this script's to remove on a blanket yes. Only a typed y does.
+    if can_ask && confirm "Remove ${#stale[@]} apt source file(s) listed above?"; then
+      sudo rm -f -- "${stale[@]}"
+      APT_UPDATED=0
+    else
+      warn "left in place. To remove it yourself: sudo rm -- ${stale[*]}"
+    fi
+  fi
+
+  # pipx only. python3.12 is deliberately not named: on Ubuntu 24.04 it is the
+  # system python3, and a line telling someone to remove it is how a desktop
+  # gets uninstalled.
+  apt_present pipx 2>/dev/null &&
+    warn "pipx is still installed; this app no longer uses it (sudo apt remove pipx, if nothing else does)"
+  return 0
 }
 
 # ------------------------------------------------------------------- checking
@@ -438,6 +550,10 @@ enable_extension() {
 
 # ----------------------------------------------------------------------- main
 
+# Sourced, not run, by tests/bootstrap-health.sh: the functions above are what
+# it exercises, and nothing below should happen to the machine running it.
+[ "${BASH_SOURCE[0]}" != "$0" ] && return 0
+
 # Armed for the dependency phase below, and disarmed the moment it ends --
 # which is the whole point, and where the first version of this got it wrong.
 # It was installed *after* that phase, so an abort inside it (a compile
@@ -462,65 +578,54 @@ trap 'explain_if_it_died $?' EXIT
 
 if [ "$INSTALL_DEPS" -eq 1 ]; then
   MANAGER="$(detect_manager || true)"
+  NEED_SSO=1
+  if [ "$RESET" -eq 0 ] && sso_healthy; then NEED_SSO=0; fi
 
   # Before anything reaches for sudo: is there anything to do at all? On a
-  # desktop that already has GTK, polkit and openconnect this is the whole of
-  # the dependency phase, and it costs no password on any distribution. The old
-  # order asked for one first and looked for work second.
-  if [ -z "$(missing_capabilities)" ] && have_sso; then
-    say "every dependency is already present -- nothing to install, no password needed"
-    # Still done, because reaching here used to mean walking the apt block and
-    # arriving at this line with everything already satisfied. It writes a
-    # dconf setting and asks for no password, so skipping it would quietly cost
-    # a user with the extension installed-but-off their tray icon.
+  # desktop that already has GTK, polkit and openconnect this costs no password
+  # on any distribution. The sign-in tool being broken is not a reason to ask
+  # for one -- uv rebuilds it in $HOME -- but a rebuild is when the Qt libraries
+  # it needs are worth checking, so they are looked at then, by dpkg alone.
+  GAPS="$(missing_capabilities)"
+  if [ "$NEED_SSO" -eq 1 ] && [ "$MANAGER" = "apt" ]; then GAPS="$GAPS$(apt_gaps)"; fi
+  if [ -z "$GAPS" ]; then
+    say "no system package is missing -- nothing to install, no password needed"
+    # Still done: it writes a dconf setting and asks for no password, so
+    # skipping it would quietly cost a user with the extension installed-but-off
+    # their tray icon.
     enable_extension
-    # The header promises the setuptools pin and the PATH check run every
-    # time, and they live inside install_openconnect_sso -- which this path
-    # skips. So a venv rebuilt by `pipx upgrade-all`, or a first run that died
-    # between the install and the inject, was met with "nothing to install"
-    # and repaired nothing, while the pin is the documented fix for exactly
-    # that state.
-    maintain_openconnect_sso
-    INSTALL_DEPS=0
-  elif [ "$MANAGER" != "apt" ]; then
-    # Report, then carry on rather than dying. Everything below this point is
-    # the user's own half -- ~/.local, no root, no distribution knowledge --
-    # and it works on any Linux. Stopping here left a Fedora or Arch user with
-    # nothing at all installed, and told them to re-run with --no-deps, which
-    # then died telling them to re-run *without* it: the two messages pointed
-    # at each other. One run now leaves `asuvpn` and `asuvpn selftest` in
-    # place, and the self-check is a far better guide to what this machine
-    # still needs than a list printed by a script that never looked at it.
+  elif [ "$MANAGER" = "apt" ]; then
+    # Package metadata has to be current before anything is looked up: on a
+    # machine whose lists are empty or stale, apt-cache reports real packages as
+    # unknown and pkexec would be silently skipped.
+    apt_refresh
+
+    polkit_pkg=""
+    command -v pkexec >/dev/null || polkit_pkg="$(apt_first_available pkexec policykit-1 || true)"
+    alsa_pkg="$(apt_first_available libasound2t64 libasound2 || true)"
+
+    tray_ext=""
+    if ! have_tray_extension; then
+      tray_ext="$(apt_first_available gnome-shell-ubuntu-extensions gnome-shell-extension-appindicator || true)"
+    fi
+
+    apt_install_missing "${APT_RUNTIME[@]}" "${APT_QT[@]}" \
+                        "$polkit_pkg" "$alsa_pkg" "$tray_ext"
+    [ -n "$tray_ext" ] && NEEDS_RELOGIN=1
+    # Inside the dependency pass on purpose: this writes a dconf setting, and
+    # the README promises that --no-deps changes nothing on the system -- the
+    # binding check below only reads, so it stays outside.
+    enable_extension
+  else
+    # Report, then carry on rather than dying. The sign-in tool below needs no
+    # distribution knowledge, and neither does the user's half after it, so one
+    # run still leaves `asuvpn` and `asuvpn selftest` in place.
     report_missing "$MANAGER"
     DEPS_SKIPPED=1
-    INSTALL_DEPS=0
-  fi
-fi
-
-if [ "$INSTALL_DEPS" -eq 1 ]; then
-  # Package metadata has to be current before anything is looked up: on a
-  # machine whose lists are empty or stale, apt-cache reports real packages as
-  # unknown and pkexec would be silently skipped.
-  apt_refresh
-
-  polkit_pkg=""
-  command -v pkexec >/dev/null || polkit_pkg="$(apt_first_available pkexec policykit-1 || true)"
-  alsa_pkg="$(apt_first_available libasound2t64 libasound2 || true)"
-
-  tray_ext=""
-  if ! have_tray_extension; then
-    tray_ext="$(apt_first_available gnome-shell-ubuntu-extensions gnome-shell-extension-appindicator || true)"
   fi
 
-  apt_install_missing "${APT_RUNTIME[@]}" "${APT_BUILD[@]}" "${APT_QT[@]}" \
-                      "$polkit_pkg" "$alsa_pkg" "$tray_ext"
-  ensure_python
+  # Every distribution: this half lives in $HOME and asks for no privileges.
   install_openconnect_sso
-  [ -n "$tray_ext" ] && NEEDS_RELOGIN=1
-  # Inside the dependency pass on purpose: this writes a dconf setting, and
-  # the README promises that --no-deps changes nothing on the system — the
-  # binding check below only reads, so it stays outside.
-  enable_extension
 fi
 
 # The dependency phase is over; everything below installs into ~/.local and
@@ -530,7 +635,12 @@ trap - EXIT
 verify_bindings
 
 say "installing the app, the launcher and the asuvpn command"
-bash "$SRC_DIR/install.sh" --server "$SERVER" "${INSTALL_ARGS[@]+"${INSTALL_ARGS[@]}"}"
+# --strict: the self-check's verdict comes back as an exit status, so the
+# ending below reports what it found instead of announcing "done" over a
+# failure. Status 3 is that verdict; any other non-zero is install.sh itself.
+SELFTEST_RC=0
+bash "$SRC_DIR/install.sh" --strict --server "$SERVER" "${INSTALL_ARGS[@]+"${INSTALL_ARGS[@]}"}" || SELFTEST_RC=$?
+[ "$SELFTEST_RC" -eq 0 ] || [ "$SELFTEST_RC" -eq 3 ] || exit "$SELFTEST_RC"
 
 if [ "$DEPS_SKIPPED" -eq 1 ] && [ -n "$(missing_capabilities)" ]; then
   cat <<EOF
@@ -547,6 +657,13 @@ $(say "the app is installed; the system packages above are not")
 
 EOF
   exit 0
+fi
+
+if [ "$SELFTEST_RC" -eq 3 ]; then
+  warn "installed, but the self-check above found problems -- this is not a working"
+  warn "install yet. 'asuvpn selftest' repeats the report. If it names"
+  warn "openconnect-sso, './bootstrap.sh --reset' rebuilds that from nothing."
+  exit 1
 fi
 
 cat <<EOF

@@ -180,9 +180,9 @@ openconnect can do SAML itself. `--external-browser=BROWSER` hands the login to
 your ordinary browser, listens on `localhost:29786`, and collects the token when
 the browser is redirected back — no embedded browser at all. Taking it would
 delete most of what `bootstrap.sh` installs: PyQt6 and QtWebEngine, the Python
-3.12 that `PyQt6-WebEngine<7` forces, the toolchain that compiles `lxml`, the
-pipx venv and its `setuptools<71` pin. Roughly nineteen of thirty apt packages
-and a from-source build, for one flag.
+3.12 that `PyQt6-WebEngine<7` forces, the `uv`-managed environment and its
+`setuptools<71` pin. Roughly a dozen apt packages and a ~hundred-megabyte
+environment, for one flag.
 
 **ASU's gateway refuses it.** Asked with only that capability on offer, it
 answers:
@@ -212,6 +212,45 @@ Cisco has to be configured to allow that plaintext local hop, and ASU's is not.
 `asuvpn selftest` asks this question on every run — see *the gateway still
 offers the sign-in method this applet uses*. If ASU ever switches, the
 self-check says so before a user meets an unhelpful sign-in error.
+
+### Why bootstrap asks whether the sign-in tool works, and why `uv` provides it
+
+`openconnect-sso` lives in an environment of its own because it cannot run on
+the system Python (it pins `lxml<5` and `PyQt6-WebEngine<7`, which have no
+wheels for 3.13+). Two decisions about that environment came out of one failure.
+
+After an upgrade to Ubuntu 26.04 the sign-in died at its first import, and
+`bootstrap.sh` — whose whole job is to put an install right — reported that
+every dependency was already present. Three things had gone, none of them by
+anyone's choice: the upgrader removed `python3.12` (26.04 ships only 3.14) and
+`pipx`, and disabled the deadsnakes PPA the first had come from. The environment
+directory and the console script in `~/.local/bin` survived, and the check was
+`[ -x ~/.local/bin/openconnect-sso ]`, which asked whether a file was there.
+It was, and nothing behind it could run.
+
+*Ask what matters, not what is cheap to ask.* The check is now whether the
+tool's own interpreter imports `openconnect_sso` and `pkg_resources` — the same
+question `asuvpn selftest` asks, so the two cannot disagree. A working install is
+left alone whoever made it; a broken one is rebuilt.
+
+*Own the interpreter.* The failure was a dependency on something the distribution
+could take away. A system `python3.12` can be removed by an upgrade; one from a
+PPA depends on the PPA publishing for the release (deadsnakes does not for
+interim releases, and the upgrade disables third-party sources besides). So
+`uv` fetches a Python of its own and builds the environment on that, all under
+`$HOME` (`--managed-python` forbids it from adopting a system one). One tool, with
+a known starting point, in place of a package manager, a PPA and a second
+installer that each had to be right. It also removes the toolchain: `lxml`
+installs from a wheel. The cost is one pinned, checksummed download when `uv`
+is absent, and `uv` itself is never replaced if the user already has one.
+
+Cleaning up after the old arrangement follows the same instinct. What a previous
+version made is removed only once its replacement is verified — except an
+environment already dead, which has nothing to protect and goes first — and what
+was merely *used* (`pipx`, `python3.12`) is left, because it may be the system's.
+`--yes` is deliberately not allowed to remove a third-party apt source: it means
+"do not ask me about what you are adding", and a PPA that may be serving other
+Pythons is not this script's to take away on a blanket yes.
 
 ## The state machine
 
@@ -1475,7 +1514,7 @@ where it can be, checked by `asuvpn selftest`.
 | The version the programs print is the version the wheel carries | `VERSION` in the contract is read at runtime by the menu, the log, `--version` and the self-test, and at build time by hatchling out of the same line; the release workflow refuses a tag that disagrees with it | CI builds the wheel, installs it, and compares the installed `asuvpn --version` with the artifact — a result, not a reading of `pyproject.toml` |
 | No source, test or document names a real address or internal host | RFC 5737 / RFC 3849 space for every example; the only name under the endpoint's own domain is the shipped default | a grep in CI, and review. Deliberately **not** a self-check: `asuvpn selftest` answers "will this work on this machine", and a source-hygiene scan is a lint that has no business shipping to users |
 | A domain from a gateway never reaches a root command line unvalidated | `DOMAIN_RE`, applied where the list is parsed | logic tier, with option-like, shell-punctuation and single-label payloads |
-| `openconnect-sso` can still import `pkg_resources` | `setuptools<71` pinned with `pipx inject --force` | environment tier, by importing it |
+| `openconnect-sso` can still import `pkg_resources` | `setuptools<71` pinned with `uv tool install --with` | environment tier, by importing it |
 
 ## How this is tested
 

@@ -778,7 +778,7 @@ def configured_server():
 
 
 def find_openconnect_sso():
-    """PATH, then ~/.local/bin, which is where pipx puts it.
+    """PATH, then ~/.local/bin, which is where uv (and pipx) put it.
 
     The ~/.local/bin half is the part that has to agree with everyone else:
     bootstrap.sh applies the same rule in shell, and a self-check that looked
@@ -817,7 +817,16 @@ else:
 
 
 def sso_interpreter(sso_path):
-    """openconnect-sso is a console script; its shebang names its own venv python."""
+    """The python that runs openconnect-sso's console script.
+
+    The python beside the real script first: uv writes a `#!/bin/sh` stub, not
+    a shebang naming the interpreter, whenever the path is long or contains a
+    space, so reading the shebang alone finds `/bin/sh` there. The shebang
+    stays as the answer for an install pip made, where no python sits beside it.
+    """
+    beside = os.path.join(os.path.dirname(os.path.realpath(sso_path)), "python")
+    if os.access(beside, os.X_OK):
+        return beside
     try:
         with open(sso_path, "rb") as fh:
             first_line = fh.readline().decode("utf-8", "replace").strip()

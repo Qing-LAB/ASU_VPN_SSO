@@ -264,6 +264,9 @@ Every serious bug here was something reporting success while doing nothing:
 - chaining to a `vpnc-script` path that does not exist on this distribution
 - comparing whole `argv` elements when `getopt` bundles short options (`-bv`)
 - `pipx inject` skipping a pin because *some* `setuptools` was present, exit 0
+- `bootstrap.sh` checking that the sign-in tool's *file* existed, so after an OS
+  upgrade removed the interpreter behind it, it reported "every dependency is
+  already present" over an install that could not start
 
 In each case the status said fine and the code was inert. So: ask the installed
 software rather than remembering what it does (`openconnect --version` reports
