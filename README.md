@@ -869,7 +869,7 @@ open, needing no privilege at all. Only a fresh connect prompts.
 ### Reporting a problem
 
 Found something that crosses a privilege or user boundary? Please report it
-privately rather than in an issue — [`SECURITY.md`](SECURITY.md) says how, what
+privately rather than in an issue — [`SECURITY.md`](https://github.com/Qing-LAB/ASU_VPN_SSO/blob/main/SECURITY.md) says how, what
 is in scope, and what belongs upstream with `openconnect` instead. It also asks
 you to keep real hostnames and addresses out of the report, for the same reason
 none appear anywhere in this repository.
@@ -969,7 +969,7 @@ environment — `reason` is one of `pre-init`, `connect`, `disconnect`,
 `INTERNAL_IP4_ADDRESS`. That interface is documented, versioned and inherited
 from vpnc; the log wording is neither.
 
-[`asuvpn-notify`](asuvpn-notify) is installed as that script. It forwards one
+[`asuvpn-notify`](https://github.com/Qing-LAB/ASU_VPN_SSO/blob/main/asuvpn-notify) is installed as that script. It forwards one
 datagram to the helper, configures the tunnel's DNS on the tunnel's own link,
 and then `exec`s the real `vpnc-script`, so routing is configured exactly as it
 would have been. DNS is the one thing it keeps — see
@@ -1656,7 +1656,7 @@ for it alone it answers `error 108, does not support the requested
 authentication type`, and only `single-sign-on-v2` — the embedded browser
 `openconnect-sso` drives — is accepted. `asuvpn selftest` re-asks on every run,
 so if that ever changes you will hear it from the self-check rather than from a
-failed sign-in. [DESIGN.md](DESIGN.md#why-openconnect-sso-and-not-openconnects-own-external-browser)
+failed sign-in. [DESIGN.md](https://github.com/Qing-LAB/ASU_VPN_SSO/blob/main/DESIGN.md#why-openconnect-sso-and-not-openconnects-own-external-browser)
 has the detail.
 
 ### Two upstream quirks worth knowing
@@ -1806,23 +1806,23 @@ teardown, and logged precisely so a declined action never reads as a hang.
 
 | Path | What it is |
 | --- | --- |
-| [`asuvpn-tray`](asuvpn-tray) | The applet and the `asuvpn` CLI. Runs as you, on the system `python3`. |
-| [`asuvpn-helper`](asuvpn-helper) | The root side, run under `pkexec`. Owns `openconnect`'s lifetime. |
-| [`asuvpn-notify`](asuvpn-notify) | The `vpnc-script` wrapper. Reports state, configures the tunnel's DNS on its own link, then chains to the real script for routing. |
-| [`asuvpn_contract.py`](asuvpn_contract.py) | What the programs agree on: wire format, control verbs, event fields, the settings schema — and the release version, stated once and read by everything including the build. Loaded, not run. |
-| [`asuvpn-selftest`](asuvpn-selftest) | Checks the install against the machine. Run by `install.sh`, and by `asuvpn selftest`. |
-| [`bootstrap.sh`](bootstrap.sh) | Installs dependencies, then calls `install.sh`. |
-| [`install.sh`](install.sh) | Copies the app into `~/.local` and registers it. No system changes. |
-| [`asuvpn.svg`](asuvpn.svg) | App icon. |
-| [`tests/bootstrap-health.sh`](tests/bootstrap-health.sh) | Hermetic test of the decisions `bootstrap.sh` makes: is the sign-in tool broken, and what is cleaned up, and in what order. No network, no `sudo`. |
-| [`tests/sandbox/`](tests/sandbox/README.md) | Scenario tests: the real programs run whole lifetimes against stand-ins, in a namespace. |
-| [`IMPLEMENTATION_GUIDE.md`](IMPLEMENTATION_GUIDE.md) | Read before changing anything: what is proven and what is only believed, the traps, and the lessons each bug paid for. |
-| [`ruff.toml`](ruff.toml) | Lint config. Its `ignore` list records which rules are off and why. |
-| [`DESIGN.md`](DESIGN.md) | How the code works: the state machine and its full as-built transition table, who owns DNS, the invariants, and how it is all tested. |
-| [`SECURITY.md`](SECURITY.md) | How to report a vulnerability privately, what is in scope, and what belongs upstream. |
-| [`pyproject.toml`](pyproject.toml) + [`asuvpn_dist/`](asuvpn_dist/install.py) | The PyPI delivery channel: a wheel carrying these same files, plus `asuvpn-bootstrap` and `asuvpn-install`, which run the bundled `bootstrap.sh` and `install.sh`. No second installer. |
-| [`.github/workflows/`](.github/workflows) | CI: the self-test and analysers on every push to `main` and every PR; the scenario sandbox on main; PyPI publishing on a `v*` tag, gated on a `verify` job because a tag push runs neither of the other two. |
-| [`LICENSE`](LICENSE) | MIT. |
+| [`asuvpn-tray`](https://github.com/Qing-LAB/ASU_VPN_SSO/blob/main/asuvpn-tray) | The applet and the `asuvpn` CLI. Runs as you, on the system `python3`. |
+| [`asuvpn-helper`](https://github.com/Qing-LAB/ASU_VPN_SSO/blob/main/asuvpn-helper) | The root side, run under `pkexec`. Owns `openconnect`'s lifetime. |
+| [`asuvpn-notify`](https://github.com/Qing-LAB/ASU_VPN_SSO/blob/main/asuvpn-notify) | The `vpnc-script` wrapper. Reports state, configures the tunnel's DNS on its own link, then chains to the real script for routing. |
+| [`asuvpn_contract.py`](https://github.com/Qing-LAB/ASU_VPN_SSO/blob/main/asuvpn_contract.py) | What the programs agree on: wire format, control verbs, event fields, the settings schema — and the release version, stated once and read by everything including the build. Loaded, not run. |
+| [`asuvpn-selftest`](https://github.com/Qing-LAB/ASU_VPN_SSO/blob/main/asuvpn-selftest) | Checks the install against the machine. Run by `install.sh`, and by `asuvpn selftest`. |
+| [`bootstrap.sh`](https://github.com/Qing-LAB/ASU_VPN_SSO/blob/main/bootstrap.sh) | Installs dependencies, then calls `install.sh`. |
+| [`install.sh`](https://github.com/Qing-LAB/ASU_VPN_SSO/blob/main/install.sh) | Copies the app into `~/.local` and registers it. No system changes. |
+| [`asuvpn.svg`](https://github.com/Qing-LAB/ASU_VPN_SSO/blob/main/asuvpn.svg) | App icon. |
+| [`tests/bootstrap-health.sh`](https://github.com/Qing-LAB/ASU_VPN_SSO/blob/main/tests/bootstrap-health.sh) | Hermetic test of the decisions `bootstrap.sh` makes: is the sign-in tool broken, and what is cleaned up, and in what order. No network, no `sudo`. |
+| [`tests/sandbox/`](https://github.com/Qing-LAB/ASU_VPN_SSO/blob/main/tests/sandbox/README.md) | Scenario tests: the real programs run whole lifetimes against stand-ins, in a namespace. |
+| [`IMPLEMENTATION_GUIDE.md`](https://github.com/Qing-LAB/ASU_VPN_SSO/blob/main/IMPLEMENTATION_GUIDE.md) | Read before changing anything: what is proven and what is only believed, the traps, and the lessons each bug paid for. |
+| [`ruff.toml`](https://github.com/Qing-LAB/ASU_VPN_SSO/blob/main/ruff.toml) | Lint config. Its `ignore` list records which rules are off and why. |
+| [`DESIGN.md`](https://github.com/Qing-LAB/ASU_VPN_SSO/blob/main/DESIGN.md) | How the code works: the state machine and its full as-built transition table, who owns DNS, the invariants, and how it is all tested. |
+| [`SECURITY.md`](https://github.com/Qing-LAB/ASU_VPN_SSO/blob/main/SECURITY.md) | How to report a vulnerability privately, what is in scope, and what belongs upstream. |
+| [`pyproject.toml`](https://github.com/Qing-LAB/ASU_VPN_SSO/blob/main/pyproject.toml) + [`asuvpn_dist/`](https://github.com/Qing-LAB/ASU_VPN_SSO/blob/main/asuvpn_dist/install.py) | The PyPI delivery channel: a wheel carrying these same files, plus `asuvpn-bootstrap` and `asuvpn-install`, which run the bundled `bootstrap.sh` and `install.sh`. No second installer. |
+| [`.github/workflows/`](https://github.com/Qing-LAB/ASU_VPN_SSO/tree/main/.github/workflows) | CI: the self-test and analysers on every push to `main` and every PR; the scenario sandbox on main; PyPI publishing on a `v*` tag, gated on a `verify` job because a tag push runs neither of the other two. |
+| [`LICENSE`](https://github.com/Qing-LAB/ASU_VPN_SSO/blob/main/LICENSE) | MIT. |
 
 ### Checking it
 
@@ -1878,7 +1878,7 @@ some future release, instead of finding out during an outage.
 The suite is itself checked by breaking the code on purpose and confirming it
 notices — from reverting the bundled-option fix to un-wiring the log scrubber
 from the write path. The full table of verified mutations, every row run and
-caught, lives in [DESIGN.md](DESIGN.md#mutation-testing).
+caught, lives in [DESIGN.md](https://github.com/Qing-LAB/ASU_VPN_SSO/blob/main/DESIGN.md#mutation-testing).
 
 The linters run separately. The four programs have no `.py` extension, so copy
 them under one first; the contract comes along so it is checked too:
@@ -1906,8 +1906,8 @@ All of these are expected to be clean. None of them need installing: `pipx run
 <tool>` runs each from pipx's own cache and touches nothing else (the last one
 as `pipx run --spec shellcheck-py shellcheck`). CI runs this same list plus
 the full self-test on every push to `main` and every pull request
-([checks.yml](.github/workflows/checks.yml)), and the whole scenario sandbox
-on pushes to main ([scenarios.yml](.github/workflows/scenarios.yml)). mypy's `--ignore-missing-imports`
+([checks.yml](https://github.com/Qing-LAB/ASU_VPN_SSO/blob/main/.github/workflows/checks.yml)), and the whole scenario sandbox
+on pushes to main ([scenarios.yml](https://github.com/Qing-LAB/ASU_VPN_SSO/blob/main/.github/workflows/scenarios.yml)). mypy's `--ignore-missing-imports`
 is for `gi`, which ships no stubs.
 
 The plain mypy run exits 0; the few `annotation-unchecked` notes it prints are
@@ -1921,7 +1921,7 @@ Anything outside those two kinds is new, and worth reading.
 
 ## Design notes
 
-[`DESIGN.md`](DESIGN.md) covers the internals for anyone reading or changing the
+[`DESIGN.md`](https://github.com/Qing-LAB/ASU_VPN_SSO/blob/main/DESIGN.md) covers the internals for anyone reading or changing the
 code: the process and privilege model, the state machine and where state comes
 from, the threading model and the locks, the teardown guarantees, the full exit
 code list, the invariants the code exists to maintain, how it is tested, and
@@ -1948,7 +1948,7 @@ and fails loudly if the refusal does not happen), and by confirming an ordinary
 user-private-group checkout still runs.
 
 The stand-ins and the scenarios live in
-[tests/sandbox](tests/sandbox/README.md) and run inside an unprivileged
+[tests/sandbox](https://github.com/Qing-LAB/ASU_VPN_SSO/blob/main/tests/sandbox/README.md) and run inside an unprivileged
 **user + mount namespace**, bind-mounted over `/usr/sbin/openconnect`,
 `/usr/bin/pkexec`, `openconnect-sso` and the
 `vpnc-script`, with a guard that refuses to start unless every one of them
@@ -2015,16 +2015,16 @@ The stand-in exercises earlier in this section — the launch races, the exit
 code sweep, the arbitrary-directory installs — predate the committed suite
 and were run with earlier versions of the same fakes before the harness moved into the
 repository; the fifteen committed scenarios are the ones tabulated in
-[tests/sandbox](tests/sandbox/README.md).
+[tests/sandbox](https://github.com/Qing-LAB/ASU_VPN_SSO/blob/main/tests/sandbox/README.md).
 
 What is proven live against the real gateway (full connects and teardowns,
 forced-DPD safety, free recovery through WiFi loss and suspend, the nudge)
 versus only in the sandbox (the full escalation ladder including the
 unattended sign-in, the shared-group refusal) is kept, with dates and evidence,
 in
-[IMPLEMENTATION_GUIDE.md](IMPLEMENTATION_GUIDE.md) — that ledger, not this
+[IMPLEMENTATION_GUIDE.md](https://github.com/Qing-LAB/ASU_VPN_SSO/blob/main/IMPLEMENTATION_GUIDE.md) — that ledger, not this
 paragraph, is current.
 
 ## License
 
-MIT. See [LICENSE](LICENSE).
+MIT. See [LICENSE](https://github.com/Qing-LAB/ASU_VPN_SSO/blob/main/LICENSE).
