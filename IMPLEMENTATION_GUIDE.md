@@ -444,8 +444,38 @@ as project `asuvpn`, repo `Qing-LAB/ASU_VPN_SSO`, workflow **`workflow.yml`**,
 environment **`pypi`**. That filename is matched literally by PyPI, so renaming
 the file breaks publishing with an invalid-publisher error after a green build;
 change it on pypi.org first if it ever has to move. A version already on PyPI
-can never be re-uploaded, so the tag is the point of no return. `DESIGN.md` has the invariants
-table and a "Changing things" section saying what to update in lockstep.
+can never be re-uploaded, so the tag is the point of no return.
+
+The order that has worked, and why each step is there:
+
+1. Bump `VERSION`, commit, push `main`.
+2. **Wait for both `checks` and `scenarios` to pass on that exact commit** before
+   tagging. The release workflow's `verify` job is deliberately a small subset
+   (no apt stack, about a minute) and does not wait for them, so a CI failure
+   that only the full suite sees would otherwise land on PyPI. CI edits cannot
+   be exercised locally, which is how a `uv`-on-`PATH` change broke
+   `pipx run build` after everything passed on the developer's machine.
+3. Push an annotated tag whose message is the bare version (`git tag -a v0.14.1
+   -m "0.14.1"`). `verify` runs first, then `pypi`; `pypi` is skipped if
+   `verify` fails, so a failed gate leaves the version number unspent. That
+   happened once (0.14.0: `install.sh` exited 1 on an advisory self-check), and
+   the cost was a re-tag, not a burnt version.
+4. Check PyPI itself: the JSON endpoint can lag the simple index by a minute or
+   two, so install the new version from a clean environment to be sure.
+
+**Tags matching `v*` are protected by a repository ruleset** ("protect release
+tags": no deletion, no updates, no force-moves; creating a tag is unaffected,
+and there are no bypass actors, so it binds admins and tokens alike). Moving a
+tag re-runs the publish job, and PyPI versions are permanent, so a tag should
+not be easy to rewrite. To repair a bad tag that has **not** been uploaded —
+confirm that first: `curl https://pypi.org/pypi/asuvpn/<version>/json` must be a
+404 — set the ruleset's enforcement to `disabled` (repository Settings → Rules →
+Rulesets, or `gh api -X PUT repos/Qing-LAB/ASU_VPN_SSO/rulesets/<id> -f
+enforcement=disabled`), fix the tag, and set it back to `active`. A tag that
+**was** uploaded is never moved: release the next version instead.
+
+`DESIGN.md` has the invariants table and a "Changing things" section saying what
+to update in lockstep.
 
 **Before claiming anything works, ask how it would look if it did not.** That
 question is the whole difference between the bugs in this history and the ones
