@@ -3799,6 +3799,141 @@ def check_notify_roundtrip(C, r):
                 f"the chained script saw the token: {got[1:2]}")
 
 
+def check_resolv_conf_follow(notify, C, r):
+    """Drive the /etc/resolv.conf swap against a scratch directory, never the real one.
+
+    What matters is that every way out leaves DNS working: a record that cannot
+    be trusted is dropped and not used, a file that could not be put back is
+    never replaced, a relative link comes back exactly as it was, and a killed
+    session is undone before the next tunnel. Notes are captured for the same
+    reason check_dns_takeover captures them.
+    """
+    name = "/etc/resolv.conf is swapped for the tunnel and put back, and only that"
+    with contextlib.redirect_stderr(io.StringIO()), \
+            tempfile.TemporaryDirectory() as d:
+        os.chmod(d, 0o700)
+        stub, static = os.path.join(d, "stub"), os.path.join(d, "static")
+        os.mkdir(os.path.join(d, "run"))
+        other = os.path.join(d, "run", "other")
+        conf, state = os.path.join(d, "etc-resolv.conf"), os.path.join(d, "state")
+        record = os.path.join(state, C.RESOLV_BACKUP)
+        for path in (stub, static):
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write("nameserver 127.0.0.53\n")
+        with open(other, "w", encoding="utf-8") as fh:
+            fh.write("nameserver 192.0.2.53\n")
+        answers = {"known": {"192.0.2.53"}}
+
+        def step(reason):
+            env = {C.DNS_DOMAINS_VAR: "example.edu", "reason": reason}
+            notify.follow_resolv_conf(env, True, conf, (stub, static), state,
+                                      known=lambda: answers["known"],
+                                      require_root=False)
+
+        def link(target):
+            if os.path.lexists(conf):
+                os.unlink(conf)
+            os.symlink(target, conf)
+
+        def on_stub():
+            return os.path.realpath(conf) == os.path.realpath(stub)
+
+        def plant(boot, target):
+            with open(record, "w", encoding="utf-8") as fh:
+                fh.write(f"{boot}\n{target}\n")
+            os.chmod(record, 0o600)
+
+        link(other)
+        step("connect")
+        if not on_stub():
+            return r.fail(name, "connect did not point it at the stub")
+        step("reconnect")
+        if not on_stub() or not os.path.exists(record):
+            return r.fail(name, "a reconnect lost this session's own record")
+        step("disconnect")
+        if os.readlink(conf) != other or os.path.exists(record):
+            return r.fail(name, "disconnect did not restore the original link")
+
+        link("run/other")  # relative, as Debian's resolvconf writes it
+        step("connect")
+        step("disconnect")
+        if not os.path.islink(conf) or os.readlink(conf) != "run/other":
+            return r.fail(name, "a relative link did not come back as it was")
+
+        link(other)
+        step("connect")
+        step("pre-init")
+        if os.readlink(conf) != other or os.path.exists(record):
+            return r.fail(name, "a killed session was not undone before the next")
+
+        link(stub)
+        plant("an-earlier-boot", other)
+        step("pre-init")
+        if not on_stub() or os.path.exists(record):
+            return r.fail(name, "a record from an earlier boot was restored")
+
+        link(static)
+        step("connect")
+        if os.readlink(conf) != static:
+            return r.fail(name, "systemd's static resolv.conf was swapped")
+
+        link(other)
+        step("connect")
+        # Group-writable is enough to be refused.
+        os.chmod(record, 0o620)  # nosec B103 — the hazard is the fixture
+        step("disconnect")
+        if os.path.exists(record) or not on_stub():
+            return r.fail(name, "a group-writable record was trusted")
+
+        link(other)
+        answers["known"] = {"198.51.100.53"}
+        step("connect")
+        answers["known"] = {"192.0.2.53"}
+        if os.readlink(conf) != other or os.path.exists(record):
+            return r.fail(name, "swapped past a resolver systemd-resolved does not use")
+
+        local = os.path.join(d, "run", "local")
+        with open(local, "w", encoding="utf-8") as fh:
+            fh.write("nameserver 127.0.0.1\n")
+        link(local)
+        step("connect")
+        if os.readlink(conf) != local or os.path.exists(record):
+            return r.fail(name, "swapped past a local resolver")
+
+        os.unlink(conf)
+        with open(conf, "w", encoding="utf-8") as fh:
+            fh.write("nameserver 203.0.113.53\n")
+        step("connect")
+        if os.path.islink(conf):
+            return r.fail(name, "a regular file was replaced")
+    r.ok(name)
+
+
+def check_resolv_conf_machine(notify, C, r):
+    """Read-only: do ssh and curl on *this* machine reach systemd-resolved?
+
+    And where they do not, would connecting fix it -- the same question
+    asuvpn-notify asks, through its own function, so this cannot promise a
+    swap the connect would then refuse.
+    """
+    name = "/etc/resolv.conf reaches systemd-resolved (or the tunnel swaps it)"
+    binary = C.resolvectl_path()
+    if binary is None:
+        return r.ok(name + " -- no systemd-resolved here, nothing to check")
+    if C.resolv_conf_reaches_resolved():
+        return r.ok(name)
+    why = None if os.path.islink(C.RESOLV_CONF) else "it is not a symlink"
+    why = why or notify.why_not_swap(C.RESOLV_CONF,
+                                     notify.resolved_servers(binary, ""))
+    if why is None:
+        return r.ok(name + " -- it does not now; with link DNS on, connecting"
+                    " swaps it for the life of the tunnel and puts it back")
+    r.warn(name, f"{C.RESOLV_CONF} does not reach resolved and connecting will"
+           f" not change it ({why}), so names behind the tunnel will not"
+           " resolve for ssh or curl. Point that resolver at systemd-resolved,"
+           f" or: sudo ln -sfn {C.RESOLVED_STUBS[0]} {C.RESOLV_CONF}")
+
+
 def check_dns_takeover(notify, C, r):
     """Drive the DNS handover against a stand-in resolvectl.
 
@@ -4484,6 +4619,8 @@ def main():
         r.section("wiring — asuvpn-notify executed end to end")
         guarded(check_notify_roundtrip, C, r)
         guarded(check_dns_takeover, notify, C, r)
+        guarded(check_resolv_conf_follow, notify, C, r)
+        guarded(check_resolv_conf_machine, notify, C, r)
         guarded(check_event_translation, helper, tray, C, r)
         guarded(check_every_argument_has_a_rule, helper, r)
         guarded(check_fatal_reporting, r)

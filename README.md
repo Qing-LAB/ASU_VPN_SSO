@@ -532,6 +532,27 @@ missing. **No compiler or build tools are installed**: `lxml` comes as a wheel.
 | `~/.local/bin/openconnect-sso` | Symlink into that environment. | With the environment. |
 | `~/.cache/uv/` | `uv`'s download cache. Up to about 0.5 GB, and shared with anything else you use `uv` for. | `uv cache clean` removes it; nothing here depends on it afterwards. |
 
+**Outside `$HOME`, at connect time (not at install).** Link DNS reaches only
+programs that ask systemd-resolved, and `ssh` and `curl` ask whatever
+`/etc/resolv.conf` names. If that is a symlink that bypasses resolved -- to
+NetworkManager's file, say -- internal names such as a cluster login node resolve to
+their public addresses instead and the host refuses you. So while the tunnel is
+up, the connect hook points that one symlink at resolved's stub, and the
+disconnect hook puts it back.
+
+| Path | What | When |
+| --- | --- | --- |
+| `/etc/resolv.conf` | Only with `dns` on, and only if it is a symlink that does not reach resolved: repointed at `/run/systemd/resolve/stub-resolv.conf` for the life of the tunnel, then restored exactly, relative targets included. Only if every nameserver it names is one resolved already uses, so public names are unaffected. Left alone if it is a regular file, if there is no stub, or if it names a local resolver or servers resolved does not use; the log, the tray and `asuvpn selftest` then say so and what to run. A link to systemd's static `/usr/lib/systemd/resolv.conf` already reaches resolved and is not touched. | On connect; undone on disconnect. |
+| `/var/lib/asuvpn/` | A root-only directory (0700) holding one root-only file (0600), `resolv.conf.orig`: the boot id and the symlink's previous target. Not under `/run`, which a reboot clears while the symlink stays. Not trusted unless root-owned and writable by no one else. | Written only when the symlink is swapped; removed on disconnect. |
+
+If a session is killed without disconnecting, the link stays on the stub --
+which is Ubuntu's default setup and resolves normally. The next connection
+cleans up before it starts: in the same boot it puts the old link back; after a
+reboot it only drops the record (someone may have pointed the link at the stub
+since) and logs the old target with the command to restore it. That cleanup
+runs even with `dns` turned off. NetworkManager can rewrite the symlink while
+you are connected; reconnecting applies the swap again.
+
 **What is downloaded, and from where.** From your distribution's mirrors, the
 packages in step 1. For step 3: if you have no `uv` and choose the official
 installer, `https://astral.sh/uv/install.sh`, which in turn fetches `uv` itself
@@ -690,6 +711,16 @@ uv tool uninstall openconnect-sso      # the sign-in environment and its link
 uv python uninstall 3.12               # the Python uv fetched (skip if other uv projects use it)
 uv cache clean                         # uv's download cache (shared with all your uv use)
 rm -f ~/.local/bin/uv ~/.local/bin/uvx # uv itself, only if uv's installer put it there at your request
+```
+
+Disconnect first: that puts `/etc/resolv.conf` back and removes the record.
+Then remove the directory it lived in. If a session was killed and the record
+is still there, put the old link back from it first:
+
+```bash
+sudo test -f /var/lib/asuvpn/resolv.conf.orig && \
+  sudo ln -sfn "$(sudo sed -n 2p /var/lib/asuvpn/resolv.conf.orig)" /etc/resolv.conf
+sudo rm -rf /var/lib/asuvpn
 ```
 
 The apt packages, the AppIndicator GNOME extension, your keyring entries and
@@ -1324,7 +1355,8 @@ resolver list:
   routing domain unless the gateway pushes one, and a link with servers and no
   domains becomes a candidate for **every** lookup on the machine.
 - **It has the right lifetime.** Link configuration dies with the link. No
-  backup file, no restore step, and nothing to lose a race with.
+  backup file, no restore step, and nothing to lose a race with. (The one
+  exception, a `/etc/resolv.conf` that bypasses `systemd-resolved`, is below.)
 - **Nobody else owns it.** `systemd-resolved` rewriting its stub file cannot
   disturb per-link configuration, because that is where it keeps its own.
 
@@ -1355,7 +1387,38 @@ to the old behaviour beats half-configuring DNS.
 Every connect logs what was done:
 
 ```
-15:38:44  [vpn] asuvpn: DNS for asu.edu on asuvpn0 via 192.0.2.53 (pushed by the gateway); /etc/resolv.conf left alone
+15:38:44  [vpn] asuvpn: DNS for asu.edu on asuvpn0 via 192.0.2.53 (pushed by the gateway)
+```
+
+**Programs that never ask `systemd-resolved`.** All of the above reaches only
+programs whose lookups go through `systemd-resolved`, and `ssh`, `curl` and most
+others ask whatever `/etc/resolv.conf` names. On a stock Ubuntu that is the
+stub, so they do. Where it has been pointed elsewhere — NetworkManager's own
+file, a list of public resolvers — the link is configured and never consulted,
+and an internal name resolves to its public address.
+
+There is no interface common to every DNS manager — resolvconf, dnsmasq,
+unbound, an encrypting proxy, a mesh VPN's resolver each have their own, or none
+— so this does not try to configure them. It makes one change, and only where
+that change loses nothing: on connect, if `/etc/resolv.conf` is a symlink whose
+every nameserver is one `systemd-resolved` already uses (NetworkManager's file
+on a machine running resolved is the usual case), it is pointed at the stub for
+the life of the tunnel and put back on disconnect. Public names go to the same
+servers either way, and the VPN's resolver is still never written into the file.
+
+Anything else is left alone: a regular file (it could not be put back exactly),
+no stub, a local resolver such as `127.0.0.1`, or servers `systemd-resolved`
+does not use — each of those is someone's choice, and going around it would
+quietly undo it. Then you are told, in three places: the log says why and what
+to run; the tray raises a warning once per connection; and `asuvpn selftest`
+warns before you ever connect. To keep your own resolver and still reach the
+tunnel's names, have it forward the tunnel's domain to `127.0.0.53`, or to the
+VPN's resolver directly.
+What is changed and where the record is kept is under
+[Scope of impact](#scope-of-impact-on-your-system).
+
+```
+15:38:44  [vpn] asuvpn: /etc/resolv.conf -> /run/systemd/resolve/stub-resolv.conf while the tunnel is up (was -> /run/NetworkManager/resolv.conf)
 ```
 
 `dns = off` turns the whole thing off and gives `vpnc-script` its old job back.

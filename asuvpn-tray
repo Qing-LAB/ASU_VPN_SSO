@@ -1935,6 +1935,9 @@ class VpnTray(StateMachine):
         # must not be able to report exit over the top of its replacement, which
         # would drop the tray's only handle on a live root openconnect.
         self.helper_generation = 0
+        # The tunnel generation already warned about /etc/resolv.conf, so the
+        # warning arrives once per connection rather than every check.
+        self.resolv_warned = None
         # Sign-ins get one too: cancel, quit and every new connect bump it,
         # so a sign-in still in flight can tell nobody wants it any more and
         # cannot start a tunnel on top of a newer one.
@@ -2917,6 +2920,8 @@ class VpnTray(StateMachine):
             # broken link would flap instead of escalating. _probe_result has
             # had this guard from the start; this is the same rule.
             return False
+        if healthy and self.resolv_warned != generation:
+            self._warn_if_resolv_conf_bypasses()
         # A verdict like any other. The table weighs it, and stands aside in
         # RECOVERING -- openconnect is rebuilding the link, and the resolver
         # goes back on it when `reconnect` runs asuvpn-notify again, which is
@@ -2926,6 +2931,26 @@ class VpnTray(StateMachine):
                       "the resolver the VPN pushed is no longer in force",
                       detail=detail)
         return False
+
+    def _warn_if_resolv_conf_bypasses(self):
+        """Say so, once a connection, when the tunnel's DNS cannot reach ssh and curl.
+
+        Asked here, after a healthy DNS check, rather than when the tunnel comes
+        up: asuvpn-notify swaps /etc/resolv.conf after it reports the connect,
+        so earlier would warn about a file it is about to fix. Where it chose
+        not to -- a regular file, a local resolver, servers resolved does not
+        use -- the link is configured and nothing that reads resolv.conf will
+        ever consult it, which looks exactly like the VPN not working.
+        """
+        self.resolv_warned = self.helper_generation
+        if C.resolv_conf_reaches_resolved():
+            return
+        sentence = (f"{C.RESOLV_CONF} does not use systemd-resolved, so names"
+                    " behind the tunnel will not resolve for ssh, curl and"
+                    " most other programs. The log says why it was left alone"
+                    " and how to fix it.")
+        self.log(f"[tray] {sentence}")
+        self.dispatch(MSG_WARNING, sentence=sentence)
 
     def _probe_target(self):
         """Where to probe: what the user configured, else what the VPN pushed."""

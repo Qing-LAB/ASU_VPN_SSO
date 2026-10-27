@@ -35,7 +35,7 @@ import stat
 # applet logs it at startup and shows it at the bottom of its menu, and the
 # self-test banner reports it. Distinct from CONTRACT_VERSION below, which
 # tracks the wire format and moves only when the programs must agree anew.
-VERSION = "0.14.2"
+VERSION = "0.15.0"
 
 # Bumped when the wire format changes in a way the programs must agree on.
 # `asuvpn selftest` reports it, and the header of a generated config file
@@ -214,6 +214,23 @@ DNS_MARKER = "dns-owner"
 # to ask.
 DNS_OWNER_LINK = "link"
 DNS_OWNER_SCRIPT = "script"
+
+# Link DNS only reaches programs that ask systemd-resolved, and `ssh` and `curl`
+# ask whatever /etc/resolv.conf names. On Ubuntu's default that is resolved's
+# stub; on a machine where it points at NetworkManager's file, or lists public
+# resolvers, the tunnel's resolver is configured and never consulted.
+# asuvpn-notify points the symlink at the stub for the life of the tunnel and
+# keeps what it replaced under RESOLV_STATE_DIR -- persistent, unlike /run,
+# because the symlink survives a reboot and so must the record of its old target.
+RESOLV_CONF = "/etc/resolv.conf"
+# What a resolv.conf that reaches systemd-resolved points at. The first is the
+# stub resolved writes while it runs, and the only one swapped *to*: it exists
+# only while resolved does. The second is the static copy systemd ships
+# (resolved(8), "/usr/lib/systemd/resolv.conf"); a link to it is already right.
+RESOLVED_STUBS = ("/run/systemd/resolve/stub-resolv.conf",
+                  "/usr/lib/systemd/resolv.conf")
+RESOLV_STATE_DIR = "/var/lib/asuvpn"
+RESOLV_BACKUP = "resolv.conf.orig"
 
 # ------------------------------------------------------------ reply routing
 #
@@ -516,6 +533,57 @@ def resolvectl_path():
     asuvpn-notify, and the two absolute paths are where it lives.
     """
     return find_program("resolvectl", RESOLVECTL_PATHS)
+
+
+# The addresses resolved itself listens on: the stub, and the proxy stub that
+# skips its own logic. A resolv.conf naming either already asks resolved.
+RESOLVED_LISTENERS = ("127.0.0.53", "127.0.0.54")
+
+
+def resolv_conf_reaches_resolved(conf=RESOLV_CONF, stubs=RESOLVED_STUBS):
+    """Do programs that read `conf` ask systemd-resolved?
+
+    Asked by asuvpn-notify before deciding to swap it, by the tray after a
+    connect to decide whether to warn, and by the self-check -- one answer, so
+    the three cannot disagree about what "reaches" means. Strict, so a link to
+    a stub that does not exist (resolved stopped) is not mistaken for one that
+    works; a file naming only resolved's own listeners counts too.
+    """
+    try:
+        here = os.path.realpath(conf, strict=True)
+    except (OSError, ValueError):
+        return False
+    if any(here == os.path.realpath(stub) for stub in stubs):
+        return True
+    servers = resolv_conf_servers(conf)
+    return bool(servers) and all(s in RESOLVED_LISTENERS for s in servers)
+
+
+def resolv_conf_servers(conf=RESOLV_CONF):
+    """The nameservers `conf` names, canonical, in order; empty if unreadable.
+
+    A scope suffix (`fe80::1%wlan0`) is dropped, since resolvectl reports the
+    same server without one, and anything that is not an address is skipped.
+    """
+    import ipaddress
+
+    try:
+        with open(conf, encoding="utf-8", errors="replace") as handle:
+            lines = handle.read().splitlines()
+    except OSError:
+        return []
+    servers = []
+    for line in lines:
+        words = line.split()
+        if len(words) < 2 or words[0] != "nameserver":
+            continue
+        try:
+            address = str(ipaddress.ip_address(words[1].split("%")[0]))
+        except ValueError:
+            continue
+        if address not in servers:
+            servers.append(address)
+    return servers
 
 
 # ------------------------------------------------------------------ split DNS

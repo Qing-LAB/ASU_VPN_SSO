@@ -365,7 +365,7 @@ def apply_dns(env, device, binary, revert_on_failure=True):
     if everything:
         where = f"{where} (the gateway routes everything through this tunnel)"
     note(f"DNS for {where} on {device} via {' '.join(servers)}"
-         f" ({source}); /etc/resolv.conf left alone")
+         f" ({source})")
     return True
 
 
@@ -386,6 +386,325 @@ def revert_dns(device, binary, env):
     set_marker(env, None)
 
 
+def points_at_stub(conf, stubs):
+    """Does `conf` already reach systemd-resolved, however many links away?
+
+    Strict, so a symlink to a stub that does not exist -- resolved stopped --
+    is not mistaken for one that works.
+    """
+    try:
+        here = os.path.realpath(conf, strict=True)
+    except (OSError, ValueError):
+        return False
+    return any(here == os.path.realpath(stub) for stub in stubs)
+
+
+def link_target(conf, raw):
+    """Where a symlink at `conf` holding `raw` points, as an absolute path.
+
+    A relative target is relative to the link's own directory -- Debian's
+    resolvconf writes `../run/resolvconf/resolv.conf` -- so it is resolved
+    against that, and the raw text is what gets put back.
+    """
+    return os.path.normpath(os.path.join(os.path.dirname(conf), raw))
+
+
+def boot_id():
+    """Names this boot, so a record from an earlier one can be told apart."""
+    try:
+        with open("/proc/sys/kernel/random/boot_id", encoding="ascii") as handle:
+            return handle.read().strip()
+    except OSError:
+        return ""
+
+
+def trusted(path, directory=False):
+    """Is `path` something root may believe: ours, not a link, not writable by others?
+
+    The record is read by root and its content ends up as /etc/resolv.conf's
+    target, so a file or directory that any other user could have written is
+    refused -- the same rule the contract loader applies to its own file.
+    """
+    try:
+        info = os.lstat(path)
+    except OSError:
+        return False
+    kind = stat.S_ISDIR if directory else stat.S_ISREG
+    return (kind(info.st_mode) and info.st_uid == os.geteuid()
+            and not info.st_mode & (stat.S_IWGRP | stat.S_IWOTH))
+
+
+def restorable(conf, raw, stubs):
+    """Can `raw` be recorded and later put back as `conf`'s target?
+
+    Not if it is empty, would break the record's line format, or already
+    reaches the stub -- restoring that would leave the machine exactly as the
+    swap did, and a record saying otherwise would be a lie.
+    """
+    if not raw or "\n" in raw or "\0" in raw:
+        return False
+    target = link_target(conf, raw)
+    return not any(os.path.realpath(target) == os.path.realpath(stub)
+                   for stub in stubs)
+
+
+def read_backup(conf, backup, stubs):
+    """(boot id, original target) from the record, or None if it cannot be used.
+
+    None covers absent, untrusted and malformed alike.
+    """
+    if not trusted(backup) or not trusted(os.path.dirname(backup), True):
+        if os.path.lexists(backup):
+            note(f"ignoring {backup}: not a root-owned, unshared file")
+        return None
+    try:
+        with open(backup, "rb") as handle:
+            lines = handle.read().split(b"\n")
+    except OSError:
+        return None
+    if len(lines) < 2:
+        return None
+    boot, raw = lines[0].decode("ascii", "replace"), os.fsdecode(lines[1])
+    if not restorable(conf, raw, stubs):
+        return None
+    return boot, raw
+
+
+def drop_backup(backup):
+    try:
+        os.unlink(backup)
+    except FileNotFoundError:
+        pass
+
+
+def write_backup(backup, raw):
+    """Write the record, never through a link and never readable by others."""
+    temporary = backup + ".tmp"
+    drop_backup(temporary)
+    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                         | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(descriptor, "wb") as handle:
+        handle.write(boot_id().encode("ascii") + b"\n" + os.fsencode(raw) + b"\n")
+    os.replace(temporary, backup)
+
+
+def replace_symlink(conf, target):
+    """Point `conf` at `target` in one rename, so no reader sees it missing."""
+    temporary = conf + ".asuvpn-tmp"
+    try:
+        os.unlink(temporary)
+    except FileNotFoundError:
+        pass
+    os.symlink(target, temporary)
+    os.replace(temporary, conf)
+
+
+def resolved_servers(binary, device):
+    """The resolvers resolved uses for names outside the tunnel, canonical.
+
+    Every server resolvectl lists globally or on any link but `device`. Forms
+    like `192.0.2.53#dns.example.com` (a DNS-over-TLS name) and `fe80::1%2` (a
+    scope) are reduced to the bare address. None if resolved could not be asked.
+    """
+    import ipaddress
+    import subprocess
+
+    try:
+        done = subprocess.run([binary, "dns"], stdin=subprocess.DEVNULL,
+                              stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                              timeout=C.RESOLVECTL_TIMEOUT, check=False)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+    if done.returncode != 0:
+        return None
+    servers = set()
+    for line in done.stdout.decode("utf-8", "replace").splitlines():
+        owner, _, listed = line.partition(":")
+        if f"({device})" in owner:
+            continue
+        for word in listed.split():
+            try:
+                servers.add(str(ipaddress.ip_address(
+                    word.split("#")[0].split("%")[0])))
+            except ValueError:
+                continue
+    return servers
+
+
+def why_not_swap(conf, known):
+    """Why pointing `conf` at the stub would lose something, or None if it would not.
+
+    The swap is only a fix where it changes nothing for names outside the
+    tunnel: every server resolv.conf names must be one resolved already uses.
+    A local resolver -- a caching daemon, an ad blocker, an encrypting proxy, a
+    mesh VPN's -- is someone's deliberate choice, and so is a server resolved
+    has never heard of; going around either for the life of a tunnel would
+    quietly undo it. There is no common interface to all of those to add the
+    tunnel's domains to instead, so those are told, not changed.
+    """
+    import ipaddress
+
+    servers = C.resolv_conf_servers(conf)
+    if not servers:
+        return "it names no nameserver"
+    local = [s for s in servers if s not in C.RESOLVED_LISTENERS
+             and ipaddress.ip_address(s).is_loopback]
+    if local:
+        return f"it names a local resolver ({' '.join(local)})"
+    if known is None:
+        return "systemd-resolved could not be asked which resolvers it uses"
+    unknown = [s for s in servers
+               if s not in known and s not in C.RESOLVED_LISTENERS]
+    if unknown:
+        return (f"it names resolvers systemd-resolved does not use"
+                f" ({' '.join(unknown)})")
+    return None
+
+
+def route_lookups_through_resolved(conf, stubs, state_dir, known):
+    """Make /etc/resolv.conf reach systemd-resolved, remembering what it was.
+
+    Link DNS is only consulted by programs that ask resolved, and ssh, curl and
+    most others ask whatever resolv.conf names. Where that is NetworkManager's
+    file or a list of public resolvers, the tunnel's resolver is configured and
+    never used, and an internal name resolves to its public address instead.
+
+    Only a symlink is swapped, because only a symlink can be put back exactly,
+    and only when nothing outside the tunnel would change (see why_not_swap).
+    Anything else gets a message saying what is wrong and what to run -- the
+    one outcome worse than saying so is a machine left with no DNS at all, or
+    one whose owner's choice of resolver was quietly overridden.
+    """
+    backup = os.path.join(state_dir, C.RESOLV_BACKUP)
+    stub = stubs[0]
+    if C.resolv_conf_reaches_resolved(conf, stubs):
+        # Already right. A record from this boot is this session's own, kept
+        # across a reconnect. One from an earlier boot belongs to a tunnel that
+        # no longer exists, and whoever pointed this at the stub since may not
+        # be us -- restoring it later would undo their fix -- so it goes.
+        record = read_backup(conf, backup, stubs)
+        if record is None or record[0] != boot_id():
+            forget(conf, backup, record)
+        return
+    if not os.path.exists(stub):
+        note(f"{conf} does not reach systemd-resolved and {stub} does not exist"
+             " (is systemd-resolved running?): ssh and curl will not see the"
+             " tunnel's DNS. Fix: sudo systemctl enable --now systemd-resolved"
+             f" && sudo ln -sfn {stub} {conf}")
+        return
+    if not os.path.islink(conf):
+        what = "a regular file" if os.path.lexists(conf) else "missing"
+        note(f"{conf} is {what} and does not reach systemd-resolved:"
+             " ssh and curl will not see the tunnel's DNS. Not changed, since it"
+             f" could not be put back. Fix: sudo ln -sfn {stub} {conf}")
+        return
+    original = os.readlink(conf)
+    if not restorable(conf, original, stubs):
+        note(f"{conf} -> {original!r} cannot be recorded to put back; not"
+             f" changed. ssh and curl will not see the tunnel's DNS.")
+        return
+    reason = why_not_swap(conf, known())
+    if reason is not None:
+        note(f"{conf} does not reach systemd-resolved and is not changed: {reason}."
+             " Names behind the tunnel will not resolve for programs that read it"
+             " (ssh, curl). To use the tunnel's DNS, point that resolver at"
+             f" systemd-resolved, or: sudo ln -sfn {stub} {conf}")
+        return
+    os.makedirs(state_dir, mode=0o700, exist_ok=True)
+    os.chmod(state_dir, 0o700)  # makedirs leaves an existing directory as it was
+    if not trusted(state_dir, directory=True):
+        note(f"{state_dir} is not a root-owned directory; {conf} not changed")
+        return
+    # Rewritten on every swap: if this is reached the link is not ours, so
+    # whatever an older record says it was is out of date.
+    write_backup(backup, original)
+    replace_symlink(conf, stub)
+    note(f"{conf} -> {stub} while the tunnel is up (was -> {original})")
+
+
+def forget(conf, backup, record):
+    """Drop a record without using it -- saying what it held, if anything."""
+    if record is not None:
+        note(f"dropping {backup} from an earlier boot; {conf} was -> {record[1]}."
+             f" To put that back: sudo ln -sfn {record[1]} {conf}")
+    drop_backup(backup)
+
+
+def restore_resolv_conf(conf, stubs, state_dir):
+    """Put /etc/resolv.conf back as it was, if this is what changed it."""
+    backup = os.path.join(state_dir, C.RESOLV_BACKUP)
+    if not os.path.lexists(backup):
+        return
+    record = read_backup(conf, backup, stubs)
+    if record is None:
+        note(f"{backup} cannot be used; {conf} left as it is")
+    elif not points_at_stub(conf, stubs):
+        # Somebody changed it since; what is there now is not ours to undo.
+        note(f"{conf} changed since the tunnel came up; leaving it as it is")
+    elif not os.path.exists(link_target(conf, record[1])):
+        # Faithful would be dangling, and a dangling resolv.conf is no DNS.
+        note(f"{conf} stays on the stub: its old target {record[1]} no longer"
+             f" exists. To put it back once it does: sudo ln -sfn {record[1]} {conf}")
+    else:
+        replace_symlink(conf, record[1])
+        note(f"{conf} put back -> {record[1]}")
+    drop_backup(backup)
+
+
+def reconcile_resolv_conf(conf, stubs, state_dir):
+    """Before a tunnel exists, undo whatever an earlier one left behind.
+
+    Run at pre-init, when openconnect has not yet created the device, so there is
+    no live tunnel a record could belong to. A record from this boot is a
+    session that was killed: its swap is put back, and the connect that follows
+    makes a fresh one from a known state. One from an earlier boot is only
+    dropped -- the link may have been pointed at the stub by someone since, and
+    putting it back would undo that.
+    """
+    backup = os.path.join(state_dir, C.RESOLV_BACKUP)
+    if not os.path.lexists(backup):
+        return
+    record = read_backup(conf, backup, stubs)
+    if record is not None and record[0] == boot_id():
+        restore_resolv_conf(conf, stubs, state_dir)
+    else:
+        forget(conf, backup, record)
+
+
+def follow_resolv_conf(environ, link_is_ours, conf=None, stubs=None,
+                       state_dir=None, known=None, require_root=True):
+    """Keep /etc/resolv.conf in step with the tunnel. Never raises.
+
+    Run by main() and not by handle_dns, so that `asuvpn selftest`, which
+    drives handle_dns against the real machine, cannot touch the real file.
+
+    Only the swap depends on link DNS being on. Undoing a swap -- at pre-init
+    or disconnect -- acts on this program's own record and nothing else, so it
+    runs whatever the setting is now: a session killed with DNS on must still
+    be cleaned up after the user has turned it off.
+    """
+    if require_root and os.geteuid() != 0:
+        return
+    conf = conf or C.RESOLV_CONF
+    stubs = tuple(stubs or C.RESOLVED_STUBS)
+    state_dir = state_dir or C.RESOLV_STATE_DIR
+    reason = environ.get("reason", "")
+    if known is None:
+        def known():
+            binary = C.resolvectl_path()
+            return None if binary is None else resolved_servers(
+                binary, environ.get("TUNDEV", ""))
+    try:
+        if reason == "pre-init":
+            reconcile_resolv_conf(conf, stubs, state_dir)
+        elif reason == "disconnect":
+            restore_resolv_conf(conf, stubs, state_dir)
+        elif reason in ("connect", "reconnect") and link_is_ours:
+            route_lookups_through_resolved(conf, stubs, state_dir, known)
+    except (OSError, ValueError) as exc:
+        note(f"could not adjust {conf}: {exc}")
+
+
 def handle_dns(environ, binary=None):
     """Take DNS over for this transition, if it is ours to take.
 
@@ -394,9 +713,11 @@ def handle_dns(environ, binary=None):
     be worked out -- is the switch. Absent means the user turned it off, or this
     is being run as a vpnc-script by hand; either way the real script keeps the
     job it has always had.
+
+    Returns True when the tunnel's resolver is on the link after this call.
     """
     if C.DNS_DOMAINS_VAR not in environ:
-        return
+        return False
     binary = C.resolvectl_path() if binary is None else binary
     if binary is None:
         # No systemd-resolved on this machine, so the stock script keeps DNS
@@ -413,13 +734,13 @@ def handle_dns(environ, binary=None):
             set_marker(environ, C.DNS_OWNER_SCRIPT)
         elif reason == "disconnect":
             set_marker(environ, None)
-        return
+        return False
     device = environ.get("TUNDEV", "")
     if not C.INTERFACE_RE.match(device):
         # About to be an argument to a root command. The helper checks this too;
         # a rule that guards a privileged call is checked where the call is.
         note(f"not touching DNS: {device!r} cannot be a device name")
-        return
+        return False
     reason = environ.get("reason", "")
     if reason == "disconnect":
         revert_dns(device, binary, environ)
@@ -438,6 +759,7 @@ def handle_dns(environ, binary=None):
         # (vpnc-script: `if [ -n "$INTERNAL_IP4_DNS" ]`), so removing it is how
         # it is told the job is done -- routing untouched, DNS entirely ours.
         environ.pop("INTERNAL_IP4_DNS", None)
+        return True
     elif reason == "connect":
         # Handed back. Recorded, because "no marker" would otherwise mean both
         # "DNS was cleanly given back" and "the stock script has been holding
@@ -455,6 +777,7 @@ def handle_dns(environ, binary=None):
     # coming back, `reconnect` will configure it again, and tearing the resolver
     # down in between would only send lookups meant for the tunnel out over the
     # public resolver instead.
+    return False
 
 
 def main():
@@ -464,7 +787,8 @@ def main():
         pass
 
     try:
-        handle_dns(os.environ)
+        ours = handle_dns(os.environ)
+        follow_resolv_conf(os.environ, ours)
     except Exception as exc:  # DNS must never break routing either
         note(f"leaving DNS to the real script: {exc.__class__.__name__}: {exc}")
 
